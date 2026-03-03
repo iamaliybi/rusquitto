@@ -1,0 +1,7 @@
+hard_tabs = true
+tab_spaces = 4
+max_width = 120
+fn_call_width = 60
+struct_lit_width = 60
+chain_width = 60
+use_small_heuristics = "Off"
