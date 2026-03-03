@@ -1,0 +1,12 @@
+[build]
+target = "x86_64-unknown-linux-gnu"
+
+[cache]
+auto-clean-frequency = "1 day"
+
+[alias]
+f = "fmt"
+t = "test -p rusquitto"
+r = "run -p rusquitto"
+rr = "run -p rusquitto --release"
+m = "run --bin mosquitto"
