@@ -11,6 +11,11 @@ bytes = "1.11"
 mqttbytes = "0.6"
 futures-lite = "2.6"
 
+# Logging / observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tracing-appender = "0.2"
+
 [[bin]]
 name = "mosquitto"
 path = "src/bin/mosquitto.rs"
