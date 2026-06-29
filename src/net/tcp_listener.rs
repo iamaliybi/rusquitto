@@ -3,8 +3,7 @@ use glommio::net::TcpListener;
 use socket2::Socket;
 
 pub fn create_tcp_listener(socket: Socket) -> TcpListener {
-    unsafe {
-        // We explicitly guarantee that 'fd' is a valid, open TCP socket.
-        TcpListener::from_raw_fd(socket.into_raw_fd())
-    }
+    // SAFETY: `into_raw_fd` yields a valid, open TCP socket fd whose ownership we
+    // transfer directly to the listener.
+    unsafe { TcpListener::from_raw_fd(socket.into_raw_fd()) }
 }

@@ -5,7 +5,6 @@ use mqttbytes::QoS;
 /// One client's subscription, with the QoS the broker granted.
 pub struct Subscription {
 	pub client_id: String,
-	#[allow(dead_code)] // consumed by per-subscriber QoS downgrade in Step 6
 	pub qos: QoS,
 }
 

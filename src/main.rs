@@ -1,49 +1,85 @@
 mod broker;
+mod config;
 mod logger;
 mod net;
 mod server;
 
+use std::process::ExitCode;
+use std::sync::Arc;
+
 use glommio::channels::channel_mesh::{Full, MeshBuilder};
 use glommio::{CpuSet, LocalExecutorPoolBuilder, PoolPlacement};
 use mqttbytes::v5::Publish;
-use std::{cmp, io::Result, path::Path};
 
-/// Per-link capacity of the inter-shard channel mesh (messages buffered before
-/// `try_send_to` drops).
-const MESH_CHANNEL_SIZE: usize = 1024;
+use crate::config::{Cli, Config, LogFormat, Placement};
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
+	let cli = Cli::parse_args();
+
+	let config = match Config::load(&cli.config) {
+		Ok(config) => config,
+		Err(e) => {
+			eprintln!("rusquitto: {e}");
+			return ExitCode::FAILURE;
+		}
+	};
+
+	match run(config) {
+		Ok(()) => ExitCode::SUCCESS,
+		Err(e) => {
+			eprintln!("rusquitto: fatal: {e}");
+			ExitCode::FAILURE
+		}
+	}
+}
+
+fn run(config: Config) -> std::io::Result<()> {
 	// Initialise logging first; keep `_log_guards` alive for the whole run so the
 	// non-blocking background writers are not torn down early.
-	let stdout_format = if cfg!(debug_assertions) {
-		logger::Format::Pretty
-	} else {
-		logger::Format::Json
+	let stdout_format = match config.logging.format {
+		LogFormat::Pretty => logger::Format::Pretty,
+		LogFormat::Json => logger::Format::Json,
 	};
 	let _log_guards = logger::init(logger::Config {
-		dir: Path::new("logs"),
-		default_filter: "info,rusquitto=debug",
+		dir: &config.logging.dir,
+		log_file: &config.logging.file,
+		error_file: &config.logging.error_file,
+		default_filter: &config.logging.level,
+		enable_terminal: config.logging.enable_terminal,
 		stdout_format,
 	})?;
 
 	let all_cpus = CpuSet::online()?;
 	let total_cores = all_cpus.len();
+	let shards = config.resolved_shards(total_cores);
 
-	let glommio_cores = cmp::max((total_cores * 3) / 4, 1);
+	let placement = match config.runtime.placement {
+		Placement::MaxSpread => PoolPlacement::MaxSpread(shards, Some(all_cpus)),
+		Placement::MaxPack => PoolPlacement::MaxPack(shards, Some(all_cpus)),
+		Placement::Unbound => PoolPlacement::Unbound(shards),
+	};
+
 	tracing::info!(
 		total_cores,
-		shards = glommio_cores,
+		shards,
+		placement = ?config.runtime.placement,
+		bind = %config.server.bind,
+		port = config.server.port,
 		"starting rusquitto broker"
 	);
-	let placement = PoolPlacement::MaxSpread(glommio_cores, Some(all_cpus));
 
 	// Full mesh connecting all shards. Cloned into each shard, which then joins.
-	let mesh: MeshBuilder<Publish, Full> = MeshBuilder::full(glommio_cores, MESH_CHANNEL_SIZE);
+	let mesh: MeshBuilder<Publish, Full> =
+		MeshBuilder::full(shards, config.runtime.mesh_capacity);
+
+	// Shared, read-only config handed to every shard.
+	let config = Arc::new(config);
 
 	LocalExecutorPoolBuilder::new(placement)
 		.on_all_shards(move || {
 			let mesh = mesh.clone();
-			async move { server::worker::init(mesh).await }
+			let config = Arc::clone(&config);
+			async move { server::worker::init(mesh, config).await }
 		})
 		.expect("failed to spawn local executor")
 		.join_all();

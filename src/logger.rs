@@ -42,10 +42,17 @@ pub enum Format {
 pub struct Config<'a> {
 	/// Directory for the rotating log files (created if missing).
 	pub dir: &'a Path,
+	/// File name for the main daily-rotating log.
+	pub log_file: &'a str,
+	/// File name for the dedicated daily-rotating ERROR log.
+	pub error_file: &'a str,
 	/// Default filter directive, e.g. `"info,rusquitto=debug"`. Overridden by the
 	/// `RUST_LOG` environment variable when present.
 	pub default_filter: &'a str,
-	/// Format for the stdout layer.
+	/// Attach a terminal (stdout) layer. When `false` the broker is silent in the
+	/// terminal — the file appenders remain active regardless.
+	pub enable_terminal: bool,
+	/// Format for the stdout layer (only used when `enable_terminal` is `true`).
 	pub stdout_format: Format,
 }
 
@@ -53,7 +60,10 @@ impl Default for Config<'_> {
 	fn default() -> Self {
 		Self {
 			dir: Path::new("logs"),
+			log_file: "rusquitto.log",
+			error_file: "rusquitto.error.log",
 			default_filter: "info,rusquitto=debug",
+			enable_terminal: false,
 			stdout_format: Format::Pretty,
 		}
 	}
@@ -81,7 +91,7 @@ pub fn init(config: Config<'_>) -> std::io::Result<Guards> {
 	let (env_filter, reload) = reload::Layer::new(env_filter);
 
 	// --- Main rotating JSON log (all levels permitted by the filter) ---
-	let (app_writer, app_guard) = non_blocking(rolling::daily(config.dir, "rusquitto.log"));
+	let (app_writer, app_guard) = non_blocking(rolling::daily(config.dir, config.log_file));
 	let file_layer = fmt::layer()
 		.json()
 		.with_ansi(false)
@@ -90,7 +100,7 @@ pub fn init(config: Config<'_>) -> std::io::Result<Guards> {
 		.with_writer(app_writer);
 
 	// --- Dedicated ERROR-only rotating JSON log ---
-	let (err_writer, err_guard) = non_blocking(rolling::daily(config.dir, "rusquitto.error.log"));
+	let (err_writer, err_guard) = non_blocking(rolling::daily(config.dir, config.error_file));
 	let error_layer = fmt::layer()
 		.json()
 		.with_ansi(false)
@@ -99,8 +109,10 @@ pub fn init(config: Config<'_>) -> std::io::Result<Guards> {
 		.with_writer(err_writer)
 		.with_filter(LevelFilter::ERROR);
 
-	// --- Stdout layer: pretty for dev, JSON for prod ---
-	let stdout_layer = match config.stdout_format {
+	// --- Stdout layer: attached ONLY when the terminal is enabled ---
+	// `Option<Layer>` implements `Layer`, so `None` is a zero-cost no-op and the
+	// terminal stays completely silent. The file appenders above are always on.
+	let stdout_layer = config.enable_terminal.then(|| match config.stdout_format {
 		Format::Pretty => fmt::layer().pretty().with_writer(std::io::stdout).boxed(),
 		Format::Json => fmt::layer()
 			.json()
@@ -108,11 +120,11 @@ pub fn init(config: Config<'_>) -> std::io::Result<Guards> {
 			.with_span_list(true)
 			.with_writer(std::io::stdout)
 			.boxed(),
-	};
+	});
 
 	Registry::default()
 		.with(env_filter) // global, runtime-reloadable verbosity
-		.with(stdout_layer)
+		.with(stdout_layer) // Option: present only if enable_terminal
 		.with(file_layer)
 		.with(error_layer)
 		.init();
