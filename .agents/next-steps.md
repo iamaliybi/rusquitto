@@ -1,104 +1,52 @@
-# Rusquitto — What's Missing & Next Steps
+# Rusquitto — What's Next (Phase 3: Hardening)
 
-## Phase 2 Priority Order
+Phase 2 (pub/sub engine) is **complete and verified** — topic trie, SUBSCRIBE/UNSUBSCRIBE, PUBLISH at
+QoS 0/1/2 (in + out), retained messages, and cross-shard routing via the glommio channel mesh all work.
+See [progress.md](progress.md) for the build log and design decisions.
 
-### 1. Topic Trie (Blocker for Everything)
+The remaining work is correctness/robustness hardening, roughly in priority order.
 
-Needed by SUBSCRIBE, PUBLISH, UNSUBSCRIBE. Must support:
+## 1. Cross-shard QoS backpressure
 
-- Exact match: `home/sensor/temp`
-- Single-level wildcard: `home/+/temp`
-- Multi-level wildcard: `home/#`
+The mesh forwards with non-blocking `try_send_to` (drop-on-full), so cross-shard QoS > 0 is best-effort.
+Make it reliable: async `send_to` with per-link flow control, or a bounded retry/queue. Touch
+`broker/engine.rs::broadcast` and the drain task in `worker.rs`.
 
-Suggested approach: trie where each node holds a `Vec<SubscriberHandle>`.  
-Lives in `src/broker/engine.rs` (currently empty).
+## 2. Persistent sessions & expiry
 
-### 2. SUBSCRIBE / SUBACK
+Sessions are currently clean-only; in-flight QoS state is dropped on disconnect. Implement:
 
-Handler stub in `src/server/connection.rs: handle_subscribe()`.
+- Honour `Session Expiry Interval` — move to a "suspended" state with an expiry timer instead of dropping.
+- Resurrection on reconnect with the same Client ID (re-attach subscriptions + in-flight window).
+- Retransmission of unacked QoS 1/2 messages (with the DUP flag) on reconnect.
 
-Steps needed:
+## 3. Will messages
 
-1. For each filter: insert `(shard_id, client_id, QoS)` into Topic Trie
-2. Negotiate granted QoS (min of requested vs. broker max)
-3. Deliver any matching retained messages
-4. Write SUBACK with per-filter result codes
+Store the CONNECT will; publish it on ungraceful disconnect (EOF/error), suppress it on clean DISCONNECT.
 
-### 3. PUBLISH routing
+## 4. Authentication / ACL
 
-Handler stub: `handle_publish()`.
+Username/password (and/or enhanced auth) at CONNECT; topic-level publish/subscribe authorization. Wire ACL
+checks into `handle_publish` / `handle_subscribe`, return proper reason codes.
 
-Steps:
+## 5. CONNECT capability negotiation
 
-1. Lookup matching subscribers in Topic Trie (wildcard-aware)
-2. For same-shard subscribers: deliver directly via local channel
-3. For cross-shard subscribers: send via SPSC inter-shard channel
-4. QoS 0: fire-and-forget; QoS 1: send PUBACK; QoS 2: PUBREC flow
-5. If retain flag: upsert Retain Table
+Act on client properties (`Receive Maximum` flow-control quota, `Maximum Packet Size`, `Topic Alias
+Maximum`) and advertise the matching server capabilities in CONNACK. `mqttbytes` already decodes them;
+today we only advertise server keep-alive.
 
-### 4. UNSUBSCRIBE / UNSUBACK
+## 6. Subscription options & shared subscriptions
 
-Remove entries from Topic Trie, send UNSUBACK with result codes.
+`No Local`, `Retain As Published`, `Retain Handling`, and `$share/...` group subscriptions.
 
-### 5. QoS 1 Session State
+## 7. Observability & ops
 
-Per-connection `inflight: HashMap<PacketId, Publish>`.  
-On PUBACK: remove from inflight.  
-On reconnect with `clean_start=false`: re-send inflight with DUP flag.
+`$SYS` metrics topics, connection/throughput counters, graceful shutdown on SIGTERM, and a documented
+`RLIMIT_MEMLOCK` requirement (io_uring buffer registration `ENOMEM` under load — see progress.md).
 
-### 6. QoS 2 Session State
+## Code map for the above
 
-Two-phase commit: PUBREC → PUBREL → PUBCOMP.  
-Requires `inflight_qos2: HashMap<PacketId, Phase>`.
-
-### 7. Global State Structures
-
-All of these need careful partitioning for the shared-nothing model:
-
-| Structure           | Options                                                  |
-|---------------------|----------------------------------------------------------|
-| **Topic Trie**      | Per-shard replica (reads local, cross-shard via message) |
-| **Client Registry** | Sharded by `hash(client_id) % num_shards`                |
-| **Retain Table**    | Per-shard or central shard with message passing          |
-
-### 8. Inter-Shard Channels
-
-`crossbeam` SPSC queues, one per shard pair (or a ring of channels).  
-Wire into `src/broker/engine.rs` and thread through to `worker.rs`.
-
-### 9. CONNECT Negotiation
-
-Current CONNACK sends bare success with no properties. Should negotiate:
-
-- `receive_maximum`
-- `maximum_packet_size`
-- `topic_alias_maximum`
-- `server_keep_alive`
-
-### 10. Will Messages
-
-On unclean disconnect: publish the will message from the CONNECT packet.
-
----
-
-## Known Stubs / TODOs in Code
-
-- `src/broker/engine.rs` — 1 line, completely empty
-- `src/broker/mod.rs` — just `pub mod engine;`
-- `handle_publish()` — `unimplemented!()`
-- `handle_subscribe()` — `unimplemented!()`
-- `handle_unsubscribe()` — `unimplemented!()`
-- `handle_puback()` — `unimplemented!()`
-- `handle_pubrec()` — `unimplemented!()`
-- `handle_pubrel()` — `unimplemented!()`
-- `handle_pubcomp()` — `unimplemented!()`
-
----
-
-## Test Script Notes (`scripts/mosquitto.sh`)
-
-- Spawns 100 concurrent publishers per QoS level (0, 1, 2) + retain
-- 50 messages per publisher
-- 4 long-lived subscribers per scenario writing to `.log` files
-- No automated pass/fail — logs must be manually inspected
-- Requires `mosquitto_pub` and `mosquitto_sub` on PATH
+- Session/QoS state: `src/server/connection.rs`
+- Routing / retain / mesh: `src/broker/engine.rs`
+- Subscription matching: `src/broker/topic_trie.rs`
+- Config knobs: `src/config.rs` (add fields under `[limits]` / a new `[auth]` section)

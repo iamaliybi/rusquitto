@@ -1,6 +1,23 @@
 # MQTT 5.0 Protocol Implementation Logic
 
-## 1. Philosophy: The Finite State Machine (FSM)
+> **Implementation status.** This document describes the intended MQTT 5.0 design. Some of it is built,
+> some is still planned — the table below is the source of truth; sections further down explain the design
+> and call out what is not yet wired up.
+>
+> | Area | Status |
+> |--------------------------------------------|--------------------------------------------------|
+> | Framing / fragmentation / coalescing | ✅ Implemented (`connection.rs::read_packet`) |
+> | CONNECT / CONNACK | ✅ Implemented (assigns empty client ids; advertises server keep-alive) |
+> | PUBLISH routing + retained messages | ✅ Implemented (wildcard trie, cross-shard mesh) |
+> | QoS 1 / QoS 2 (in- and outbound) | ✅ Implemented (per-connection in-flight window) |
+> | SUBSCRIBE / UNSUBSCRIBE + reason codes | ✅ Implemented |
+> | Granted-QoS negotiation (`min(req, max)`) | ✅ Implemented |
+> | Property parsing (handled by `mqttbytes`) | ✅ Decoded; most server-side properties not yet acted on |
+> | Formal state-machine gating | ⛔ Planned — packets are dispatched by type, not gated by a state enum |
+> | ACLs / auth, `No Local`, flow control | ⛔ Planned |
+> | Session expiry / persistence / will msgs | ⛔ Planned — sessions are treated as clean |
+
+## 1. Protocol Dispatch (intended: a Finite State Machine)
 
 We implement the protocol logic as an asynchronous Finite State Machine strictly adhering to the MQTT 5.0 specification.
 
@@ -11,11 +28,13 @@ We implement the protocol logic as an asynchronous Finite State Machine strictly
 * **Security:** By isolating states (`Handshake`, `Active`, `Error`), we prevent state-confusion attacks where
   unauthenticated clients attempt to inject data.
 
-### How it is Implemented?
+### How it is Implemented today
 
-* **State Enum:** The `Session` struct holds a `State` variant.
-* **Transition:** Every received packet triggers a check: `match (current_state, packet_type)`. If the pair is invalid (
-  e.g., `WaitConnect` + `PUBLISH`), the connection is immediately terminated with a Protocol Error.
+* **Per-packet dispatch:** `Connection::process_packet` matches on the packet type and routes to a handler. Server-only
+  packets (CONNACK, SUBACK, …) sent by a client are rejected as protocol violations.
+* **Not yet a strict FSM:** there is no explicit `State` enum gating transitions, so the "must CONNECT first" ordering
+  is not enforced beyond the empty-client-id handling. A formal state machine (`WaitConnect` → `Active` → `Error`) is
+  planned.
 
 ---
 
@@ -69,12 +88,13 @@ The `CONNECT` packet in MQTT 5.0 is a negotiation of capabilities, not just a lo
 * **Session Control:** The client dictates `Clean Start` (wipe memory) and `Session Expiry Interval` (how long to
   remember me).
 
-### How it is Implemented?
+### How it is Implemented today
 
-* **Parameter Extraction:** We parse the `CONNECT` properties to set the session's `Receive Maximum` (flow control
-  quota).
-* **Capability Response:** In the `CONNACK`, we inject our own Properties (Server Capabilities) to inform the client of
-  our limits.
+* **Capability Response:** The `CONNACK` carries a property set (it must, even if empty — a v5 CONNACK without the
+  property-length byte is malformed and clients reject it). We advertise the configured **Server Keep-Alive** so
+  clients adopt our ceiling.
+* **Planned:** acting on `Receive Maximum` (flow-control quota) and the other client-side properties, which `mqttbytes`
+  already decodes for us.
 
 ---
 
@@ -87,12 +107,14 @@ Once connected, the FSM enters the `Active` state to process command packets.
 * **Granularity:** In v5.0, an ACK isn't just "OK". We can return specific errors (e.g., `QuotaExceeded`,
   `TopicNameInvalid`) in `PUBACK`, `SUBACK`, and even `DISCONNECT`.
 
-### How it is Implemented?
+### How it is Implemented today
 
-* **PUBLISH:** We validate ACLs. If successful, we route the message. If QoS > 0, we respond with a `PUBACK` containing
-  a `Reason Code 0x00`.
-* **SUBSCRIBE:** We process the new **Subscription Options** (like `No Local` to prevent echo). We insert filters into
-  the Topic Trie and respond with a `SUBACK`.
+* **PUBLISH:** We route the message to local subscribers (wildcard-matched via the topic trie) and forward it to peer
+  shards over the mesh; retained publishes update the retain table. QoS 1 replies with `PUBACK`; QoS 2 runs the
+  PUBREC→PUBREL→PUBCOMP handshake and delivers exactly once. *(ACL checks are planned, not yet enforced.)*
+* **SUBSCRIBE:** We insert each filter into the topic trie, grant `min(requested, server max)` QoS, replay any matching
+  retained messages, and reply with a `SUBACK` carrying a reason code per filter. *(Subscription options such as
+  `No Local` are parsed by `mqttbytes` but not yet acted on.)*
 
 ---
 
@@ -105,10 +127,11 @@ Managing the life and death of a session is more complex in v5.0 due to "Session
 * **The Problem:** In v3, `CleanSession=0` meant "keep data forever". This fills up the disk.
 * **The Solution:** v5 allows a client to say "Keep my data for 1 hour after I leave".
 
-### How it is Implemented?
+### How it is Implemented today
 
-* **The Timer:** When a TCP disconnect happens, if `Session Expiry > 0`, we do *not* delete the Session struct. Instead,
-  we move it to a "Suspended" state and start an expiry timer.
-* **Resurrection:** If the client reconnects (with the same Client ID) before the timer fires, we re-attach the new TCP
-  stream to the old Session struct (restoring subscriptions).
-* **The End:** If the timer expires, we drop the data and publish the **Will Message** (if set).
+* **Clean sessions only:** on disconnect (or EOF) we immediately deregister the client — its mailbox is dropped and all
+  of its subscriptions are purged. There is no suspended state and no expiry timer yet.
+* **Session takeover:** if a new connection registers with an existing Client ID, it overwrites the old mailbox; the
+  displaced connection's mailbox channel closes and that connection tears down cleanly.
+* **Planned:** honouring `Session Expiry Interval` (suspend instead of drop, with resurrection on reconnect) and
+  publishing the **Will Message** on ungraceful disconnect.

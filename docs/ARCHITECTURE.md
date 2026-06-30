@@ -73,20 +73,27 @@ Rusquitto eliminates the "Central Dispatcher" bottleneck by allowing all cores t
 
 ---
 
-## 5. Clustering: Internal Message Bus
+## 5. Inter-Shard Routing: Internal Message Bus
 
 Since Shard 0 cannot read Shard 1's memory, they must communicate like separate servers.
 
 ### Why Message Passing?
 
-* **Isolation:** To maintain the "Lock-Free" guarantee, we cannot share the Session Map.
+* **Isolation:** To maintain the "Lock-Free" guarantee, we cannot share the subscription/client state.
 * **Scalability:** This architecture allows Rusquitto to theoretically span across multiple physical machines with
   minimal changes.
 
 ### How it is Implemented?
 
-* **SPSC Channels:** We use Single-Producer Single-Consumer lock-free ring buffers between cores.
-* **The Bus:** If Shard 0 needs to publish to a client on Shard 1, it sends the message pointer through the channel.
+* **Channel Mesh:** We build a Glommio `channel_mesh` (a full mesh of lock-free shared channels) connecting every
+  shard to every other shard. Each shard `join()`s the mesh during `worker::init` and spawns a task that drains the
+  inbound channels.
+* **Broadcast routing:** A PUBLISH first fans out to local subscribers, then is forwarded to **every** peer shard,
+  which runs its own local match against its subscription trie. This keeps each shard's state private — no shard ever
+  queries another's tables.
+* **Drop-on-full (current trade-off):** Forwarding uses a non-blocking `try_send_to`, so a slow peer never stalls the
+  publisher. This means cross-shard QoS > 0 is currently best-effort; the at-least/exactly-once guarantee holds within
+  a shard. Adding backpressure (an async `send_to`) is the path to full cross-shard QoS.
 
 ---
 
@@ -125,5 +132,5 @@ This diagram illustrates the data flow from the physical network wire down to th
         |                 |                 |
 +-------------------------------------------------------+
 |           INTER-SHARD MESSAGE BUS (Mesh)              |
-|      (Lock-Free SPSC Channels for Routing)            |
+|   (Glommio channel_mesh — full mesh of shared chans)  |
 +-------------------------------------------------------+
