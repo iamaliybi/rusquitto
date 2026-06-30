@@ -1,8 +1,9 @@
 //! Command-line interface and configuration management.
 //!
-//! The broker takes exactly one argument — the path to a TOML config file —
-//! parsed with `clap`'s derive API ([`Cli`]). The file is decoded with `serde` +
-//! `toml` into the strongly-typed [`Config`] tree, then validated.
+//! The broker takes exactly one argument — the path to a TOML config file, given
+//! positionally (`rusquitto <CONFIG>`) — parsed with `clap`'s derive API
+//! ([`Cli`]). The file is decoded with `serde` + `toml` into the strongly-typed
+//! [`Config`] tree, then validated.
 //!
 //! Every section and field has a sensible default (see the `Default` impls and
 //! `rusquitto.toml`), so a minimal config — or even an empty file — is valid.
@@ -25,7 +26,7 @@ use serde::Deserialize;
 )]
 pub struct Cli {
 	/// Path to the TOML configuration file.
-	#[arg(short, long, value_name = "FILE")]
+	#[arg(value_name = "CONFIG")]
 	pub config: PathBuf,
 }
 

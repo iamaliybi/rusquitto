@@ -1,11 +1,11 @@
 # Agentic Context for Rusquitto
 
-Notes saved by Claude Code on 2026-06-29 after full project analysis.
+Internal working notes. Last refreshed 2026-06-30 (Phase 2 complete — functional pub/sub broker).
 
-| File                               | Contents                                                                        |
-|------------------------------------|---------------------------------------------------------------------------------|
-| [overview.md](overview.md)         | Project status summary, feature matrix, build commands                          |
-| [architecture.md](architecture.md) | Thread-per-core design, io_uring, SO_REUSEPORT, connection lifecycle, key files |
-| [dependencies.md](dependencies.md) | Direct deps with purpose, key types by source crate                             |
-| [next-steps.md](next-steps.md)     | Prioritised Phase 2 work: Topic Trie → Pub/Sub → QoS → inter-shard              |
-| [progress.md](progress.md)         | Implementation progress (Steps 1–4 done & verified), decisions, mqttbytes gotchas |
+| File                               | Contents                                                                       |
+|------------------------------------|--------------------------------------------------------------------------------|
+| [overview.md](overview.md)         | Project status summary, current feature matrix, build/run commands             |
+| [architecture.md](architecture.md) | Thread-per-core design, io_uring, SO_REUSEPORT, inter-shard mesh, key files    |
+| [dependencies.md](dependencies.md) | Direct deps with purpose, key types by source crate                            |
+| [next-steps.md](next-steps.md)     | Phase 3 hardening roadmap: cross-shard QoS, sessions, will, auth, negotiation  |
+| [progress.md](progress.md)         | Full implementation log (Steps 1–6 + logging + CLI/config), decisions, gotchas |
