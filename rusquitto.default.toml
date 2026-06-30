@@ -1,0 +1,140 @@
+# =============================================================================
+# rusquitto — FULL DEFAULT CONFIGURATION (reference)
+#
+# This file lists every configuration property with its built-in default value.
+# Loading it produces exactly the same behaviour as running with no config keys
+# at all — it exists so you can see the complete configuration surface in one
+# place and copy what you need.
+#
+#   Usage:   rusquitto --config rusquitto.default.toml
+#
+# Notes:
+#   * Every key is optional; omit any to fall back to the default shown here.
+#   * Unknown keys are rejected (typo protection).
+#   * The file MUST have a .toml extension.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# [server] — network ingress
+#
+# All shards bind this same address/port via SO_REUSEPORT; the kernel load-
+# balances incoming TCP connections across them (no central accept thread).
+# -----------------------------------------------------------------------------
+[server]
+
+# IP address to bind. IPv4 or IPv6 (e.g. "0.0.0.0", "::", "127.0.0.1").
+# Type: string (IP)            Default: "127.0.0.1"
+bind = "127.0.0.1"
+
+# TCP port to listen on. Must be non-zero.
+# Type: integer (1-65535)      Default: 1883
+port = 1883
+
+# listen(2) backlog applied to each shard's socket. Must be positive.
+# Type: integer (> 0)          Default: 1024
+listen_backlog = 1024
+
+
+# -----------------------------------------------------------------------------
+# [runtime] — thread-per-core / glommio settings
+# -----------------------------------------------------------------------------
+[runtime]
+
+# Explicit number of shards (pinned executors) to spawn.
+# When unset, the count is derived as round(online_cores * cpu_fraction).
+# Type: integer (>= 1) or unset   Default: unset (auto)
+# shards = 4
+
+# Fraction of online cores to use when `shards` is unset.
+# Type: float (0.0 < x <= 1.0)    Default: 0.75
+cpu_fraction = 0.75
+
+# CPU placement / affinity strategy, mapped onto glommio's PoolPlacement:
+#   "max-spread" — spread shards across cores / NUMA nodes (best latency)
+#   "max-pack"   — pack onto as few NUMA nodes as possible (best locality)
+#   "unbound"    — no pinning; let the OS schedule the threads
+# Type: enum                      Default: "max-spread"
+placement = "max-spread"
+
+# Per-link capacity of the inter-shard channel mesh (messages buffered before
+# a cross-shard send is dropped). Must be non-zero.
+# Type: integer (> 0)             Default: 1024
+mesh_capacity = 1024
+
+
+# -----------------------------------------------------------------------------
+# [logging] — non-blocking tracing pipeline (see logger.rs)
+#
+# Writes a daily-rotating JSON main log and a dedicated daily-rotating ERROR
+# log, plus a stdout layer. All disk I/O happens on a background thread.
+# -----------------------------------------------------------------------------
+[logging]
+
+# Verbosity filter in EnvFilter syntax (per-module directives allowed).
+# Overridden at startup by the RUST_LOG environment variable when present.
+# Type: string                    Default: "info,rusquitto=debug"
+level = "info,rusquitto=debug"
+
+# Directory for the rotating log files (created if missing).
+# Type: string (path)             Default: "logs"
+dir = "logs"
+
+# File name for the main daily-rotating JSON log.
+# Type: string                    Default: "rusquitto.log"
+file = "rusquitto.log"
+
+# File name for the dedicated daily-rotating ERROR-only log.
+# Type: string                    Default: "rusquitto.error.log"
+error_file = "rusquitto.error.log"
+
+# Attach a terminal (stdout) layer. Off by default so the broker is completely
+# silent in the terminal for maximum performance; file logging is ALWAYS active.
+# Set to true for live monitoring.
+# Type: boolean                   Default: false
+enable_terminal = false
+
+# Format of the stdout layer (only used when enable_terminal = true):
+#   "pretty" — human-readable, colourised (local development)
+#   "json"   — one JSON object per line (production telemetry)
+# Type: enum                      Default: "pretty"
+format = "pretty"
+
+
+# -----------------------------------------------------------------------------
+# [limits] — broker / MQTT resource limits
+# -----------------------------------------------------------------------------
+[limits]
+
+# Maximum concurrent connections accepted on a single shard. Further
+# connections are rejected (socket closed) until existing ones close.
+# Type: integer                   Default: 16384
+max_connections_per_shard = 16384
+
+# Largest accepted MQTT packet, in bytes. Oversized packets close the
+# connection. Must be non-zero.
+# Type: integer (bytes, > 0)      Default: 65536   (64 KiB)
+max_payload_size = 65536
+
+# Initial capacity of each connection's read/assembly buffer, in bytes.
+# Type: integer (bytes, > 0)      Default: 4096    (4 KiB)
+initial_read_buffer = 4096
+
+# Outbound QoS 1/2 in-flight window per connection (max unacknowledged
+# messages the broker will keep in flight to a subscriber).
+# Type: integer                   Default: 128
+max_inflight = 128
+
+# Maximum QoS the broker grants to subscribers. Delivered QoS is
+# min(publish QoS, granted QoS).  0, 1, or 2.
+# Type: integer (0-2)             Default: 2
+max_qos = 2
+
+# Server keep-alive in seconds, advertised to clients in CONNACK so they
+# adopt this ceiling. Set to 0 to disable the override.
+# Type: integer (seconds)         Default: 60
+keep_alive = 60
+
+# Whether retained messages are accepted and served.
+# Type: boolean                   Default: true
+retain_available = true

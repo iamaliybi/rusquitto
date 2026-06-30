@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info, warn};
 
 use crate::broker::engine::{Delivery, Mailbox, ShardState};
+use crate::config::LimitsConfig;
 use crate::logger::redact;
 
 /// Monotonic counter for assigning identifiers to clients that connect without
@@ -62,24 +63,25 @@ pub struct Connection {
 	inflight: HashMap<u16, Inflight>,
 	/// Rolling packet-id allocator for outbound QoS 1/2 messages.
 	next_pkid: u16,
+	/// Broker resource limits (max payload, granted QoS, keep-alive, …).
+	limits: LimitsConfig,
 }
 
 impl Connection {
-	const MAX_PACKET_SIZE: usize = 64 * 1024;
-	
-	const INITIAL_BUFFER_SIZE: usize = 4 * 1024;
-	
+	/// Stack scratch buffer for each socket read. The growable assembly buffer is
+	/// `buffer` (sized from config); a fixed size keeps this one on the stack.
 	const READ_BUFFER_SIZE: usize = 2048;
 
-	/// Highest QoS the broker grants to subscribers. Messages are downgraded to
-	/// `min(publish QoS, granted QoS)` on delivery.
-	const SERVER_MAX_QOS: QoS = QoS::ExactlyOnce;
-	
-	pub fn new(stream: TcpStream, shard_id: usize, state: Rc<RefCell<ShardState>>) -> Self {
+	pub fn new(
+		stream: TcpStream,
+		shard_id: usize,
+		state: Rc<RefCell<ShardState>>,
+		limits: LimitsConfig,
+	) -> Self {
 		let (mailbox_tx, mailbox_rx) = local_channel::new_unbounded();
 		Self {
 			stream,
-			buffer: BytesMut::with_capacity(Self::INITIAL_BUFFER_SIZE),
+			buffer: BytesMut::with_capacity(limits.initial_read_buffer),
 			shard_id,
 			client_id: String::new(),
 			state,
@@ -88,6 +90,7 @@ impl Connection {
 			incoming_qos2: HashMap::new(),
 			inflight: HashMap::new(),
 			next_pkid: 0,
+			limits,
 		}
 	}
 
@@ -116,11 +119,14 @@ impl Connection {
 	/// Bidirectional event loop: race an inbound socket read against an
 	/// outbound mailbox delivery, handling whichever resolves first.
 	async fn event_loop(&mut self) -> Result<()> {
+		let max_packet = self.limits.max_payload_size;
 		loop {
 			// Borrow disjoint fields so the two futures don't both need `&mut self`.
 			let event = {
 				let read = async {
-					Event::Incoming(Self::read_packet(&mut self.stream, &mut self.buffer).await)
+					Event::Incoming(
+						Self::read_packet(&mut self.stream, &mut self.buffer, max_packet).await,
+					)
 				};
 				let recv = async { Event::Outgoing(self.mailbox_rx.recv().await) };
 				read.or(recv).await
@@ -130,7 +136,7 @@ impl Connection {
 				Event::Incoming(Ok(Some(packet))) => {
 					if let Err(e) = self.process_packet(packet).await {
 						warn!(error = %e, "protocol/io error, closing connection");
-						return Ok(()); // Close connection on error
+						return Ok(());
 					}
 				}
 				Event::Incoming(Ok(None)) => break, // Client closed (EOF)
@@ -156,18 +162,22 @@ impl Connection {
 	/// Reads from `stream` into `buffer` until a complete MQTT packet can be
 	/// framed. Takes the fields directly (not `&mut self`) so it can race against
 	/// the mailbox receiver, which borrows a different field.
-	async fn read_packet(stream: &mut TcpStream, buffer: &mut BytesMut) -> Result<Option<Packet>> {
+	async fn read_packet(
+		stream: &mut TcpStream,
+		buffer: &mut BytesMut,
+		max_packet: usize,
+	) -> Result<Option<Packet>> {
 		let mut temp_buf = [0u8; Self::READ_BUFFER_SIZE];
 
-		// A single TCP read might contain multiple MQTT packets (Batch Processing)
+		// One read may carry several MQTT packets; frame as many as are complete.
 		loop {
 			// First byte (fixed header) before `read` consumes the frame; used to
 			// recognise the zero-length DISCONNECT that mqttbytes can't parse.
 			let first_byte = buffer.first().copied();
-			match mqtt_v5::read(buffer, Self::MAX_PACKET_SIZE) {
+			match mqtt_v5::read(buffer, max_packet) {
 				Ok(packet) => return Ok(Some(packet)),
 				Err(MqttError::InsufficientBytes(_)) => {
-					// Not enough data, continue reading from network
+					// Need more bytes.
 				}
 				// mqttbytes rejects any zero-length packet other than PING as
 				// `PayloadRequired`, but a bare `E0 00` DISCONNECT is valid MQTT 5.
@@ -255,7 +265,7 @@ impl Connection {
 			Packet::PubRel(pubrel) => self.handle_pubrel(pubrel).await,
 			Packet::PubComp(pubcomp) => self.handle_pubcomp(pubcomp).await,
 
-			// Server -> Client Packets (Should NOT receive these from client)
+			// Server-only packets — a client must never send these.
 			Packet::ConnAck(_) | Packet::SubAck(_) | Packet::UnsubAck(_) | Packet::PingResp => {
 				warn!("protocol violation: received server-only packet from client");
 				Ok(())
@@ -302,7 +312,12 @@ impl Connection {
 		// that clients reject. Attach an empty property set so the 0-length is
 		// emitted. (SubAck/Publish/PubAck handle the None case correctly.)
 		let mut conn_ack = mqtt_v5::ConnAck::new(mqtt_v5::ConnectReturnCode::Success, false);
-		conn_ack.properties = Some(mqtt_v5::ConnAckProperties::new());
+		let mut props = mqtt_v5::ConnAckProperties::new();
+		// Advertise the server keep-alive so clients adopt our ceiling.
+		if self.limits.keep_alive > 0 {
+			props.server_keep_alive = Some(self.limits.keep_alive);
+		}
+		conn_ack.properties = Some(props);
 		let mut buf = BytesMut::new();
 		conn_ack
 			.write(&mut buf)
@@ -313,11 +328,8 @@ impl Connection {
 
 	async fn handle_disconnect(&mut self) -> Result<()> {
 		info!("client sent disconnect");
-		// Clean exit
-		Err(Error::new(
-			ErrorKind::ConnectionAborted,
-			"Client Disconnected",
-		))
+		// Returning an error unwinds the event loop and closes the connection.
+		Err(Error::new(ErrorKind::ConnectionAborted, "Client Disconnected"))
 	}
 
 	async fn handle_ping(&mut self) -> Result<()> {
@@ -329,10 +341,7 @@ impl Connection {
 	}
 
 	async fn handle_publish(&mut self, publish: mqtt_v5::Publish) -> Result<()> {
-		// Normalize to a QoS 0 delivery: every current subscriber was granted
-		// QoS 0, so downgrade once and share the Rc across all of them. Per-
-		// subscriber QoS, retain storage, and cross-shard routing arrive later.
-		// Payload contents are never logged — only the topic, QoS, and byte length.
+		// Payload contents are never logged — only topic, QoS, and byte length.
 		debug!(
 			topic = %publish.topic,
 			qos = ?publish.qos,
@@ -386,7 +395,7 @@ impl Connection {
 		let mut retained = Vec::new();
 
 		for filter in &subscribe.filters {
-			let granted = min_qos(filter.qos, Self::SERVER_MAX_QOS);
+			let granted = min_qos(filter.qos, self.limits.max_qos());
 
 			{
 				let mut state = self.state.borrow_mut();

@@ -44,7 +44,7 @@ pub struct ShardState {
 	trie: TopicTrie,
 	/// Last retained message per topic. Replicated on every shard (each retained
 	/// publish is broadcast to all shards), so a new subscriber finds matches
-	/// locally. Normalized to QoS 0, retain flag set.
+	/// locally.
 	retained: HashMap<String, Publish>,
 	/// Senders to every other shard in the full channel mesh. `None` until the
 	/// shard joins the mesh in `worker::init`.
@@ -97,9 +97,9 @@ impl ShardState {
 		self.trie.remove(filter, client_id);
 	}
 
-	/// Handles one (already-normalized, QoS 0) publish on this shard: updates the
-	/// retain table if the retain flag is set, then fans the message out to local
-	/// subscribers. Shared by the local publish path and the mesh drain task.
+	/// Routes one publish on this shard: updates the retain table if the retain
+	/// flag is set, then fans it out to local subscribers. Shared by the local
+	/// publish path and the mesh drain task.
 	pub fn deliver_local(&mut self, mut publish: Publish) {
 		if publish.retain {
 			self.update_retain(&publish);
