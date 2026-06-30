@@ -19,7 +19,7 @@ tracing-appender = "0.2"
 # CLI & configuration
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1.1"
 
 [[bin]]
 name = "mosquitto"
