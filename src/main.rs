@@ -2,6 +2,7 @@ mod auth;
 mod broker;
 mod config;
 mod logger;
+mod metrics;
 mod net;
 mod server;
 
@@ -85,12 +86,16 @@ fn run(config: Config) -> std::io::Result<()> {
 		signal_hook::flag::register(signal, Arc::clone(&shutdown))?;
 	}
 
+	// Cross-shard broker counters, published to `$SYS` by one shard.
+	let metrics = Arc::new(metrics::Metrics::default());
+
 	LocalExecutorPoolBuilder::new(placement)
 		.on_all_shards(move || {
 			let mesh = mesh.clone();
 			let config = Arc::clone(&config);
 			let shutdown = Arc::clone(&shutdown);
-			async move { server::worker::init(mesh, config, shutdown).await }
+			let metrics = Arc::clone(&metrics);
+			async move { server::worker::init(mesh, config, shutdown, metrics).await }
 		})
 		.expect("failed to spawn local executor")
 		.join_all();

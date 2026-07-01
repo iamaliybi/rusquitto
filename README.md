@@ -39,6 +39,9 @@ isolated, shard-local executor — no `Mutex`, no `RwLock`, no work-stealing.
   per shard, lock-free shard-local state.
 - **Structured logging** (`tracing`): non-blocking file appenders, daily rotation, a dedicated error log, per-connection
   spans tagged with `client_id`, and redaction of passwords and payloads.
+- **`$SYS` metrics** — the broker publishes retained `$SYS/broker/...` topics (uptime, connected/total clients,
+  messages and bytes in/out) on a configurable interval, so you can monitor it over MQTT by subscribing to
+  `$SYS/#`.
 - **Graceful shutdown** on `SIGTERM` / `SIGINT`: shards stop accepting, the process exits cleanly (code 0), and
   buffered logs are flushed instead of being lost to an abrupt kill.
 - **TOML configuration** with a typed, validated schema and a CLI.

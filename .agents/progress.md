@@ -140,6 +140,26 @@ non-blocking appender flushed).
 cleanup (session suspend / will) doesn't run. Draining connections is the next ops step
 (see [next-steps.md](next-steps.md) item 7).
 
+## Phase 3g — `$SYS` metrics (2026-07-02)
+
+New `src/metrics.rs`: `Arc<Metrics>` of relaxed `AtomicU64` counters shared across shards.
+
+| Item | Description | Status |
+|------|-------------|--------|
+| Counters | clients connected (gauge) / total, messages + bytes received/sent, uptime | ✅ |
+| Increments | `connection.rs` — `client_connected`/`disconnected` (guarded by a `counted` flag), `message_received` in `handle_publish`, `message_sent` in `send_publish` | ✅ |
+| Publisher | mesh **peer 0** publishes retained `$SYS/broker/...` every `[sys].interval` s (broadcast + `deliver_local`) | ✅ |
+| Config | `[sys]` (`enabled` default true, `interval` default 10 s); validated non-zero | ✅ |
+
+**Shard-election gotcha (fixed):** `glommio::executor().id()` is **1-based**, so the earlier `shard_id == 0`
+guard never matched — the `$SYS` publisher (and the `authentication configured` startup log) never fired.
+Both now use the 0-based mesh `peer_id()`.
+
+**Verification (single shard, interval 2 s):** a `$SYS/#` subscriber received all eight topics; values matched
+reality — `clients/total = 3`, `clients/connected = 1`, `messages/received = 2`, `bytes/received = 10`
+(`hello`+`world`), version/uptime correct. `messages/sent` includes the `$SYS` deliveries to the subscriber
+(expected). 8/8 unit tests pass.
+
 ## Architecture decisions locked in
 
 - **Mailbox payload:** `Rc<Publish>` for local fan-out; the mesh carries owned `Publish`, re-wrapped in `Rc` on the

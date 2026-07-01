@@ -67,3 +67,12 @@ allow_anonymous = true             # false = clients must present a valid userna
 # password  = "s3cret"
 # publish   = ["sensors/#"]                # may publish only under sensors/
 # subscribe = ["sensors/#", "cmd/alice"]   # may subscribe only to these
+
+# -----------------------------------------------------------------------------
+# [sys] — $SYS metrics topics
+# -----------------------------------------------------------------------------
+# Periodically publishes broker counters as retained "$SYS/broker/..." messages.
+# Subscribe to "$SYS/#" to monitor the broker over MQTT.
+[sys]
+enabled = true                     # Publish $SYS metrics topics.
+interval = 10                      # Seconds between $SYS updates.

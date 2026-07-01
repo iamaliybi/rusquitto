@@ -51,6 +51,7 @@ pub struct Config {
 	pub logging: LoggingConfig,
 	pub limits: LimitsConfig,
 	pub auth: AuthConfig,
+	pub sys: SysConfig,
 }
 
 /// `[server]` — network ingress.
@@ -158,6 +159,18 @@ pub struct AuthConfig {
 	pub users: Vec<UserConfig>,
 }
 
+/// `[sys]` — `$SYS/broker/...` metrics topics. One shard periodically publishes
+/// broker counters (uptime, client counts, message/byte throughput) as retained
+/// messages that any `$SYS/#` subscriber can read.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SysConfig {
+	/// Whether to publish `$SYS` metrics topics.
+	pub enabled: bool,
+	/// Interval between `$SYS` updates, in seconds.
+	pub interval: u64,
+}
+
 /// A single `[[auth.users]]` entry.
 ///
 /// Passwords are stored in plaintext in the config file, so protect it with file
@@ -201,6 +214,16 @@ impl Default for Config {
 			logging: LoggingConfig::default(),
 			limits: LimitsConfig::default(),
 			auth: AuthConfig::default(),
+			sys: SysConfig::default(),
+		}
+	}
+}
+
+impl Default for SysConfig {
+	fn default() -> Self {
+		Self {
+			enabled: true,
+			interval: 10,
 		}
 	}
 }
@@ -313,6 +336,9 @@ impl Config {
 		}
 		if self.limits.initial_read_buffer == 0 {
 			return invalid("limits.initial_read_buffer must be non-zero");
+		}
+		if self.sys.enabled && self.sys.interval == 0 {
+			return invalid("sys.interval must be non-zero when sys.enabled is true");
 		}
 		let mut seen = std::collections::HashSet::new();
 		for user in &self.auth.users {

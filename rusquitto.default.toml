@@ -172,3 +172,20 @@ allow_anonymous = true
 #
 # Type: array of { username, password, publish?, subscribe? }   Default: [] (none)
 users = []
+
+# =============================================================================
+# [sys] — $SYS metrics topics
+# =============================================================================
+# One shard periodically publishes broker-wide counters as retained
+# $SYS/broker/... messages (version, uptime, clients/connected, clients/total,
+# messages/received, messages/sent, bytes/received, bytes/sent). Subscribe to
+# "$SYS/#" to monitor the broker over MQTT.
+[sys]
+
+# Whether to publish $SYS metrics topics.
+# Type: boolean                   Default: true
+enabled = true
+
+# Interval between $SYS updates, in seconds.
+# Type: integer (seconds, > 0)    Default: 10
+interval = 10
