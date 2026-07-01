@@ -14,12 +14,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tracing::{debug, info, warn};
 
+use std::sync::Arc;
+
 use crate::auth::{AuthResult, Authenticator};
 use crate::broker::engine::{
 	Delivery, InflightMessage, InflightState, Mailbox, SessionSnapshot, ShardState,
 };
 use crate::config::LimitsConfig;
 use crate::logger::redact;
+use crate::metrics::Metrics;
 
 /// Monotonic counter for assigning identifiers to clients that connect without
 /// one (MQTT 5 allows an empty client id, leaving the server to assign it).
@@ -86,6 +89,11 @@ pub struct Connection {
 	/// Authenticated username, used for per-topic ACL checks. `None` for an
 	/// anonymous client (which is unrestricted).
 	username: Option<String>,
+	/// Cross-shard broker metrics (published to `$SYS`).
+	metrics: Arc<Metrics>,
+	/// Whether this connection has been counted as connected, so the matching
+	/// decrement happens exactly once (only after a successful CONNECT).
+	counted: bool,
 }
 
 impl Connection {
@@ -99,6 +107,7 @@ impl Connection {
 		state: Rc<RefCell<ShardState>>,
 		limits: LimitsConfig,
 		auth: Rc<Authenticator>,
+		metrics: Arc<Metrics>,
 	) -> Self {
 		let (mailbox_tx, mailbox_rx) = local_channel::new_unbounded();
 		Self {
@@ -121,6 +130,8 @@ impl Connection {
 			pending_outbound: VecDeque::new(),
 			auth,
 			username: None,
+			metrics,
+			counted: false,
 		}
 	}
 
@@ -195,6 +206,12 @@ impl Connection {
 				state.broadcast(&will);
 				state.deliver_local(will);
 			}
+		}
+
+		// Balance the connected-client gauge if this connection was ever counted.
+		if self.counted {
+			self.metrics.client_disconnected();
+			self.counted = false;
 		}
 
 		debug!("connection closed");
@@ -341,6 +358,7 @@ impl Connection {
 			return Ok(());
 		}
 
+		self.metrics.message_sent(message.payload.len());
 		self.stream.write_all(&buf).await
 	}
 
@@ -521,6 +539,10 @@ impl Connection {
 			offline_queue = handle.offline_queue;
 		}
 
+		// The CONNECT succeeded; count this client until it disconnects.
+		self.metrics.client_connected();
+		self.counted = true;
+
 		debug!(session_present, "session established");
 
 		// NOTE: mqttbytes' `ConnAck::write` omits the mandatory MQTT v5 property-
@@ -652,6 +674,8 @@ impl Connection {
 			payload = %redact::payload(&publish.payload),
 			"publish received"
 		);
+
+		self.metrics.message_received(publish.payload.len());
 
 		// Enforce publish authorization before routing. On denial the message is
 		// not fanned out: QoS > 0 gets a negative acknowledgement (Not Authorized),

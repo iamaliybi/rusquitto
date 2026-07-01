@@ -1,13 +1,14 @@
 use crate::auth::Authenticator;
 use crate::broker::engine::ShardState;
 use crate::config::Config;
+use crate::metrics::Metrics;
 use crate::net::socket::create_socket;
 use crate::net::tcp_listener::create_tcp_listener;
 use crate::server::connection::Connection;
 use futures_lite::FutureExt;
 use glommio::channels::channel_mesh::{Full, MeshBuilder};
 use glommio::net::TcpStream;
-use mqttbytes::v5::Publish;
+use mqttbytes::{QoS, v5::Publish};
 use std::cell::Cell;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -31,7 +32,12 @@ enum AcceptTurn {
 	Tick,
 }
 
-pub async fn init(mesh: MeshBuilder<Publish, Full>, config: Arc<Config>, shutdown: Arc<AtomicBool>) {
+pub async fn init(
+	mesh: MeshBuilder<Publish, Full>,
+	config: Arc<Config>,
+	shutdown: Arc<AtomicBool>,
+	metrics: Arc<Metrics>,
+) {
 	let shard_id: usize = glommio::executor().id();
 	let socket_addr = SocketAddr::new(config.server.bind, config.server.port);
 
@@ -53,6 +59,11 @@ pub async fn init(mesh: MeshBuilder<Publish, Full>, config: Arc<Config>, shutdow
 	};
 
 	let tcp_listener = create_tcp_listener(socket);
+
+	// Mesh peer id is 0-based and unique per shard (glommio executor ids are
+	// 1-based, so they can't be used to pick a single shard). Peer 0 is elected
+	// to publish the broker-wide `$SYS` metrics.
+	let mesh_peer_id = senders.peer_id();
 
 	// Shard-local broker state. Shared by Rc between every connection on this
 	// shard; never crosses the core boundary, so no locking is required.
@@ -83,13 +94,36 @@ pub async fn init(mesh: MeshBuilder<Publish, Full>, config: Arc<Config>, shutdow
 		.detach();
 	}
 
+	// One shard owns publishing `$SYS` metrics (they are broker-wide totals, so a
+	// single publisher avoids duplicates). Messages are retained and broadcast to
+	// every shard, so any `$SYS/#` subscriber — on any shard — sees them.
+	if mesh_peer_id == 0 && config.sys.enabled {
+		let state = state.clone();
+		let metrics = metrics.clone();
+		let interval = Duration::from_secs(config.sys.interval);
+		glommio::spawn_local(async move {
+			loop {
+				glommio::timer::sleep(interval).await;
+				let topics = metrics.snapshot().topics();
+				let mut shard_state = state.borrow_mut();
+				for (topic, value) in topics {
+					let mut publish = Publish::new(topic, QoS::AtMostOnce, value.into_bytes());
+					publish.retain = true;
+					shard_state.broadcast(&publish);
+					shard_state.deliver_local(publish);
+				}
+			}
+		})
+		.detach();
+	}
+
 	tracing::info!(shard = shard_id, "shard ready, accepting connections");
 
 	let limits = config.limits;
 	let max_conns = limits.max_connections_per_shard;
 	// Shard-local credential store, shared by every connection on this shard.
 	let auth = Rc::new(Authenticator::from_config(&config.auth));
-	if shard_id == 0 {
+	if mesh_peer_id == 0 {
 		tracing::info!(
 			enforced = !auth.is_open(),
 			users = config.auth.users.len(),
@@ -140,6 +174,7 @@ pub async fn init(mesh: MeshBuilder<Publish, Full>, config: Arc<Config>, shutdow
 		let state = state.clone();
 		let counter = conn_count.clone();
 		let auth = auth.clone();
+		let metrics = metrics.clone();
 		// One span per connection. `client_id` is recorded later, once the
 		// client sends CONNECT, so every log line for this connection — on
 		// either side of an `.await` — automatically carries it.
@@ -150,7 +185,8 @@ pub async fn init(mesh: MeshBuilder<Publish, Full>, config: Arc<Config>, shutdow
 		);
 		glommio::spawn_local(
 			async move {
-				let mut connection = Connection::new(stream, shard_id, state, limits, auth);
+				let mut connection =
+					Connection::new(stream, shard_id, state, limits, auth, metrics);
 				let _ = connection.run().await;
 				counter.set(counter.get() - 1);
 			}

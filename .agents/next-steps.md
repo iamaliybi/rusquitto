@@ -94,12 +94,16 @@ Topic Alias support (we advertise 0, i.e. none accepted inbound, and send none o
 set, so `init()` returns, the executor pool unwinds, and `main` returns normally — flushing the non-blocking
 log guards (previously a signal killed the process mid-write, losing buffered logs). Exits with code 0.
 
+**`$SYS` metrics done.** `src/metrics.rs` — an `Arc<Metrics>` of relaxed atomics (clients connected/total,
+messages + bytes in/out, uptime) shared across shards; mesh peer 0 publishes retained `$SYS/broker/...` topics
+every `[sys].interval` seconds. Note: glommio executor ids are **1-based**, so shard election uses the 0-based
+mesh `peer_id()`, not `executor().id()`.
+
 **Remaining:**
 - **Drain active connections on shutdown** — currently in-flight connection tasks are dropped (no client
   DISCONNECT, and `run()` cleanup / will handling doesn't run). Send DISCONNECT `ServerShuttingDown` (0x8B) and
   let sessions suspend cleanly. Needs a per-connection shutdown signal (e.g. a shard-local broadcast the event
   loop selects on).
-- `$SYS` metrics topics, connection/throughput counters.
 - Documented `RLIMIT_MEMLOCK` requirement (io_uring buffer registration `ENOMEM` under load — see progress.md).
 
 ## Code map for the above
