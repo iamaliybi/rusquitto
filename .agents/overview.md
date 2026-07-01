@@ -5,7 +5,7 @@
 **Architecture:** Thread-per-core, Shared-Nothing
 **Runtime:** Glommio (io_uring, Linux 5.8+)
 **Author:** Ali Yaghoubi
-**Status:** Functional pub/sub broker with shard-local persistent sessions — Phase 3a complete.
+**Status:** Functional pub/sub broker with persistent sessions + will messages — Phase 3a/3b complete.
 **Last updated:** 2026-07-02
 
 See [progress.md](progress.md) for the detailed implementation log, decisions, and gotchas.
@@ -37,10 +37,11 @@ See [progress.md](progress.md) for the detailed implementation log, decisions, a
 | Offline message queueing (QoS > 0)           | ✅ buffered while suspended         |
 | In-flight retransmission (DUP) on resume     | ✅ QoS 1/2                          |
 | Session takeover (Client ID reuse)           | ✅ generation-guarded              |
+| Will messages                                | ✅ fire on abnormal, suppress clean |
 | Cross-shard QoS > 0 guarantees               | ⚠️ best-effort (drop-on-full mesh) |
 | Cross-shard session resume                   | ⚠️ shard-local only (see below)    |
+| Will Delay Interval                          | ⚠️ treated as 0 (immediate)        |
 | Auth / ACL                                   | ❌ planned                          |
-| Will messages                                | ❌ planned                          |
 | Flow control (receive maximum)               | ❌ planned                          |
 
 ---

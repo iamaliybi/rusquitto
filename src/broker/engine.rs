@@ -337,18 +337,23 @@ impl ShardState {
 	/// the subscriptions stay armed in the trie, and an expiry deadline is set
 	/// (unless the interval is `0xFFFFFFFF`, meaning it never expires) so
 	/// [`sweep_expired`](Self::sweep_expired) can reclaim it later.
+	///
+	/// Returns `true` if this connection still owned the session (generations
+	/// matched) and it was closed, or `false` if it had already been taken over —
+	/// the caller uses this to decide whether to publish the Will Message (a
+	/// takeover must not trigger the displaced connection's will).
 	pub fn close_session(
 		&mut self,
 		client_id: &str,
 		generation: u64,
 		expiry_secs: u32,
 		snapshot: SessionSnapshot,
-	) {
+	) -> bool {
 		let Some(session) = self.sessions.get_mut(client_id) else {
-			return;
+			return false;
 		};
 		if session.generation != generation {
-			return;
+			return false;
 		}
 
 		if expiry_secs == 0 {
@@ -360,6 +365,7 @@ impl ShardState {
 			session.expires_at = (expiry_secs != SESSION_NEVER_EXPIRES)
 				.then(|| Instant::now() + Duration::from_secs(u64::from(expiry_secs)));
 		}
+		true
 	}
 
 	/// Discards every suspended session whose expiry deadline has passed, along
