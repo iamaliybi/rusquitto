@@ -1,3 +1,4 @@
+use crate::auth::Authenticator;
 use crate::broker::engine::ShardState;
 use crate::config::Config;
 use crate::net::socket::create_socket;
@@ -71,6 +72,16 @@ pub async fn init(mesh: MeshBuilder<Publish, Full>, config: Arc<Config>) {
 
 	let limits = config.limits;
 	let max_conns = limits.max_connections_per_shard;
+	// Shard-local credential store, shared by every connection on this shard.
+	let auth = Rc::new(Authenticator::from_config(&config.auth));
+	if shard_id == 0 {
+		tracing::info!(
+			enforced = !auth.is_open(),
+			users = config.auth.users.len(),
+			allow_anonymous = config.auth.allow_anonymous,
+			"authentication configured"
+		);
+	}
 	// Shard-local live-connection counter (single-threaded, so a plain Cell).
 	let conn_count = Rc::new(Cell::new(0usize));
 
@@ -90,6 +101,7 @@ pub async fn init(mesh: MeshBuilder<Publish, Full>, config: Arc<Config>) {
 
 				let state = state.clone();
 				let counter = conn_count.clone();
+				let auth = auth.clone();
 				// One span per connection. `client_id` is recorded later, once the
 				// client sends CONNECT, so every log line for this connection — on
 				// either side of an `.await` — automatically carries it.
@@ -100,7 +112,7 @@ pub async fn init(mesh: MeshBuilder<Publish, Full>, config: Arc<Config>) {
 				);
 				glommio::spawn_local(
 					async move {
-						let mut connection = Connection::new(stream, shard_id, state, limits);
+						let mut connection = Connection::new(stream, shard_id, state, limits, auth);
 						let _ = connection.run().await;
 						counter.set(counter.get() - 1);
 					}

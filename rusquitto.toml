@@ -50,3 +50,16 @@ max_inflight = 128                 # Outbound QoS 1/2 in-flight window per conne
 max_qos = 2                        # Max QoS granted to subscribers: 0, 1, or 2.
 keep_alive = 60                    # Server keep-alive (seconds) advertised in CONNACK. 0 disables.
 retain_available = true            # Whether retained messages are accepted/served.
+
+# -----------------------------------------------------------------------------
+# [auth] — connection authentication
+# -----------------------------------------------------------------------------
+# Defaults are open: anonymous allowed, no users -> any client may connect.
+# Set allow_anonymous = false and/or add users to require credentials.
+[auth]
+allow_anonymous = true             # false = clients must present a valid username/password.
+
+# One table per user. Passwords are plaintext, so keep this file secret.
+# [[auth.users]]
+# username = "alice"
+# password = "s3cret"

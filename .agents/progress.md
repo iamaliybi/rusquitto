@@ -82,6 +82,27 @@ client `receive-maximum 1` → 5 QoS 1 messages all delivered in order (drain wo
 
 **Known limitation:** inbound Receive Maximum and Topic Alias not yet enforced — see [next-steps.md](next-steps.md) item 5.
 
+## Phase 3d — Authentication (2026-07-02)
+
+New `src/auth.rs`: `Authenticator { allow_anonymous, users: HashMap<String,String> }` built per shard from
+`[auth]` config; `check(username, password) -> AuthResult { Granted | BadUserNamePassword | NotAuthorized }`.
+
+| Item | Description | Status |
+|------|-------------|--------|
+| Config | `[auth]` with `allow_anonymous` (default true) + `[[auth.users]]` (username/password); validates empty/duplicate usernames | ✅ |
+| Wiring | `Rc<Authenticator>` built once per shard in `worker.rs`, passed to `Connection::new`; startup log on shard 0 | ✅ |
+| Enforcement | `handle_connect` authenticates before opening a session; failure → `reject_connect` writes CONNACK reason and closes | ✅ |
+| Reason codes | `BadUserNamePassword` (0x86) for wrong user/pass, `NotAuthorized` (0x87) for forbidden anonymous | ✅ |
+| Unit tests | `auth::tests` — open, anonymous-forbidden, good/bad password (3 tests) | ✅ |
+
+Default config stays open (anonymous allowed, no users) so existing behaviour is unchanged.
+
+**Verification (single shard):** correct creds connect + deliver ✅; wrong password → client exit 134
+(`Bad User Name or Password`) ✅; anonymous → client exit 135 (`Not authorized`) ✅; broker logs both failures
+with redacted credentials. Both sample configs parse with the new `[auth]` section.
+
+**Known limitation:** passwords are plaintext; no topic ACL yet — see [next-steps.md](next-steps.md) item 4.
+
 ## Architecture decisions locked in
 
 - **Mailbox payload:** `Rc<Publish>` for local fan-out; the mesh carries owned `Publish`, re-wrapped in `Rc` on the

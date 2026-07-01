@@ -50,6 +50,7 @@ pub struct Config {
 	pub runtime: RuntimeConfig,
 	pub logging: LoggingConfig,
 	pub limits: LimitsConfig,
+	pub auth: AuthConfig,
 }
 
 /// `[server]` — network ingress.
@@ -145,6 +146,30 @@ pub struct LimitsConfig {
 	pub retain_available: bool,
 }
 
+/// `[auth]` — connection authentication. When `allow_anonymous` is true and no
+/// users are defined (the default), authentication is a no-op and any client may
+/// connect.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthConfig {
+	/// Whether clients may connect without supplying a username.
+	pub allow_anonymous: bool,
+	/// Known users. A client that presents a username must match one of these.
+	pub users: Vec<UserConfig>,
+}
+
+/// A single `[[auth.users]]` entry.
+///
+/// Passwords are stored in plaintext in the config file, so protect it with file
+/// permissions and treat it as a secret. (Hashed passwords are a planned
+/// enhancement.)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserConfig {
+	pub username: String,
+	pub password: String,
+}
+
 impl LimitsConfig {
 	/// The `max_qos` ceiling as a typed [`QoS`].
 	pub fn max_qos(&self) -> QoS {
@@ -167,6 +192,16 @@ impl Default for Config {
 			runtime: RuntimeConfig::default(),
 			logging: LoggingConfig::default(),
 			limits: LimitsConfig::default(),
+			auth: AuthConfig::default(),
+		}
+	}
+}
+
+impl Default for AuthConfig {
+	fn default() -> Self {
+		Self {
+			allow_anonymous: true,
+			users: Vec::new(),
 		}
 	}
 }
@@ -270,6 +305,18 @@ impl Config {
 		}
 		if self.limits.initial_read_buffer == 0 {
 			return invalid("limits.initial_read_buffer must be non-zero");
+		}
+		let mut seen = std::collections::HashSet::new();
+		for user in &self.auth.users {
+			if user.username.is_empty() {
+				return invalid("auth.users entries must have a non-empty username");
+			}
+			if !seen.insert(user.username.as_str()) {
+				return Err(ConfigError::Validation(format!(
+					"duplicate auth user '{}'",
+					user.username
+				)));
+			}
 		}
 		Ok(())
 	}
