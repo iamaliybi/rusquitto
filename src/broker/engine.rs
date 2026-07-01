@@ -1,12 +1,54 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use glommio::channels::channel_mesh::Senders;
 use glommio::channels::local_channel::LocalSender;
 use mqttbytes::{v5::Publish, QoS};
 
 use crate::broker::topic_trie::{filter_matches, TopicTrie};
+
+/// MQTT 5 Session Expiry Interval sentinel meaning "the session never expires".
+const SESSION_NEVER_EXPIRES: u32 = u32::MAX;
+
+/// Upper bound on QoS > 0 messages buffered for a suspended (offline) session.
+/// Prevents an unbounded backlog for a client that never returns; the oldest
+/// messages are dropped once the queue is full.
+const OFFLINE_QUEUE_LIMIT: usize = 1024;
+
+/// Stage of an outbound QoS 1/2 message awaiting acknowledgement. Held per
+/// in-flight packet id so the exchange can be resumed and retransmitted after a
+/// reconnect.
+pub enum InflightState {
+	/// QoS 1 PUBLISH sent, awaiting PUBACK.
+	Qos1,
+	/// QoS 2 PUBLISH sent, awaiting PUBREC.
+	Qos2Pending,
+	/// QoS 2 PUBREL sent, awaiting PUBCOMP.
+	Qos2Released,
+}
+
+/// An outbound QoS 1/2 message in flight: its stage plus the PUBLISH itself, so
+/// it can be retransmitted (with the DUP flag) when a session resumes.
+pub struct InflightMessage {
+	pub publish: Publish,
+	pub state: InflightState,
+}
+
+/// The durable QoS state a connection hands to its session when it disconnects,
+/// and receives back when the session is resumed. While the client is connected
+/// this state lives in the [`Connection`](crate::server::connection::Connection)
+/// (hot path, no shared-state borrow); it only rests here between connections.
+#[derive(Default)]
+pub struct SessionSnapshot {
+	/// Outbound QoS 1/2 messages we sent but the client has not fully acked.
+	pub inflight: HashMap<u16, InflightMessage>,
+	/// Inbound QoS 2 messages received (PUBLISH) but not yet released (PUBREL).
+	pub incoming_qos2: HashMap<u16, Publish>,
+	/// Where the outbound packet-id allocator left off.
+	pub next_pkid: u16,
+}
 
 /// Returns the lower of two QoS levels.
 fn min_qos(a: QoS, b: QoS) -> QoS {
@@ -27,9 +69,54 @@ pub struct Delivery {
 /// Sender half of a connection's mailbox.
 ///
 /// `LocalSender` is single-owner (not `Clone`), so each connection's sender is
-/// stored exactly once — in [`ShardState::clients`] — and subscriptions refer to
-/// the connection by `client_id` rather than holding their own sender.
+/// stored exactly once — in its [`Session`] — and subscriptions refer to the
+/// client by `client_id` rather than holding their own sender.
 pub type Mailbox = LocalSender<Delivery>;
+
+/// Durable per-client session state, keyed by `client_id` in [`ShardState`].
+///
+/// A session outlives the [`Connection`](crate::server::connection::Connection)
+/// that created it: on disconnect with a non-zero Session Expiry Interval the
+/// session is *suspended* (its live mailbox dropped, subscriptions retained in
+/// the trie) rather than destroyed, so a later reconnect with the same client id
+/// resumes it. The subscriptions themselves live in the shared [`TopicTrie`]
+/// keyed by `client_id`, so they persist across reconnects without being copied
+/// here.
+struct Session {
+	/// Live mailbox while the client is connected; `None` while suspended.
+	mailbox: Option<Mailbox>,
+	/// Deadline after which a suspended session is discarded. `None` means either
+	/// the client is currently connected, or the session never expires
+	/// (Session Expiry Interval `0xFFFFFFFF`); the two are told apart by whether
+	/// `mailbox` is `Some`.
+	expires_at: Option<Instant>,
+	/// Bumped every time a connection (re)opens this session. A departing
+	/// connection only tears its session down if this still matches the
+	/// generation it opened, so a takeover by a newer connection is never
+	/// clobbered by the old one's cleanup.
+	generation: u64,
+	/// Durable QoS state, populated only while the session is suspended (the
+	/// connected client holds the live copy). Restored on resume.
+	snapshot: SessionSnapshot,
+	/// QoS > 0 messages that matched while the client was offline, delivered in
+	/// order when it reconnects. Bounded by [`OFFLINE_QUEUE_LIMIT`].
+	offline_queue: VecDeque<Delivery>,
+}
+
+/// Outcome of opening a session at CONNECT, returned to the connection so it can
+/// set CONNACK `session_present`, remember which generation it owns, and restore
+/// any durable state carried over from a previous connection.
+pub struct SessionHandle {
+	/// Whether an existing session was resumed (drives CONNACK `session_present`).
+	pub resumed: bool,
+	/// The generation this connection now owns; passed back to `close_session`.
+	pub generation: u64,
+	/// Durable QoS state to restore into the connection (empty when fresh).
+	pub snapshot: SessionSnapshot,
+	/// Messages buffered while the session was offline, to flush after CONNACK
+	/// (empty when fresh).
+	pub offline_queue: VecDeque<Delivery>,
+}
 
 /// Per-shard broker state.
 ///
@@ -38,8 +125,12 @@ pub type Mailbox = LocalSender<Delivery>;
 /// core ever touches this memory.
 #[derive(Default)]
 pub struct ShardState {
-	/// Connected clients on this shard -> their mailbox sender.
-	clients: HashMap<String, Mailbox>,
+	/// Sessions on this shard, keyed by client id. Present while a client is
+	/// connected and, if it has a non-zero expiry, while suspended after it
+	/// disconnects.
+	sessions: HashMap<String, Session>,
+	/// Monotonic session-generation counter (see [`Session::generation`]).
+	next_generation: u64,
 	/// Subscription index: wildcard-aware topic trie keyed by filter.
 	trie: TopicTrie,
 	/// Last retained message per topic. Replicated on every shard (each retained
@@ -81,9 +172,61 @@ impl ShardState {
 		}
 	}
 
-	/// Records a connected client's mailbox. Called once at CONNECT.
-	pub fn register(&mut self, client_id: String, mailbox: Mailbox) {
-		self.clients.insert(client_id, mailbox);
+	/// Opens (or resumes) a session for a connecting client, installing its live
+	/// `mailbox`. Called once per CONNECT.
+	///
+	/// - `clean_start = true` discards any existing session and its subscriptions,
+	///   then starts fresh (`resumed = false`).
+	/// - `clean_start = false` resumes an existing session if one is present —
+	///   re-attaching the mailbox and clearing its expiry, with the subscriptions
+	///   already armed in the trie (`resumed = true`) — otherwise starts fresh.
+	///
+	/// If a session for this client id was still *online* (a live connection),
+	/// installing the new mailbox drops the old sender, which closes the old
+	/// connection's channel and ends it: a session takeover. The returned
+	/// generation lets the displaced connection detect that it was taken over.
+	pub fn open_session(
+		&mut self,
+		client_id: &str,
+		mailbox: Mailbox,
+		clean_start: bool,
+	) -> SessionHandle {
+		self.next_generation += 1;
+		let generation = self.next_generation;
+
+		if clean_start {
+			if self.sessions.remove(client_id).is_some() {
+				self.trie.remove_client(client_id);
+			}
+		} else if let Some(existing) = self.sessions.get_mut(client_id) {
+			existing.mailbox = Some(mailbox);
+			existing.expires_at = None;
+			existing.generation = generation;
+			// Hand the durable state back to the resuming connection.
+			return SessionHandle {
+				resumed: true,
+				generation,
+				snapshot: std::mem::take(&mut existing.snapshot),
+				offline_queue: std::mem::take(&mut existing.offline_queue),
+			};
+		}
+
+		self.sessions.insert(
+			client_id.to_string(),
+			Session {
+				mailbox: Some(mailbox),
+				expires_at: None,
+				generation,
+				snapshot: SessionSnapshot::default(),
+				offline_queue: VecDeque::new(),
+			},
+		);
+		SessionHandle {
+			resumed: false,
+			generation,
+			snapshot: SessionSnapshot::default(),
+			offline_queue: VecDeque::new(),
+		}
 	}
 
 	/// Subscribes a client to a topic filter with a granted QoS. The filter may
@@ -137,34 +280,102 @@ impl ShardState {
 	/// overlapping filters receives a single copy, at the highest QoS it was
 	/// granted across those filters (capped by the publish QoS). Uses `try_send`
 	/// so a slow or full consumer never blocks the publisher.
-	fn route(&self, publish: Rc<Publish>) {
+	fn route(&mut self, publish: Rc<Publish>) {
 		let mut matches = Vec::new();
 		self.trie.matching(&publish.topic, &mut matches);
 
 		// Collapse overlapping subscriptions to the best granted QoS per client.
-		let mut best: HashMap<&str, QoS> = HashMap::new();
+		// Owned keys so the borrow of the trie ends before we touch `sessions`.
+		let mut best: HashMap<String, QoS> = HashMap::new();
 		for sub in matches {
-			let entry = best.entry(sub.client_id.as_str()).or_insert(sub.qos);
+			let entry = best
+				.entry(sub.client_id.clone())
+				.or_insert(sub.qos);
 			if (sub.qos as u8) > (*entry as u8) {
 				*entry = sub.qos;
 			}
 		}
 
 		for (client_id, granted) in best {
-			if let Some(mailbox) = self.clients.get(client_id) {
-				let qos = min_qos(publish.qos, granted);
-				let _ = mailbox.try_send(Delivery {
-					publish: publish.clone(),
-					qos,
-				});
+			let Some(session) = self.sessions.get_mut(&client_id) else {
+				continue;
+			};
+			let qos = min_qos(publish.qos, granted);
+
+			match &session.mailbox {
+				// Online: hand straight to the live mailbox.
+				Some(mailbox) => {
+					let _ = mailbox.try_send(Delivery {
+						publish: publish.clone(),
+						qos,
+					});
+				}
+				// Suspended: buffer QoS > 0 for delivery on resume; drop QoS 0.
+				None if qos != QoS::AtMostOnce => {
+					if session.offline_queue.len() >= OFFLINE_QUEUE_LIMIT {
+						session.offline_queue.pop_front();
+					}
+					session.offline_queue.push_back(Delivery {
+						publish: publish.clone(),
+						qos,
+					});
+				}
+				None => {}
 			}
 		}
 	}
 
-	/// Removes a client's mailbox and all of its subscriptions. Called on
-	/// disconnect or EOF; dropping the mailbox closes the connection's channel.
-	pub fn disconnect(&mut self, client_id: &str) {
-		self.clients.remove(client_id);
-		self.trie.remove_client(client_id);
+	/// Ends a connection's hold on its session when the socket closes (clean
+	/// DISCONNECT or EOF/error).
+	///
+	/// `generation` must be the value returned by the matching [`open_session`];
+	/// if a newer connection has since taken over this client id the generations
+	/// differ and this is a no-op, leaving the new session untouched.
+	///
+	/// With `expiry_secs = 0` the session (and its subscriptions) is destroyed
+	/// immediately. Otherwise it is *suspended*: the live mailbox is dropped but
+	/// the subscriptions stay armed in the trie, and an expiry deadline is set
+	/// (unless the interval is `0xFFFFFFFF`, meaning it never expires) so
+	/// [`sweep_expired`](Self::sweep_expired) can reclaim it later.
+	pub fn close_session(
+		&mut self,
+		client_id: &str,
+		generation: u64,
+		expiry_secs: u32,
+		snapshot: SessionSnapshot,
+	) {
+		let Some(session) = self.sessions.get_mut(client_id) else {
+			return;
+		};
+		if session.generation != generation {
+			return;
+		}
+
+		if expiry_secs == 0 {
+			self.sessions.remove(client_id);
+			self.trie.remove_client(client_id);
+		} else {
+			session.mailbox = None;
+			session.snapshot = snapshot;
+			session.expires_at = (expiry_secs != SESSION_NEVER_EXPIRES)
+				.then(|| Instant::now() + Duration::from_secs(u64::from(expiry_secs)));
+		}
+	}
+
+	/// Discards every suspended session whose expiry deadline has passed, along
+	/// with its subscriptions. Driven periodically by a per-shard timer task.
+	pub fn sweep_expired(&mut self) {
+		let now = Instant::now();
+		let expired: Vec<String> = self
+			.sessions
+			.iter()
+			.filter(|(_, s)| s.mailbox.is_none() && s.expires_at.is_some_and(|d| d <= now))
+			.map(|(id, _)| id.clone())
+			.collect();
+
+		for id in expired {
+			self.sessions.remove(&id);
+			self.trie.remove_client(&id);
+		}
 	}
 }

@@ -7,14 +7,16 @@ use mqttbytes::{
 	Error as MqttError, QoS,
 };
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Error, ErrorKind, Result};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tracing::{debug, info, warn};
 
-use crate::broker::engine::{Delivery, Mailbox, ShardState};
+use crate::broker::engine::{
+	Delivery, InflightMessage, InflightState, Mailbox, SessionSnapshot, ShardState,
+};
 use crate::config::LimitsConfig;
 use crate::logger::redact;
 
@@ -22,16 +24,6 @@ use crate::logger::redact;
 /// one (MQTT 5 allows an empty client id, leaving the server to assign it).
 /// Combined with the shard id it is unique across the whole broker.
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(0);
-
-/// State of an outbound QoS 1/2 message awaiting acknowledgement from the client.
-enum Inflight {
-	/// QoS 1 PUBLISH sent, awaiting PUBACK.
-	Qos1,
-	/// QoS 2 PUBLISH sent, awaiting PUBREC.
-	Qos2Pending,
-	/// QoS 2 PUBREL sent, awaiting PUBCOMP.
-	Qos2Released,
-}
 
 /// One iteration of the connection event loop resolves to exactly one of these:
 /// either the client sent us bytes, or the broker routed a message to us.
@@ -59,12 +51,21 @@ pub struct Connection {
 	/// keyed by the publisher's packet id. Delivered exactly once on PUBREL.
 	incoming_qos2: HashMap<u16, mqtt_v5::Publish>,
 	/// Outbound QoS 1/2 messages we sent to this client, keyed by the packet id
-	/// we assigned, awaiting their acknowledgement.
-	inflight: HashMap<u16, Inflight>,
+	/// we assigned, awaiting their acknowledgement. Retained so they can be
+	/// retransmitted (with DUP) if the session is resumed.
+	inflight: HashMap<u16, InflightMessage>,
 	/// Rolling packet-id allocator for outbound QoS 1/2 messages.
 	next_pkid: u16,
 	/// Broker resource limits (max payload, granted QoS, keep-alive, …).
 	limits: LimitsConfig,
+	/// Session Expiry Interval (seconds) negotiated at CONNECT: `0` discards the
+	/// session on disconnect, `0xFFFFFFFF` keeps it forever, anything between
+	/// suspends it for that many seconds. See [`ShardState::close_session`].
+	session_expiry: u32,
+	/// Generation token for this connection's session, returned by
+	/// `open_session` and handed back to `close_session` so a takeover by a
+	/// newer connection isn't torn down by this one's cleanup.
+	session_generation: u64,
 }
 
 impl Connection {
@@ -91,6 +92,8 @@ impl Connection {
 			inflight: HashMap::new(),
 			next_pkid: 0,
 			limits,
+			session_expiry: 0,
+			session_generation: 0,
 		}
 	}
 
@@ -106,10 +109,23 @@ impl Connection {
 
 		let result = self.event_loop().await;
 
-		// Always deregister so the mailbox sender is dropped and stale
-		// subscriptions are purged, whichever way the loop exited.
+		// Release our hold on the session, whichever way the loop exited. Depending
+		// on the negotiated expiry this either destroys the session (and its
+		// subscriptions) or suspends it for a later reconnect, handing over our
+		// durable QoS state so it survives the gap. The generation guard makes this
+		// a no-op if a newer connection already took over our client id.
 		if !self.client_id.is_empty() {
-			self.state.borrow_mut().disconnect(&self.client_id);
+			let snapshot = SessionSnapshot {
+				inflight: std::mem::take(&mut self.inflight),
+				incoming_qos2: std::mem::take(&mut self.incoming_qos2),
+				next_pkid: self.next_pkid,
+			};
+			self.state.borrow_mut().close_session(
+				&self.client_id,
+				self.session_generation,
+				self.session_expiry,
+				snapshot,
+			);
 		}
 
 		debug!("connection closed");
@@ -219,12 +235,12 @@ impl Connection {
 			QoS::AtLeastOnce => {
 				let pkid = self.alloc_pkid();
 				message.pkid = pkid;
-				self.inflight.insert(pkid, Inflight::Qos1);
+				self.track_inflight(pkid, &message, InflightState::Qos1);
 			}
 			QoS::ExactlyOnce => {
 				let pkid = self.alloc_pkid();
 				message.pkid = pkid;
-				self.inflight.insert(pkid, Inflight::Qos2Pending);
+				self.track_inflight(pkid, &message, InflightState::Qos2Pending);
 			}
 		}
 
@@ -233,6 +249,18 @@ impl Connection {
 			.write(&mut buf)
 			.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
 		self.stream.write_all(&buf).await
+	}
+
+	/// Records an outbound QoS 1/2 message in the in-flight window, keeping a copy
+	/// of the PUBLISH so it can be retransmitted with the DUP flag on resume.
+	fn track_inflight(&mut self, pkid: u16, message: &mqtt_v5::Publish, state: InflightState) {
+		self.inflight.insert(
+			pkid,
+			InflightMessage {
+				publish: message.clone(),
+				state,
+			},
+		);
 	}
 
 	/// Allocates the next unused packet id (1..=65535) for an outbound message.
@@ -276,7 +304,19 @@ impl Connection {
 
 impl Connection {
 	async fn handle_connect(&mut self, connect: mqtt_v5::Connect) -> Result<()> {
-		self.client_id = if connect.client_id.is_empty() {
+		// Clean Start decides whether an existing session is resumed; the Session
+		// Expiry Interval decides how long the session outlives a disconnect.
+		let clean_start = connect.clean_session;
+		self.session_expiry = connect
+			.properties
+			.as_ref()
+			.and_then(|p| p.session_expiry_interval)
+			.unwrap_or(0);
+
+		// An empty client id has the server assign one, which must then be echoed
+		// back in CONNACK so the client can reconnect to the same session.
+		let assigned = connect.client_id.is_empty();
+		self.client_id = if assigned {
 			let n = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
 			format!("auto-{}-{}", self.shard_id, n)
 		} else {
@@ -294,28 +334,47 @@ impl Connection {
 				connect.login.as_ref().map(|l| l.username.as_str()),
 				connect.login.as_ref().is_some_and(|l| !l.password.is_empty()),
 			),
-			clean_session = connect.clean_session,
+			clean_session = clean_start,
+			session_expiry = self.session_expiry,
 			keep_alive = connect.keep_alive,
 			"client connected"
 		);
 
-		// Hand our mailbox sender to the shard registry so other connections can
-		// route messages to us. The registry now owns it (the sender is not Clone).
+		// Open or resume the session, handing over our mailbox sender. The shard
+		// now owns it (the sender is not Clone); on takeover this displaces any
+		// prior live connection for the same client id. Resuming restores the
+		// durable QoS state and any messages buffered while we were offline.
+		let mut session_present = false;
+		let mut offline_queue = VecDeque::new();
 		if let Some(mailbox) = self.mailbox_tx.take() {
-			self.state
-				.borrow_mut()
-				.register(self.client_id.clone(), mailbox);
+			let handle =
+				self.state
+					.borrow_mut()
+					.open_session(&self.client_id, mailbox, clean_start);
+			self.session_generation = handle.generation;
+			session_present = handle.resumed;
+			self.inflight = handle.snapshot.inflight;
+			self.incoming_qos2 = handle.snapshot.incoming_qos2;
+			self.next_pkid = handle.snapshot.next_pkid;
+			offline_queue = handle.offline_queue;
 		}
+
+		debug!(session_present, "session established");
 
 		// NOTE: mqttbytes' `ConnAck::write` omits the mandatory MQTT v5 property-
 		// length byte when `properties` is `None`, producing a malformed packet
 		// that clients reject. Attach an empty property set so the 0-length is
 		// emitted. (SubAck/Publish/PubAck handle the None case correctly.)
-		let mut conn_ack = mqtt_v5::ConnAck::new(mqtt_v5::ConnectReturnCode::Success, false);
+		let mut conn_ack =
+			mqtt_v5::ConnAck::new(mqtt_v5::ConnectReturnCode::Success, session_present);
 		let mut props = mqtt_v5::ConnAckProperties::new();
 		// Advertise the server keep-alive so clients adopt our ceiling.
 		if self.limits.keep_alive > 0 {
 			props.server_keep_alive = Some(self.limits.keep_alive);
+		}
+		// Tell the client the id we assigned so it can resume this session later.
+		if assigned {
+			props.assigned_client_identifier = Some(self.client_id.clone());
 		}
 		conn_ack.properties = Some(props);
 		let mut buf = BytesMut::new();
@@ -323,7 +382,62 @@ impl Connection {
 			.write(&mut buf)
 			.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
 
-		self.stream.write_all(&buf).await
+		self.stream.write_all(&buf).await?;
+
+		// After CONNACK, resurrect message flow for a resumed session.
+		if session_present {
+			self.resume_delivery(offline_queue).await?;
+		}
+
+		Ok(())
+	}
+
+	/// Restores message flow on a resumed session: first retransmit the unacked
+	/// in-flight QoS 1/2 messages (with the DUP flag, reusing their packet ids),
+	/// then deliver everything buffered while the client was offline.
+	async fn resume_delivery(&mut self, offline_queue: VecDeque<Delivery>) -> Result<()> {
+		// Encode the retransmissions before writing, so we don't hold a borrow of
+		// `self.inflight` across the await points.
+		let mut packets: Vec<BytesMut> = Vec::with_capacity(self.inflight.len());
+		for (pkid, entry) in &self.inflight {
+			let mut buf = BytesMut::new();
+			match entry.state {
+				// Message not yet acknowledged: resend the PUBLISH marked DUP.
+				InflightState::Qos1 | InflightState::Qos2Pending => {
+					let mut publish = entry.publish.clone();
+					publish.pkid = *pkid;
+					publish.dup = true;
+					publish
+						.write(&mut buf)
+						.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+				}
+				// PUBLISH already acknowledged via PUBREC: resume at PUBREL.
+				InflightState::Qos2Released => {
+					mqtt_v5::PubRel::new(*pkid)
+						.write(&mut buf)
+						.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+				}
+			}
+			packets.push(buf);
+		}
+
+		if !packets.is_empty() {
+			debug!(count = packets.len(), "retransmitting in-flight messages");
+			for buf in packets {
+				self.stream.write_all(&buf).await?;
+			}
+		}
+
+		// Deliver messages that arrived while the session was suspended; each gets
+		// a fresh packet id via the normal outbound path.
+		if !offline_queue.is_empty() {
+			debug!(count = offline_queue.len(), "flushing offline queue");
+			for delivery in offline_queue {
+				self.send_publish(&delivery.publish, delivery.qos).await?;
+			}
+		}
+
+		Ok(())
 	}
 
 	async fn handle_disconnect(&mut self) -> Result<()> {
@@ -458,9 +572,9 @@ impl Connection {
 	async fn handle_pubrec(&mut self, pubrec: mqtt_v5::PubRec) -> Result<()> {
 		// QoS 2, sender side (step 2): the client received our PUBLISH. Advance the
 		// transaction to "released" and send PUBREL.
-		if let Some(state) = self.inflight.get_mut(&pubrec.pkid) {
-			if matches!(state, Inflight::Qos2Pending) {
-				*state = Inflight::Qos2Released;
+		if let Some(entry) = self.inflight.get_mut(&pubrec.pkid) {
+			if matches!(entry.state, InflightState::Qos2Pending) {
+				entry.state = InflightState::Qos2Released;
 			}
 		}
 

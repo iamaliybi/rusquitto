@@ -5,8 +5,8 @@
 **Architecture:** Thread-per-core, Shared-Nothing
 **Runtime:** Glommio (io_uring, Linux 5.8+)
 **Author:** Ali Yaghoubi
-**Status:** Functional pub/sub broker — Phase 2 complete. Phase 3 (hardening) pending.
-**Last updated:** 2026-06-30
+**Status:** Functional pub/sub broker with shard-local persistent sessions — Phase 3a complete.
+**Last updated:** 2026-07-02
 
 See [progress.md](progress.md) for the detailed implementation log, decisions, and gotchas.
 
@@ -33,10 +33,14 @@ See [progress.md](progress.md) for the detailed implementation log, decisions, a
 | Inter-shard channels                         | ✅ glommio `channel_mesh`           |
 | Structured logging (tracing)                 | ✅ `src/logger.rs`                  |
 | CLI + TOML config                            | ✅ `src/config.rs`                  |
+| Session persistence / expiry                 | ✅ suspend/resume + expiry sweep    |
+| Offline message queueing (QoS > 0)           | ✅ buffered while suspended         |
+| In-flight retransmission (DUP) on resume     | ✅ QoS 1/2                          |
+| Session takeover (Client ID reuse)           | ✅ generation-guarded              |
 | Cross-shard QoS > 0 guarantees               | ⚠️ best-effort (drop-on-full mesh) |
+| Cross-shard session resume                   | ⚠️ shard-local only (see below)    |
 | Auth / ACL                                   | ❌ planned                          |
 | Will messages                                | ❌ planned                          |
-| Session persistence / expiry                 | ❌ planned (clean sessions only)    |
 | Flow control (receive maximum)               | ❌ planned                          |
 
 ---
@@ -55,3 +59,14 @@ cargo run --release rusquitto.default.toml   # NOT `--config` (Cargo intercepts 
 - The separate stress-test binary: `cargo run --bin mosquitto` → runs `scripts/mosquitto.sh` (needs mosquitto-clients).
 
 Broker binds `127.0.0.1:1883` by default.
+
+---
+
+## Known limitation: cross-shard session resume
+
+Sessions live in shard-local `ShardState`, keyed by client id. `SO_REUSEPORT` assigns a connection to a
+shard by hashing its TCP 4-tuple, so a reconnecting client — which uses a **new ephemeral port** — may land
+on a *different* shard, where its suspended session does not exist (it is treated as a fresh session there).
+Resume is therefore reliable only when the client rehashes to the same shard. A robust fix needs a
+cross-shard session directory or a redirect (MQTT 5 Server Reference), tracked in
+[next-steps.md](next-steps.md). For single-shard deployments (`runtime.shards = 1`) resume is always exact.

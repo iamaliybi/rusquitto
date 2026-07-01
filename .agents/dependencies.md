@@ -14,7 +14,7 @@
 | `tracing-appender`   | 0.2     | Non-blocking, daily-rotating file appenders                                                                                         |
 | `clap`               | 4       | CLI (derive API); single positional `<CONFIG>` arg                                                                                  |
 | `serde`              | 1       | `Deserialize` for the config tree (derive)                                                                                          |
-| `toml`               | 0.8     | Decodes the `.toml` config file                                                                                                     |
+| `toml`               | 1.1     | Decodes the `.toml` config file                                                                                                     |
 
 ## Key Types by Source
 
