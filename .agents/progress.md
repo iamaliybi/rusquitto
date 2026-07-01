@@ -103,6 +103,26 @@ with redacted credentials. Both sample configs parse with the new `[auth]` secti
 
 **Known limitation:** passwords are plaintext; no topic ACL yet — see [next-steps.md](next-steps.md) item 4.
 
+## Phase 3e — Topic ACL (2026-07-02)
+
+Per-user publish/subscribe authorization layered on Phase 3d auth.
+
+| Item | Description | Status |
+|------|-------------|--------|
+| Config | `[[auth.users]]` gains optional `publish` / `subscribe` topic-filter allow-lists (`Option<Vec<String>>`, `None` = unrestricted) | ✅ |
+| Authenticator | stores per-user ACLs in a `UserEntry`; `authorize_publish` / `authorize_subscribe` use `filter_matches` (anonymous & no-list = allowed, empty list = deny all) | ✅ |
+| Connection | records the authenticated `username` at CONNECT for ACL checks | ✅ |
+| Publish enforcement | `handle_publish`: deny → PUBACK/PUBREC `NotAuthorized` (QoS 1/2), silent drop (QoS 0); never fans out | ✅ |
+| Subscribe enforcement | `handle_subscribe`: per-filter deny → SubAck `NotAuthorized`, trie not armed, no retained replay | ✅ |
+| Will topic | an unauthorized will topic is dropped at CONNECT | ✅ |
+| Unit tests | 5 ACL tests (unrestricted, anonymous, publish/subscribe wildcards, empty-list-denies) | ✅ |
+
+**Verification (single shard):** `alice` limited to `sensors/#` — publish to `sensors/temp` routed to an
+unrestricted watcher ✅; publish to `actuators/door` → client `Publish failed: Not authorized`, not routed ✅;
+subscribe to `secret/#` → `subscribe not authorized` (SubAck NotAuthorized) ✅. 8/8 unit tests pass.
+
+**Known limitation:** plaintext passwords; anonymous clients are unrestricted (no anonymous ACL).
+
 ## Architecture decisions locked in
 
 - **Mailbox payload:** `Rc<Publish>` for local fan-out; the mesh carries owned `Publish`, re-wrapped in `Rc` on the

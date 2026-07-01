@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use crate::broker::topic_trie::filter_matches;
 use crate::config::AuthConfig;
 
 /// Result of an authentication check. The caller maps each variant to the
@@ -21,12 +22,30 @@ pub enum AuthResult {
 	NotAuthorized,
 }
 
+/// A configured user's credentials and per-operation topic authorization.
+struct UserEntry {
+	password: String,
+	/// Topic-filter allow-list for publishing; `None` means unrestricted.
+	publish_acl: Option<Vec<String>>,
+	/// Topic-filter allow-list for subscribing; `None` means unrestricted.
+	subscribe_acl: Option<Vec<String>>,
+}
+
+/// Returns whether `topic` is permitted by an optional allow-list: `None` is
+/// unrestricted, otherwise the topic must match at least one filter rule.
+fn acl_allows(acl: &Option<Vec<String>>, topic: &str) -> bool {
+	match acl {
+		None => true,
+		Some(rules) => rules.iter().any(|rule| filter_matches(rule, topic)),
+	}
+}
+
 /// Per-shard credential store, built from the broker configuration.
 pub struct Authenticator {
 	/// Whether clients may connect without a username.
 	allow_anonymous: bool,
-	/// Known `username -> password` pairs.
-	users: HashMap<String, String>,
+	/// Known users, indexed by name.
+	users: HashMap<String, UserEntry>,
 }
 
 impl Authenticator {
@@ -35,7 +54,16 @@ impl Authenticator {
 		let users = config
 			.users
 			.iter()
-			.map(|u| (u.username.clone(), u.password.clone()))
+			.map(|u| {
+				(
+					u.username.clone(),
+					UserEntry {
+						password: u.password.clone(),
+						publish_acl: u.publish.clone(),
+						subscribe_acl: u.subscribe.clone(),
+					},
+				)
+			})
 			.collect();
 		Self {
 			allow_anonymous: config.allow_anonymous,
@@ -58,11 +86,29 @@ impl Authenticator {
 	pub fn check(&self, username: Option<&str>, password: Option<&str>) -> AuthResult {
 		match username {
 			Some(name) => match self.users.get(name) {
-				Some(expected) if expected == password.unwrap_or("") => AuthResult::Granted,
+				Some(entry) if entry.password == password.unwrap_or("") => AuthResult::Granted,
 				_ => AuthResult::BadUserNamePassword,
 			},
 			None if self.allow_anonymous => AuthResult::Granted,
 			None => AuthResult::NotAuthorized,
+		}
+	}
+
+	/// Whether `username` may publish to `topic`. Anonymous clients (no username)
+	/// and users without a `publish` allow-list are unrestricted.
+	pub fn authorize_publish(&self, username: Option<&str>, topic: &str) -> bool {
+		match username.and_then(|u| self.users.get(u)) {
+			Some(entry) => acl_allows(&entry.publish_acl, topic),
+			None => true,
+		}
+	}
+
+	/// Whether `username` may subscribe to `filter`. Anonymous clients and users
+	/// without a `subscribe` allow-list are unrestricted.
+	pub fn authorize_subscribe(&self, username: Option<&str>, filter: &str) -> bool {
+		match username.and_then(|u| self.users.get(u)) {
+			Some(entry) => acl_allows(&entry.subscribe_acl, filter),
+			None => true,
 		}
 	}
 }
@@ -80,6 +126,8 @@ mod tests {
 				.map(|(u, p)| UserConfig {
 					username: u.to_string(),
 					password: p.to_string(),
+					publish: None,
+					subscribe: None,
 				})
 				.collect(),
 		}
@@ -110,5 +158,52 @@ mod tests {
 			auth.check(Some("bob"), Some("s3cret")),
 			AuthResult::BadUserNamePassword
 		);
+	}
+
+	fn acl_cfg(publish: Option<&[&str]>, subscribe: Option<&[&str]>) -> AuthConfig {
+		let to_vec = |o: Option<&[&str]>| o.map(|s| s.iter().map(|x| x.to_string()).collect());
+		AuthConfig {
+			allow_anonymous: true,
+			users: vec![UserConfig {
+				username: "u".into(),
+				password: "p".into(),
+				publish: to_vec(publish),
+				subscribe: to_vec(subscribe),
+			}],
+		}
+	}
+
+	#[test]
+	fn no_acl_is_unrestricted() {
+		let auth = Authenticator::from_config(&acl_cfg(None, None));
+		assert!(auth.authorize_publish(Some("u"), "any/topic"));
+		assert!(auth.authorize_subscribe(Some("u"), "any/#"));
+	}
+
+	#[test]
+	fn anonymous_is_unrestricted() {
+		let auth = Authenticator::from_config(&acl_cfg(Some(&["only/this"]), Some(&["only/this"])));
+		assert!(auth.authorize_publish(None, "something/else"));
+		assert!(auth.authorize_subscribe(None, "something/else"));
+	}
+
+	#[test]
+	fn publish_acl_enforced_with_wildcards() {
+		let auth = Authenticator::from_config(&acl_cfg(Some(&["sensors/#"]), None));
+		assert!(auth.authorize_publish(Some("u"), "sensors/kitchen/temp"));
+		assert!(!auth.authorize_publish(Some("u"), "actuators/door"));
+	}
+
+	#[test]
+	fn subscribe_acl_enforced() {
+		let auth = Authenticator::from_config(&acl_cfg(None, Some(&["sensors/#"])));
+		assert!(auth.authorize_subscribe(Some("u"), "sensors/+/temp"));
+		assert!(!auth.authorize_subscribe(Some("u"), "commands/#"));
+	}
+
+	#[test]
+	fn empty_acl_denies_everything() {
+		let auth = Authenticator::from_config(&acl_cfg(Some(&[]), None));
+		assert!(!auth.authorize_publish(Some("u"), "anything"));
 	}
 }

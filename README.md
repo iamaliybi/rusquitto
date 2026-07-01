@@ -28,9 +28,11 @@ isolated, shard-local executor — no `Mutex`, no `RwLock`, no work-stealing.
   Maximum QoS, Retain Available, and wildcard/shared/subscription-identifier availability. The client's
   **Receive Maximum** (a windowed outbound in-flight limit, with held messages drained as acks arrive) and
   **Maximum Packet Size** (oversized outbound publishes are dropped) are enforced.
-- **Authentication** — optional username/password at CONNECT via the `[auth]` config (`allow_anonymous` plus a
-  list of users). Failures are rejected with the proper CONNACK reason code (`0x86` bad credentials, `0x87`
-  anonymous not allowed). Defaults are open, so no credentials are required until you configure them.
+- **Authentication & ACL** — optional username/password at CONNECT via the `[auth]` config (`allow_anonymous`
+  plus a list of users). Failures are rejected with the proper CONNACK reason code (`0x86` bad credentials,
+  `0x87` anonymous not allowed). Each user may carry `publish` / `subscribe` topic-filter allow-lists: a denied
+  publish is dropped (QoS 0) or Not-Authorized-acked (QoS 1/2), and a denied subscribe gets a Not Authorized
+  reason code. Defaults are open, so nothing is required until you configure it.
 - **Cross-shard routing** over a `glommio` channel mesh, so a publisher and subscriber on different cores still reach
   each other.
 - **Thread-per-core, shared-nothing**: `SO_REUSEPORT` kernel load balancing, one `io_uring` ring and one `LocalExecutor`
@@ -130,8 +132,8 @@ Deliberately out of scope for now (tracked in `.agents/progress.md`):
 - **Negotiation is outbound-only.** The client's Receive Maximum and Maximum Packet Size are enforced, but the
   server does not yet enforce an *inbound* Receive Maximum quota, and Topic Aliases are unsupported (CONNACK
   advertises a Topic Alias Maximum of 0).
-- **Authentication is username/password only.** Passwords are stored in plaintext in the config (protect the
-  file), there is no per-topic **ACL** yet, and no enhanced (SASL-style) authentication.
+- **Passwords are plaintext** in the config file (protect it with permissions); there is no hashed-password
+  support or enhanced (SASL-style) authentication yet. Anonymous clients bypass ACL (they are unrestricted).
 
 ## License
 

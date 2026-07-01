@@ -83,6 +83,9 @@ pub struct Connection {
 	pending_outbound: VecDeque<Delivery>,
 	/// Shard-local credential store, shared by every connection on this shard.
 	auth: Rc<Authenticator>,
+	/// Authenticated username, used for per-topic ACL checks. `None` for an
+	/// anonymous client (which is unrestricted).
+	username: Option<String>,
 }
 
 impl Connection {
@@ -117,6 +120,7 @@ impl Connection {
 			peer_max_packet_size: None,
 			pending_outbound: VecDeque::new(),
 			auth,
+			username: None,
 		}
 	}
 
@@ -470,6 +474,21 @@ impl Connection {
 			return self.reject_connect(code).await;
 		}
 
+		// Remember the authenticated identity for per-topic ACL checks.
+		self.username = login.map(|l| l.username.clone());
+
+		// Drop a Will Message whose topic the client isn't authorized to publish.
+		let will_authorized = match &self.will {
+			Some(will) => self
+				.auth
+				.authorize_publish(self.username.as_deref(), &will.topic),
+			None => true,
+		};
+		if !will_authorized {
+			debug!("will topic not authorized, dropping will");
+			self.will = None;
+		}
+
 		// Credentials are redacted: the username is logged, the password is never
 		// passed to the logger — only its presence is noted.
 		info!(
@@ -634,6 +653,35 @@ impl Connection {
 			"publish received"
 		);
 
+		// Enforce publish authorization before routing. On denial the message is
+		// not fanned out: QoS > 0 gets a negative acknowledgement (Not Authorized),
+		// QoS 0 is dropped silently as there is no way to signal the sender.
+		if !self
+			.auth
+			.authorize_publish(self.username.as_deref(), &publish.topic)
+		{
+			warn!(topic = %publish.topic, "publish not authorized, rejecting");
+			return match publish.qos {
+				QoS::AtMostOnce => Ok(()),
+				QoS::AtLeastOnce => {
+					let mut ack = mqtt_v5::PubAck::new(publish.pkid);
+					ack.reason = mqtt_v5::PubAckReason::NotAuthorized;
+					let mut buf = BytesMut::new();
+					ack.write(&mut buf)
+						.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+					self.stream.write_all(&buf).await
+				}
+				QoS::ExactlyOnce => {
+					let mut rec = mqtt_v5::PubRec::new(publish.pkid);
+					rec.reason = mqtt_v5::PubRecReason::NotAuthorized;
+					let mut buf = BytesMut::new();
+					rec.write(&mut buf)
+						.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+					self.stream.write_all(&buf).await
+				}
+			};
+		}
+
 		// Normalize for fan-out: clear the publisher's packet id and dup flag, but
 		// keep the original QoS so each subscriber can be downgraded individually
 		// to `min(publish QoS, granted QoS)` at delivery time.
@@ -679,6 +727,17 @@ impl Connection {
 		let mut retained = Vec::new();
 
 		for filter in &subscribe.filters {
+			// Deny unauthorized filters: no trie entry, no retained replay, and a
+			// Not Authorized reason code in the SubAck for this filter.
+			if !self
+				.auth
+				.authorize_subscribe(self.username.as_deref(), &filter.path)
+			{
+				warn!(filter = %filter.path, "subscribe not authorized, rejecting");
+				return_codes.push(mqtt_v5::SubscribeReasonCode::NotAuthorized);
+				continue;
+			}
+
 			let granted = min_qos(filter.qos, self.limits.max_qos());
 
 			{

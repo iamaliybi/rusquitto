@@ -48,20 +48,23 @@ disconnect). Honouring a non-zero delay needs a timer that publishes the will af
 `min(will_delay, session_expiry)` and is cancelled if the client reconnects first — the same machinery as the
 session expiry sweep. Reuse `sweep_expired` / the per-shard timer task.
 
-## 4. Authentication / ACL — auth ✅, ACL remaining
+## 4. Authentication / ACL ✅
 
-**Auth done.** `[auth]` config (`allow_anonymous` + `[[auth.users]]` username/password) builds a per-shard
+**Done.** `[auth]` config (`allow_anonymous` + `[[auth.users]]` username/password) builds a per-shard
 `Authenticator` (`src/auth.rs`); `handle_connect` validates credentials before any session state and rejects
-with CONNACK `BadUserNamePassword` (0x86) / `NotAuthorized` (0x87). Default config is open (anonymous, no
-users). Passwords are plaintext for now.
+with CONNACK `BadUserNamePassword` (0x86) / `NotAuthorized` (0x87). Default config is open (anonymous, no users).
+
+**Topic ACL** — each `[[auth.users]]` entry carries optional `publish` / `subscribe` topic-filter allow-lists
+(`None`/omitted = unrestricted). `handle_connect` records the authenticated username; `handle_publish` denies
+with PUBACK/PUBREC `NotAuthorized` (0x87) for QoS 1/2 and drops QoS 0; `handle_subscribe` denies per filter
+with SubAck `NotAuthorized` (0x87) and doesn't arm the trie; an unauthorized will topic is dropped at CONNECT.
+Anonymous clients are unrestricted.
 
 **Remaining:**
-- **Topic ACL** — per-user publish/subscribe authorization. Store the authenticated username on the
-  connection (already have it at CONNECT), add allow-lists to `UserConfig`, and check them in
-  `handle_publish` (deny → PUBACK/PUBREC `NotAuthorized` 0x87, drop QoS 0) and `handle_subscribe`
-  (deny → SubAck `NotAuthorized` 0x87, don't arm the trie). `mqttbytes` exposes all these reason codes.
-- **Hashed passwords** — replace plaintext comparison with a salted hash (e.g. SHA-256 / Argon2); would add a
+- **Hashed passwords** — replace plaintext comparison with a salted hash (e.g. SHA-256 / Argon2); adds a
   hashing dependency.
+- **ACL for anonymous clients** — currently anonymous is all-or-nothing (unrestricted); could add a default
+  anonymous ACL if needed.
 
 ## 5. CONNECT capability negotiation ✅
 
