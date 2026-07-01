@@ -12,13 +12,24 @@ The mesh forwards with non-blocking `try_send_to` (drop-on-full), so cross-shard
 Make it reliable: async `send_to` with per-link flow control, or a bounded retry/queue. Touch
 `broker/engine.rs::broadcast` and the drain task in `worker.rs`.
 
-## 2. Persistent sessions & expiry
+## 2. Persistent sessions & expiry ✅ (shard-local)
 
-Sessions are currently clean-only; in-flight QoS state is dropped on disconnect. Implement:
+**Done.** `ShardState` now owns a `Session` per client id:
 
-- Honour `Session Expiry Interval` — move to a "suspended" state with an expiry timer instead of dropping.
-- Resurrection on reconnect with the same Client ID (re-attach subscriptions + in-flight window).
-- Retransmission of unacked QoS 1/2 messages (with the DUP flag) on reconnect.
+- `Session Expiry Interval` honoured — disconnect *suspends* the session (mailbox dropped, subscriptions
+  retained in the trie, expiry deadline armed); `0` discards immediately, `0xFFFFFFFF` never expires. A
+  per-shard timer task (`sweep_expired`) reclaims lapsed sessions.
+- Resume on reconnect with the same Client ID (Clean Start `false`) → CONNACK `session_present = true`,
+  subscriptions already armed, durable QoS state restored.
+- Offline QoS > 0 messages buffered in `Session::offline_queue` (bounded) and flushed on resume.
+- Unacked in-flight QoS 1/2 retransmitted with the DUP flag on resume (PUBREL resumed for released QoS 2).
+- Session takeover (same Client ID, live connection) is generation-guarded so the displaced connection's
+  cleanup can't clobber the new session.
+
+**Remaining — cross-shard session resume.** `SO_REUSEPORT` may land a reconnecting client (new ephemeral
+port) on a different shard, where its session doesn't exist. Needs a cross-shard session directory or an
+MQTT 5 Server Reference redirect. Until then, resume is exact only within a shard (always, for
+`runtime.shards = 1`). This overlaps with item 1 (cross-shard reliability) and the clustering goal.
 
 ## 3. Will messages
 

@@ -16,6 +16,11 @@ isolated, shard-local executor — no `Mutex`, no `RwLock`, no work-stealing.
 - **Topic wildcards** `+` (single level) and `#` (multi level) via a topic trie; `$`-topics are excluded from wildcard
   matches.
 - **Retained messages** — stored, replayed to new subscribers, cleared by empty payload, replicated across shards.
+- **Persistent sessions** — honours the Session Expiry Interval: a disconnect *suspends* the session (keeping its
+  subscriptions), a reconnect with the same Client ID and Clean Start `false` resumes it (CONNACK `session_present`),
+  QoS > 0 messages published while offline are queued and flushed on resume, and unacknowledged in-flight QoS 1/2
+  messages are retransmitted with the DUP flag. Session takeover on Client ID reuse is handled. *(Shard-local — see
+  [Limitations](#limitations).)*
 - **Cross-shard routing** over a `glommio` channel mesh, so a publisher and subscriber on different cores still reach
   each other.
 - **Thread-per-core, shared-nothing**: `SO_REUSEPORT` kernel load balancing, one `io_uring` ring and one `LocalExecutor`
@@ -105,8 +110,11 @@ Deliberately out of scope for now (tracked in `.agents/progress.md`):
   at-least/exactly-once guarantee holds *within* a shard but is best-effort *across* shards. Under heavy
   connection bursts you may also hit a `glommio` io_uring `ENOMEM` from a low `RLIMIT_MEMLOCK`; raise it
   (`ulimit -l unlimited` or `LimitMEMLOCK=infinity`).
-- **No persistent sessions or retransmission** — sessions are treated as clean; in-flight QoS state is
-  dropped on disconnect.
+- **Session resume is shard-local.** Sessions are stored per shard, keyed by Client ID. `SO_REUSEPORT`
+  hashes each connection's TCP 4-tuple to a shard, and a reconnecting client uses a new ephemeral port, so
+  it may land on a *different* shard where its suspended session doesn't exist (and is treated as fresh).
+  Resume is reliable when the client rehashes to the same shard, and **always exact for
+  `runtime.shards = 1`**. A cross-shard session directory / MQTT 5 Server Reference redirect is future work.
 - **No authentication / ACL**, **no will messages**, and **no CONNECT capability negotiation** beyond
   advertising the server keep-alive.
 

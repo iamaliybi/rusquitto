@@ -9,7 +9,11 @@ use std::cell::Cell;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::Instrument;
+
+/// How often each shard reclaims suspended sessions past their expiry deadline.
+const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 pub async fn init(mesh: MeshBuilder<Publish, Full>, config: Arc<Config>) {
 	let shard_id: usize = glommio::executor().id();
@@ -46,6 +50,18 @@ pub async fn init(mesh: MeshBuilder<Publish, Full>, config: Arc<Config>) {
 		glommio::spawn_local(async move {
 			while let Some(publish) = receiver.recv().await {
 				state.borrow_mut().deliver_local(publish);
+			}
+		})
+		.detach();
+	}
+
+	// Periodically reclaim suspended sessions whose expiry has lapsed.
+	{
+		let state = state.clone();
+		glommio::spawn_local(async move {
+			loop {
+				glommio::timer::sleep(SESSION_SWEEP_INTERVAL).await;
+				state.borrow_mut().sweep_expired();
 			}
 		})
 		.detach();

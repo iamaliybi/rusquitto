@@ -26,6 +26,28 @@ single-level).
 QoS 1 publisher completes + subscriber receives ✅; QoS 2 publisher completes the full PUBREC/PUBREL/PUBCOMP handshake +
 subscriber receives ✅.
 
+## Phase 3a — Session persistence & expiry (2026-07-02)
+
+`clients: HashMap<String, Mailbox>` in `ShardState` replaced by `sessions: HashMap<String, Session>`. A
+`Session` outlives the `Connection`: `{ mailbox: Option<Mailbox>, expires_at, generation, snapshot, offline_queue }`.
+
+| Item | Description | Status |
+|------|-------------|--------|
+| Session store | `open_session` (Clean Start → discard/resume) / `close_session` (expiry 0 → destroy, else suspend) / `sweep_expired` (per-shard 1 s timer task in `worker.rs`) | ✅ |
+| Takeover | `next_generation` counter; `close_session` no-ops on generation mismatch so a displaced connection can't tear down the new session (also fixes a latent takeover race) | ✅ |
+| Durable QoS state | `SessionSnapshot { inflight, incoming_qos2, next_pkid }` moved out of `Connection` on suspend, restored on resume. `Inflight` enum → `InflightMessage { publish, state }` so PUBLISHes can be retransmitted | ✅ |
+| Offline queue | `route` buffers QoS > 0 for suspended sessions (`OFFLINE_QUEUE_LIMIT = 1024`, oldest dropped); `route` now takes `&mut self` | ✅ |
+| Resume delivery | `Connection::resume_delivery` after CONNACK: retransmit in-flight (DUP; PUBREL for released QoS 2), then flush offline queue via `send_publish` | ✅ |
+| CONNACK | `session_present` from resume result; `assigned_client_identifier` echoed for anonymous clients | ✅ |
+
+**Verification (single shard, `runtime.shards = 1`):** new session → `session_present=false` ✅; reconnect same
+id after `kill -9` → `session_present=true` (resumed) ✅; Clean Start → discarded (`false`) ✅; 1 s expiry + 3 s
+wait → swept, reconnect `false` ✅; 3× QoS 1 published while offline → all 3 delivered in order on reconnect
+(`flushing offline queue count:3`) ✅.
+
+**Known limitation:** cross-shard resume (see [next-steps.md](next-steps.md) item 2) — `SO_REUSEPORT` may
+rehash a reconnecting client to another shard. Exact within a shard; always exact for `runtime.shards = 1`.
+
 ## Architecture decisions locked in
 
 - **Mailbox payload:** `Rc<Publish>` for local fan-out; the mesh carries owned `Publish`, re-wrapped in `Rc` on the

@@ -57,6 +57,32 @@ accept() → spawn_local(Connection::new(stream, shard_id))
            handle_*()           per-type handler
 ```
 
+### Session Lifecycle (shard-local)
+
+A `Session` in `ShardState` outlives its `Connection`. Durable QoS state lives in the connection while
+online (hot path, no shared borrow) and rests in the session only between connections.
+
+```
+CONNECT ──▶ open_session(clean_start)
+              ├─ clean_start=true         → discard any old session + subs, fresh (session_present=false)
+              ├─ existing session found   → resume: re-attach mailbox, restore snapshot + offline queue
+              │                             (session_present=true) → resume_delivery() after CONNACK:
+              │                                • retransmit in-flight QoS 1/2 with DUP (PUBREL if released)
+              │                                • flush messages queued while offline
+              └─ none                      → fresh (session_present=false)
+
+(online)   route() → live mailbox            |  (suspended) route() → offline_queue (QoS>0, bounded)
+
+DISCONNECT/EOF ──▶ close_session(gen, expiry)
+              ├─ generation mismatch → no-op (a newer connection took over this client id)
+              ├─ expiry = 0          → destroy session + subscriptions
+              └─ expiry > 0          → suspend: drop mailbox, keep subs, store snapshot, arm deadline
+                                        (0xFFFFFFFF = never); per-shard sweep_expired() reclaims lapsed ones
+```
+
+**Caveat:** sessions are shard-local; `SO_REUSEPORT` may rehash a reconnecting client to another shard.
+Exact resume within a shard; always exact for `runtime.shards = 1`. See [next-steps.md](next-steps.md).
+
 ### Packet Buffer Strategy
 
 - `temp_buf: [u8; 2048]` — stack-allocated, reused each read (hot path)
@@ -85,9 +111,9 @@ Built on glommio's `channels::channel_mesh` — a full mesh of shared channels c
 | `src/main.rs`              | Entry: CLI/config load, CPU detection, executor pool launch |
 | `src/config.rs`            | CLI (clap) + TOML config tree (serde), validation           |
 | `src/logger.rs`            | tracing setup: non-blocking appenders, spans, redaction     |
-| `src/server/worker.rs`     | Per-shard init: mesh join, socket bind, accept loop         |
-| `src/server/connection.rs` | Per-packet dispatch, all MQTT handlers, QoS state           |
-| `src/broker/engine.rs`     | `ShardState`: clients, subscriptions, retain, mesh senders  |
+| `src/server/worker.rs`     | Per-shard init: mesh join, socket bind, accept loop, session expiry sweep |
+| `src/server/connection.rs` | Per-packet dispatch, all MQTT handlers, live QoS + session state |
+| `src/broker/engine.rs`     | `ShardState`: sessions (persist/expiry/takeover), subs, retain, mesh |
 | `src/broker/topic_trie.rs` | Wildcard-aware subscription trie (`+` / `#`)                |
 | `src/net/socket.rs`        | Low-level socket creation with SO_REUSEPORT                 |
 | `src/net/tcp_listener.rs`  | Glommio TcpListener wrapper                                 |
