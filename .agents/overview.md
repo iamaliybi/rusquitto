@@ -5,7 +5,7 @@
 **Architecture:** Thread-per-core, Shared-Nothing
 **Runtime:** Glommio (io_uring, Linux 5.8+)
 **Author:** Ali Yaghoubi
-**Status:** Functional broker — sessions, will, negotiation, auth+ACL, shutdown, `$SYS` — Phase 3a–3g complete.
+**Status:** Functional broker — sessions, will, negotiation, auth+ACL, `$SYS`, graceful shutdown — Phase 3a–3h complete.
 **Last updated:** 2026-07-02
 
 See [progress.md](progress.md) for the detailed implementation log, decisions, and gotchas.
@@ -43,7 +43,7 @@ See [progress.md](progress.md) for the detailed implementation log, decisions, a
 | Maximum Packet Size (outbound)               | ✅ oversized dropped                |
 | Authentication (username/password)           | ✅ `src/auth.rs`, `[auth]` config   |
 | Topic ACL (per-user publish/subscribe)       | ✅ allow-lists in `[[auth.users]]`  |
-| Graceful shutdown (SIGTERM/SIGINT)           | ✅ stops accepting, flushes logs    |
+| Graceful shutdown (SIGTERM/SIGINT)           | ✅ drains conns (DISCONNECT), flushes logs |
 | `$SYS` metrics topics                        | ✅ `src/metrics.rs`, `[sys]` config |
 | Cross-shard QoS > 0 guarantees               | ⚠️ best-effort (drop-on-full mesh) |
 | Cross-shard session resume                   | ⚠️ shard-local only (see below)    |

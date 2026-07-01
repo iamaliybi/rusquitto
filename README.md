@@ -42,7 +42,8 @@ isolated, shard-local executor — no `Mutex`, no `RwLock`, no work-stealing.
 - **`$SYS` metrics** — the broker publishes retained `$SYS/broker/...` topics (uptime, connected/total clients,
   messages and bytes in/out) on a configurable interval, so you can monitor it over MQTT by subscribing to
   `$SYS/#`.
-- **Graceful shutdown** on `SIGTERM` / `SIGINT`: shards stop accepting, the process exits cleanly (code 0), and
+- **Graceful shutdown** on `SIGTERM` / `SIGINT`: shards stop accepting, connected clients are sent a
+  `ServerShuttingDown` DISCONNECT and their sessions suspended cleanly, the process exits with code 0, and
   buffered logs are flushed instead of being lost to an abrupt kill.
 - **TOML configuration** with a typed, validated schema and a CLI.
 
@@ -134,9 +135,6 @@ Deliberately out of scope for now (tracked in `.agents/progress.md`):
   `runtime.shards = 1`**. A cross-shard session directory / MQTT 5 Server Reference redirect is future work.
 - **Will Delay Interval is not yet honoured** — a will fires immediately on abnormal disconnect rather than
   after the requested delay. (Will messages themselves work; only the *delay* is unimplemented.)
-- **Shutdown drops active connections.** On `SIGTERM`/`SIGINT` the broker stops accepting and exits cleanly,
-  but in-flight connections are closed without a client DISCONNECT and without running session-suspend / will
-  handling. Draining connections gracefully is future work.
 - **Negotiation is outbound-only.** The client's Receive Maximum and Maximum Packet Size are enforced, but the
   server does not yet enforce an *inbound* Receive Maximum quota, and Topic Aliases are unsupported (CONNACK
   advertises a Topic Alias Maximum of 0).

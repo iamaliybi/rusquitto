@@ -99,11 +99,13 @@ messages + bytes in/out, uptime) shared across shards; mesh peer 0 publishes ret
 every `[sys].interval` seconds. Note: glommio executor ids are **1-based**, so shard election uses the 0-based
 mesh `peer_id()`, not `executor().id()`.
 
+**Connection draining done.** On shutdown each shard calls `ShardState::shutdown_connections` (drops every
+session's mailbox), which wakes each connection via its already-handled `Outgoing(None)` path; the connection
+sees the shutdown flag set, sends DISCONNECT `ServerShuttingDown` (0x8B), suppresses its will, and runs its
+normal cleanup (session suspends per expiry). The shard then waits (bounded by `SHUTDOWN_GRACE = 5 s`) for the
+live-connection count to reach 0 before returning. No per-connection timers — the wakeup reuses the mailbox.
+
 **Remaining:**
-- **Drain active connections on shutdown** — currently in-flight connection tasks are dropped (no client
-  DISCONNECT, and `run()` cleanup / will handling doesn't run). Send DISCONNECT `ServerShuttingDown` (0x8B) and
-  let sessions suspend cleanly. Needs a per-connection shutdown signal (e.g. a shard-local broadcast the event
-  loop selects on).
 - Documented `RLIMIT_MEMLOCK` requirement (io_uring buffer registration `ENOMEM` under load — see progress.md).
 
 ## Code map for the above

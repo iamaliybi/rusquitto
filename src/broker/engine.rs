@@ -373,6 +373,16 @@ impl ShardState {
 		true
 	}
 
+	/// Drops the live mailbox of every session on this shard. Each connected
+	/// client's mailbox channel closes, waking its connection with a closed
+	/// receiver (`Outgoing(None)`) so it can disconnect cleanly during shutdown.
+	/// The sessions themselves are left intact for the connections' own cleanup.
+	pub fn shutdown_connections(&mut self) {
+		for session in self.sessions.values_mut() {
+			session.mailbox = None;
+		}
+	}
+
 	/// Discards every suspended session whose expiry deadline has passed, along
 	/// with its subscriptions. Driven periodically by a per-shard timer task.
 	pub fn sweep_expired(&mut self) {
