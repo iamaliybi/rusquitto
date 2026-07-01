@@ -138,3 +138,28 @@ keep_alive = 60
 # Whether retained messages are accepted and served.
 # Type: boolean                   Default: true
 retain_available = true
+
+# =============================================================================
+# [auth] — connection authentication
+# =============================================================================
+# With the defaults below (allow_anonymous = true, no users) authentication is
+# a no-op and any client may connect. Define users and/or disable anonymous
+# access to require credentials.
+[auth]
+
+# Whether clients may connect without supplying a username.
+# Type: boolean                   Default: true
+allow_anonymous = true
+
+# Known users. A client that presents a username must match one of these
+# (name + password). Passwords are stored in plaintext, so protect this file
+# with restrictive permissions and treat it as a secret.
+#
+# Add one [[auth.users]] table per user, for example:
+#
+#   [[auth.users]]
+#   username = "alice"
+#   password = "s3cret"
+#
+# Type: array of { username, password }   Default: [] (none)
+users = []

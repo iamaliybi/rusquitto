@@ -28,6 +28,9 @@ isolated, shard-local executor — no `Mutex`, no `RwLock`, no work-stealing.
   Maximum QoS, Retain Available, and wildcard/shared/subscription-identifier availability. The client's
   **Receive Maximum** (a windowed outbound in-flight limit, with held messages drained as acks arrive) and
   **Maximum Packet Size** (oversized outbound publishes are dropped) are enforced.
+- **Authentication** — optional username/password at CONNECT via the `[auth]` config (`allow_anonymous` plus a
+  list of users). Failures are rejected with the proper CONNACK reason code (`0x86` bad credentials, `0x87`
+  anonymous not allowed). Defaults are open, so no credentials are required until you configure them.
 - **Cross-shard routing** over a `glommio` channel mesh, so a publisher and subscriber on different cores still reach
   each other.
 - **Thread-per-core, shared-nothing**: `SO_REUSEPORT` kernel load balancing, one `io_uring` ring and one `LocalExecutor`
@@ -127,7 +130,8 @@ Deliberately out of scope for now (tracked in `.agents/progress.md`):
 - **Negotiation is outbound-only.** The client's Receive Maximum and Maximum Packet Size are enforced, but the
   server does not yet enforce an *inbound* Receive Maximum quota, and Topic Aliases are unsupported (CONNACK
   advertises a Topic Alias Maximum of 0).
-- **No authentication / ACL.**
+- **Authentication is username/password only.** Passwords are stored in plaintext in the config (protect the
+  file), there is no per-topic **ACL** yet, and no enhanced (SASL-style) authentication.
 
 ## License
 

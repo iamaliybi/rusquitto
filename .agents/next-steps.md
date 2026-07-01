@@ -48,10 +48,20 @@ disconnect). Honouring a non-zero delay needs a timer that publishes the will af
 `min(will_delay, session_expiry)` and is cancelled if the client reconnects first — the same machinery as the
 session expiry sweep. Reuse `sweep_expired` / the per-shard timer task.
 
-## 4. Authentication / ACL
+## 4. Authentication / ACL — auth ✅, ACL remaining
 
-Username/password (and/or enhanced auth) at CONNECT; topic-level publish/subscribe authorization. Wire ACL
-checks into `handle_publish` / `handle_subscribe`, return proper reason codes.
+**Auth done.** `[auth]` config (`allow_anonymous` + `[[auth.users]]` username/password) builds a per-shard
+`Authenticator` (`src/auth.rs`); `handle_connect` validates credentials before any session state and rejects
+with CONNACK `BadUserNamePassword` (0x86) / `NotAuthorized` (0x87). Default config is open (anonymous, no
+users). Passwords are plaintext for now.
+
+**Remaining:**
+- **Topic ACL** — per-user publish/subscribe authorization. Store the authenticated username on the
+  connection (already have it at CONNECT), add allow-lists to `UserConfig`, and check them in
+  `handle_publish` (deny → PUBACK/PUBREC `NotAuthorized` 0x87, drop QoS 0) and `handle_subscribe`
+  (deny → SubAck `NotAuthorized` 0x87, don't arm the trie). `mqttbytes` exposes all these reason codes.
+- **Hashed passwords** — replace plaintext comparison with a salted hash (e.g. SHA-256 / Argon2); would add a
+  hashing dependency.
 
 ## 5. CONNECT capability negotiation ✅
 

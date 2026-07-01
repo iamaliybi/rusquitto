@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tracing::{debug, info, warn};
 
+use crate::auth::{AuthResult, Authenticator};
 use crate::broker::engine::{
 	Delivery, InflightMessage, InflightState, Mailbox, SessionSnapshot, ShardState,
 };
@@ -80,6 +81,8 @@ pub struct Connection {
 	/// by [`peer_receive_max`](Self::peer_receive_max)) is full; drained as
 	/// acknowledgements free slots.
 	pending_outbound: VecDeque<Delivery>,
+	/// Shard-local credential store, shared by every connection on this shard.
+	auth: Rc<Authenticator>,
 }
 
 impl Connection {
@@ -92,6 +95,7 @@ impl Connection {
 		shard_id: usize,
 		state: Rc<RefCell<ShardState>>,
 		limits: LimitsConfig,
+		auth: Rc<Authenticator>,
 	) -> Self {
 		let (mailbox_tx, mailbox_rx) = local_channel::new_unbounded();
 		Self {
@@ -112,6 +116,7 @@ impl Connection {
 			peer_receive_max: u16::MAX,
 			peer_max_packet_size: None,
 			pending_outbound: VecDeque::new(),
+			auth,
 		}
 	}
 
@@ -387,6 +392,23 @@ impl Connection {
 }
 
 impl Connection {
+	/// Replies to a rejected CONNECT with a failure CONNACK (session present is
+	/// always false) and returns an error to unwind and close the connection.
+	async fn reject_connect(&mut self, code: mqtt_v5::ConnectReturnCode) -> Result<()> {
+		let mut conn_ack = mqtt_v5::ConnAck::new(code, false);
+		// Attach empty properties so mqttbytes emits the mandatory v5 length byte.
+		conn_ack.properties = Some(mqtt_v5::ConnAckProperties::new());
+		let mut buf = BytesMut::new();
+		conn_ack
+			.write(&mut buf)
+			.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+		self.stream.write_all(&buf).await?;
+		Err(Error::new(
+			ErrorKind::PermissionDenied,
+			"authentication failed",
+		))
+	}
+
 	async fn handle_connect(&mut self, connect: mqtt_v5::Connect) -> Result<()> {
 		// Clean Start decides whether an existing session is resumed; the Session
 		// Expiry Interval decides how long the session outlives a disconnect.
@@ -425,6 +447,28 @@ impl Connection {
 		// Backfill the connection span's `client_id` so every subsequent log line
 		// for this connection carries it automatically.
 		tracing::Span::current().record("client_id", self.client_id.as_str());
+
+		// Authenticate before logging a successful connection or opening any session
+		// state. On failure, reply with the matching CONNACK reason code and close.
+		let login = connect.login.as_ref();
+		let auth = self
+			.auth
+			.check(login.map(|l| l.username.as_str()), login.map(|l| l.password.as_str()));
+		if auth != AuthResult::Granted {
+			let code = match auth {
+				AuthResult::BadUserNamePassword => mqtt_v5::ConnectReturnCode::BadUserNamePassword,
+				_ => mqtt_v5::ConnectReturnCode::NotAuthorized,
+			};
+			warn!(
+				credentials = %redact::credentials(
+					login.map(|l| l.username.as_str()),
+					login.is_some_and(|l| !l.password.is_empty()),
+				),
+				reason = ?code,
+				"authentication failed, rejecting connection"
+			);
+			return self.reject_connect(code).await;
+		}
 
 		// Credentials are redacted: the username is logged, the password is never
 		// passed to the logger — only its presence is noted.

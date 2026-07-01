@@ -1,3 +1,4 @@
+mod auth;
 mod broker;
 mod config;
 mod logger;

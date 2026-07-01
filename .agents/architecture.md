@@ -110,6 +110,7 @@ Built on glommio's `channels::channel_mesh` — a full mesh of shared channels c
 |----------------------------|-------------------------------------------------------------|
 | `src/main.rs`              | Entry: CLI/config load, CPU detection, executor pool launch |
 | `src/config.rs`            | CLI (clap) + TOML config tree (serde), validation           |
+| `src/auth.rs`              | Per-shard `Authenticator`: username/password check at CONNECT |
 | `src/logger.rs`            | tracing setup: non-blocking appenders, spans, redaction     |
 | `src/server/worker.rs`     | Per-shard init: mesh join, socket bind, accept loop, session expiry sweep |
 | `src/server/connection.rs` | Per-packet dispatch, all MQTT handlers, live QoS + session state |
