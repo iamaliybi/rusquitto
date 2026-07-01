@@ -348,6 +348,7 @@ impl ShardState {
 		generation: u64,
 		expiry_secs: u32,
 		snapshot: SessionSnapshot,
+		mut pending: VecDeque<Delivery>,
 	) -> bool {
 		let Some(session) = self.sessions.get_mut(client_id) else {
 			return false;
@@ -362,6 +363,10 @@ impl ShardState {
 		} else {
 			session.mailbox = None;
 			session.snapshot = snapshot;
+			// Messages held back by the outbound window were already dequeued, so
+			// they precede anything that arrives while suspended.
+			pending.append(&mut session.offline_queue);
+			session.offline_queue = pending;
 			session.expires_at = (expiry_secs != SESSION_NEVER_EXPIRES)
 				.then(|| Instant::now() + Duration::from_secs(u64::from(expiry_secs)));
 		}

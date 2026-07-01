@@ -63,6 +63,25 @@ rehash a reconnecting client to another shard. Exact within a shard; always exac
 
 **Known limitation:** Will Delay Interval treated as `0` (immediate) — see [next-steps.md](next-steps.md) item 3.
 
+## Phase 3c — CONNECT negotiation & outbound flow control (2026-07-02)
+
+| Item | Description | Status |
+|------|-------------|--------|
+| CONNACK capability advertisement | receive-max, max-packet-size, max-qos (< 2), retain-available, wildcard/sub-id/shared availability, topic-alias-max = 0 | ✅ |
+| Receive Maximum (outbound) | `outbound_window() = min(client receive-max, max_inflight)`; over-window deliveries held in `pending_outbound`, released by `drain_pending` on PUBACK/PUBCOMP | ✅ |
+| Pending survives suspend | `close_session` takes the pending deque and prepends it to the session's offline queue | ✅ |
+| Maximum Packet Size (outbound) | encoded PUBLISH exceeding the client's limit is dropped, in-flight slot rolled back | ✅ |
+| Windowed delivery paths | live fan-out, retained replay, and offline-queue flush all route through `deliver()` | ✅ |
+
+Client props (`receive_maximum`, `max_packet_size`) captured in `handle_connect`; new `Connection` fields
+`peer_receive_max`, `peer_max_packet_size`, `pending_outbound`.
+
+**Verification (single shard, via `mosquitto -D CONNECT ...`):** client `maximum-packet-size 100` → a 300-byte
+publish is dropped (`exceeds client max packet size`), only the small one delivered, connection stays up ✅;
+client `receive-maximum 1` → 5 QoS 1 messages all delivered in order (drain works) ✅.
+
+**Known limitation:** inbound Receive Maximum and Topic Alias not yet enforced — see [next-steps.md](next-steps.md) item 5.
+
 ## Architecture decisions locked in
 
 - **Mailbox payload:** `Rc<Publish>` for local fan-out; the mesh carries owned `Publish`, re-wrapped in `Rc` on the
