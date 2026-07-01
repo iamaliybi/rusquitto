@@ -24,6 +24,10 @@ isolated, shard-local executor — no `Mutex`, no `RwLock`, no work-stealing.
 - **Will messages** — the CONNECT Will is published when a client drops abnormally (EOF, network error, or a
   DISCONNECT that requests it) and suppressed on a normal DISCONNECT; a session takeover never fires the
   displaced connection's will. *(Will Delay Interval is treated as immediate — see [Limitations](#limitations).)*
+- **CONNECT capability negotiation** — CONNACK advertises the server's Receive Maximum, Maximum Packet Size,
+  Maximum QoS, Retain Available, and wildcard/shared/subscription-identifier availability. The client's
+  **Receive Maximum** (a windowed outbound in-flight limit, with held messages drained as acks arrive) and
+  **Maximum Packet Size** (oversized outbound publishes are dropped) are enforced.
 - **Cross-shard routing** over a `glommio` channel mesh, so a publisher and subscriber on different cores still reach
   each other.
 - **Thread-per-core, shared-nothing**: `SO_REUSEPORT` kernel load balancing, one `io_uring` ring and one `LocalExecutor`
@@ -120,8 +124,10 @@ Deliberately out of scope for now (tracked in `.agents/progress.md`):
   `runtime.shards = 1`**. A cross-shard session directory / MQTT 5 Server Reference redirect is future work.
 - **Will Delay Interval is not yet honoured** — a will fires immediately on abnormal disconnect rather than
   after the requested delay. (Will messages themselves work; only the *delay* is unimplemented.)
-- **No authentication / ACL** and **no CONNECT capability negotiation** beyond advertising the server
-  keep-alive.
+- **Negotiation is outbound-only.** The client's Receive Maximum and Maximum Packet Size are enforced, but the
+  server does not yet enforce an *inbound* Receive Maximum quota, and Topic Aliases are unsupported (CONNACK
+  advertises a Topic Alias Maximum of 0).
+- **No authentication / ACL.**
 
 ## License
 

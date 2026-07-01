@@ -53,11 +53,22 @@ session expiry sweep. Reuse `sweep_expired` / the per-shard timer task.
 Username/password (and/or enhanced auth) at CONNECT; topic-level publish/subscribe authorization. Wire ACL
 checks into `handle_publish` / `handle_subscribe`, return proper reason codes.
 
-## 5. CONNECT capability negotiation
+## 5. CONNECT capability negotiation ✅
 
-Act on client properties (`Receive Maximum` flow-control quota, `Maximum Packet Size`, `Topic Alias
-Maximum`) and advertise the matching server capabilities in CONNACK. `mqttbytes` already decodes them;
-today we only advertise server keep-alive.
+**Done.** CONNACK advertises the full server capability set — Receive Maximum (`max_inflight`), Maximum
+Packet Size (`max_payload_size`), Maximum QoS (when < 2), Retain Available, wildcard/subscription-id/shared
+availability, and Topic Alias Maximum (0) — alongside the existing server keep-alive and assigned client id.
+
+Client limits are stored and **enforced on the outbound path** (`connection.rs`):
+
+- **Receive Maximum** bounds the unacked QoS 1/2 window (`min(client receive-max, max_inflight)`). Deliveries
+  over the window are held in `pending_outbound` and released by `drain_pending` as PUBACK/PUBCOMP free slots.
+  Held messages are preserved across a suspend (merged into the session's offline queue in `close_session`).
+- **Maximum Packet Size** — an outbound PUBLISH larger than the client's limit is dropped (in-flight slot
+  rolled back) rather than sent.
+
+**Remaining:** inbound Receive Maximum enforcement (limit concurrent inbound QoS 1/2 the *server* accepts) and
+Topic Alias support (we advertise 0, i.e. none accepted inbound, and send none outbound).
 
 ## 6. Subscription options & shared subscriptions
 

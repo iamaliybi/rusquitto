@@ -70,6 +70,16 @@ pub struct Connection {
 	/// to fan out. Published when the connection ends abnormally; cleared by a
 	/// normal DISCONNECT so it is suppressed. `None` when no will was set.
 	will: Option<mqtt_v5::Publish>,
+	/// The client's Receive Maximum (CONNECT): the most unacknowledged QoS 1/2
+	/// PUBLISHes we may have in flight to it at once. Defaults to 65535.
+	peer_receive_max: u16,
+	/// The client's Maximum Packet Size (CONNECT), if any: we must not send it a
+	/// packet larger than this. `None` means no limit.
+	peer_max_packet_size: Option<u32>,
+	/// Outbound QoS 1/2 messages held back because the in-flight window (bounded
+	/// by [`peer_receive_max`](Self::peer_receive_max)) is full; drained as
+	/// acknowledgements free slots.
+	pending_outbound: VecDeque<Delivery>,
 }
 
 impl Connection {
@@ -99,7 +109,39 @@ impl Connection {
 			session_expiry: 0,
 			session_generation: 0,
 			will: None,
+			peer_receive_max: u16::MAX,
+			peer_max_packet_size: None,
+			pending_outbound: VecDeque::new(),
 		}
+	}
+
+	/// The outbound in-flight ceiling: the smaller of the client's Receive Maximum
+	/// and our own configured `max_inflight`, and always at least 1.
+	fn outbound_window(&self) -> usize {
+		usize::from(self.peer_receive_max.min(self.limits.max_inflight)).max(1)
+	}
+
+	/// Sends a delivery now if the in-flight window has room (QoS 0 always sends),
+	/// otherwise holds it in the pending queue for later draining.
+	async fn deliver(&mut self, delivery: Delivery) -> Result<()> {
+		if delivery.qos == QoS::AtMostOnce || self.inflight.len() < self.outbound_window() {
+			self.send_publish(&delivery.publish, delivery.qos).await
+		} else {
+			self.pending_outbound.push_back(delivery);
+			Ok(())
+		}
+	}
+
+	/// Releases held-back messages up to the in-flight window; called after an
+	/// acknowledgement frees a slot.
+	async fn drain_pending(&mut self) -> Result<()> {
+		while self.inflight.len() < self.outbound_window() {
+			let Some(delivery) = self.pending_outbound.pop_front() else {
+				break;
+			};
+			self.send_publish(&delivery.publish, delivery.qos).await?;
+		}
+		Ok(())
 	}
 
 	/// Forwards a publish to peer shards and fans it out to local subscribers.
@@ -129,6 +171,7 @@ impl Connection {
 				incoming_qos2: std::mem::take(&mut self.incoming_qos2),
 				next_pkid: self.next_pkid,
 			};
+			let pending = std::mem::take(&mut self.pending_outbound);
 			let will = self.will.take();
 			let mut state = self.state.borrow_mut();
 			let owned = state.close_session(
@@ -136,6 +179,7 @@ impl Connection {
 				self.session_generation,
 				self.session_expiry,
 				snapshot,
+				pending,
 			);
 			if owned && let Some(will) = will {
 				debug!(topic = %will.topic, "publishing will message");
@@ -177,7 +221,7 @@ impl Connection {
 					return Err(e);
 				}
 				Event::Outgoing(Some(delivery)) => {
-					if let Err(e) = self.send_publish(&delivery.publish, delivery.qos).await {
+					if let Err(e) = self.deliver(delivery).await {
 						warn!(error = %e, "delivery error, closing connection");
 						return Err(e);
 					}
@@ -248,24 +292,46 @@ impl Connection {
 		message.qos = qos;
 		message.dup = false;
 
-		match qos {
-			QoS::AtMostOnce => message.pkid = 0,
+		let pkid = match qos {
+			QoS::AtMostOnce => {
+				message.pkid = 0;
+				None
+			}
 			QoS::AtLeastOnce => {
 				let pkid = self.alloc_pkid();
 				message.pkid = pkid;
 				self.track_inflight(pkid, &message, InflightState::Qos1);
+				Some(pkid)
 			}
 			QoS::ExactlyOnce => {
 				let pkid = self.alloc_pkid();
 				message.pkid = pkid;
 				self.track_inflight(pkid, &message, InflightState::Qos2Pending);
+				Some(pkid)
 			}
-		}
+		};
 
 		let mut buf = BytesMut::new();
 		message
 			.write(&mut buf)
 			.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+
+		// The client's Maximum Packet Size is a hard ceiling: we must not send a
+		// larger packet. Drop it (rolling back the in-flight slot so it doesn't
+		// wedge the window) — it can never be delivered to this client.
+		if let Some(max) = self.peer_max_packet_size
+			&& buf.len() as u64 > u64::from(max)
+		{
+			warn!(
+				size = buf.len(),
+				max, "outbound publish exceeds client max packet size, dropping"
+			);
+			if let Some(pkid) = pkid {
+				self.inflight.remove(&pkid);
+			}
+			return Ok(());
+		}
+
 		self.stream.write_all(&buf).await
 	}
 
@@ -325,11 +391,17 @@ impl Connection {
 		// Clean Start decides whether an existing session is resumed; the Session
 		// Expiry Interval decides how long the session outlives a disconnect.
 		let clean_start = connect.clean_session;
-		self.session_expiry = connect
-			.properties
-			.as_ref()
-			.and_then(|p| p.session_expiry_interval)
-			.unwrap_or(0);
+		let props = connect.properties.as_ref();
+		self.session_expiry = props.and_then(|p| p.session_expiry_interval).unwrap_or(0);
+
+		// Client flow-control limits we must honour on the outbound path. Receive
+		// Maximum bounds our unacked QoS 1/2 window (0 is invalid, so clamp to 1);
+		// Maximum Packet Size caps the size of any packet we send it.
+		self.peer_receive_max = props
+			.and_then(|p| p.receive_maximum)
+			.unwrap_or(u16::MAX)
+			.max(1);
+		self.peer_max_packet_size = props.and_then(|p| p.max_packet_size);
 
 		// An empty client id has the server assign one, which must then be echoed
 		// back in CONNACK so the client can reconnect to the same session.
@@ -394,16 +466,37 @@ impl Connection {
 		// emitted. (SubAck/Publish/PubAck handle the None case correctly.)
 		let mut conn_ack =
 			mqtt_v5::ConnAck::new(mqtt_v5::ConnectReturnCode::Success, session_present);
-		let mut props = mqtt_v5::ConnAckProperties::new();
+		let mut ack_props = mqtt_v5::ConnAckProperties::new();
 		// Advertise the server keep-alive so clients adopt our ceiling.
 		if self.limits.keep_alive > 0 {
-			props.server_keep_alive = Some(self.limits.keep_alive);
+			ack_props.server_keep_alive = Some(self.limits.keep_alive);
 		}
 		// Tell the client the id we assigned so it can resume this session later.
 		if assigned {
-			props.assigned_client_identifier = Some(self.client_id.clone());
+			ack_props.assigned_client_identifier = Some(self.client_id.clone());
 		}
-		conn_ack.properties = Some(props);
+
+		// Advertise our capabilities so the client shapes its traffic accordingly.
+		// Receive Maximum: how many unacked QoS 1/2 PUBLISHes we accept concurrently.
+		ack_props.receive_max = Some(self.limits.max_inflight);
+		// Maximum Packet Size we will accept.
+		ack_props.max_packet_size = Some(self.limits.max_payload_size as u32);
+		// Maximum QoS — only sent when below 2 (absence means QoS 2 supported).
+		if self.limits.max_qos < 2 {
+			ack_props.max_qos = Some(self.limits.max_qos);
+		}
+		// Retain Available — 0 signals retained messages are unsupported.
+		if !self.limits.retain_available {
+			ack_props.retain_available = Some(0);
+		}
+		// We support wildcard subscriptions but not subscription identifiers,
+		// shared subscriptions, or inbound topic aliases (yet).
+		ack_props.wildcard_subscription_available = Some(1);
+		ack_props.subscription_identifiers_available = Some(0);
+		ack_props.shared_subscription_available = Some(0);
+		ack_props.topic_alias_max = Some(0);
+
+		conn_ack.properties = Some(ack_props);
 		let mut buf = BytesMut::new();
 		conn_ack
 			.write(&mut buf)
@@ -456,11 +549,11 @@ impl Connection {
 		}
 
 		// Deliver messages that arrived while the session was suspended; each gets
-		// a fresh packet id via the normal outbound path.
+		// a fresh packet id via the normal outbound path, respecting the window.
 		if !offline_queue.is_empty() {
 			debug!(count = offline_queue.len(), "flushing offline queue");
 			for delivery in offline_queue {
-				self.send_publish(&delivery.publish, delivery.qos).await?;
+				self.deliver(delivery).await?;
 			}
 		}
 
@@ -565,11 +658,16 @@ impl Connection {
 		self.stream.write_all(&buf).await?;
 
 		// Replay matching retained messages, delivered with the retain flag set and
-		// downgraded to min(message QoS, granted QoS) for this subscription.
+		// downgraded to min(message QoS, granted QoS) for this subscription. Routed
+		// through `deliver` so the in-flight window is respected.
 		for (mut message, granted) in retained {
 			message.retain = true;
 			let qos = min_qos(message.qos, granted);
-			self.send_publish(&message, qos).await?;
+			self.deliver(Delivery {
+				publish: Rc::new(message),
+				qos,
+			})
+			.await?;
 		}
 
 		Ok(())
@@ -597,8 +695,11 @@ impl Connection {
 
 	async fn handle_puback(&mut self, puback: mqtt_v5::PubAck) -> Result<()> {
 		// QoS 1, sender side: the client acknowledged a message we delivered. The
-		// transaction is complete; release the packet id.
-		self.inflight.remove(&puback.pkid);
+		// transaction is complete; release the packet id and let a held message
+		// through the freed window slot.
+		if self.inflight.remove(&puback.pkid).is_some() {
+			self.drain_pending().await?;
+		}
 		Ok(())
 	}
 
@@ -634,8 +735,10 @@ impl Connection {
 
 	async fn handle_pubcomp(&mut self, pubcomp: mqtt_v5::PubComp) -> Result<()> {
 		// QoS 2, sender side (step 4): the client finalized the transaction.
-		// Release the packet id.
-		self.inflight.remove(&pubcomp.pkid);
+		// Release the packet id and admit a held message into the freed slot.
+		if self.inflight.remove(&pubcomp.pkid).is_some() {
+			self.drain_pending().await?;
+		}
 		Ok(())
 	}
 }
