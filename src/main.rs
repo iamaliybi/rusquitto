@@ -7,6 +7,7 @@ mod server;
 
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use glommio::channels::channel_mesh::{Full, MeshBuilder};
 use glommio::{CpuSet, LocalExecutorPoolBuilder, PoolPlacement};
@@ -76,14 +77,24 @@ fn run(config: Config) -> std::io::Result<()> {
 	// Shared, read-only config handed to every shard.
 	let config = Arc::new(config);
 
+	// Shared shutdown flag flipped by SIGTERM/SIGINT. Each shard polls it and
+	// stops accepting, so the executor pool unwinds and this function returns —
+	// letting the log guards flush on the way out instead of dying mid-write.
+	let shutdown = Arc::new(AtomicBool::new(false));
+	for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+		signal_hook::flag::register(signal, Arc::clone(&shutdown))?;
+	}
+
 	LocalExecutorPoolBuilder::new(placement)
 		.on_all_shards(move || {
 			let mesh = mesh.clone();
 			let config = Arc::clone(&config);
-			async move { server::worker::init(mesh, config).await }
+			let shutdown = Arc::clone(&shutdown);
+			async move { server::worker::init(mesh, config, shutdown).await }
 		})
 		.expect("failed to spawn local executor")
 		.join_all();
 
+	tracing::info!("broker shut down");
 	Ok(())
 }

@@ -21,6 +21,9 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1.1"
 
+# Process signals (graceful shutdown on SIGTERM / SIGINT)
+signal-hook = "0.4"
+
 [[bin]]
 name = "mosquitto"
 path = "src/bin/mosquitto.rs"

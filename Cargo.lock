@@ -425,7 +425,7 @@ dependencies = [
  "rlimit",
  "scoped-tls",
  "scopeguard",
- "signal-hook",
+ "signal-hook 0.3.18",
  "sketches-ddsketch",
  "smallvec",
  "socket2 0.4.10",
@@ -728,6 +728,7 @@ dependencies = [
  "glommio",
  "mqttbytes",
  "serde",
+ "signal-hook 0.4.4",
  "socket2 0.6.2",
  "toml",
  "tracing",
@@ -831,6 +832,16 @@ name = "signal-hook"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
+name = "signal-hook"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2a0c28ca5908dbdbcd52e6fdaa00358ab88637f8ab33e1f188dd510eb44b53d"
 dependencies = [
  "libc",
  "signal-hook-registry",

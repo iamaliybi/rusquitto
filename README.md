@@ -39,6 +39,8 @@ isolated, shard-local executor — no `Mutex`, no `RwLock`, no work-stealing.
   per shard, lock-free shard-local state.
 - **Structured logging** (`tracing`): non-blocking file appenders, daily rotation, a dedicated error log, per-connection
   spans tagged with `client_id`, and redaction of passwords and payloads.
+- **Graceful shutdown** on `SIGTERM` / `SIGINT`: shards stop accepting, the process exits cleanly (code 0), and
+  buffered logs are flushed instead of being lost to an abrupt kill.
 - **TOML configuration** with a typed, validated schema and a CLI.
 
 ## Requirements
@@ -129,6 +131,9 @@ Deliberately out of scope for now (tracked in `.agents/progress.md`):
   `runtime.shards = 1`**. A cross-shard session directory / MQTT 5 Server Reference redirect is future work.
 - **Will Delay Interval is not yet honoured** — a will fires immediately on abnormal disconnect rather than
   after the requested delay. (Will messages themselves work; only the *delay* is unimplemented.)
+- **Shutdown drops active connections.** On `SIGTERM`/`SIGINT` the broker stops accepting and exits cleanly,
+  but in-flight connections are closed without a client DISCONNECT and without running session-suspend / will
+  handling. Draining connections gracefully is future work.
 - **Negotiation is outbound-only.** The client's Receive Maximum and Maximum Packet Size are enforced, but the
   server does not yet enforce an *inbound* Receive Maximum quota, and Topic Aliases are unsupported (CONNACK
   advertises a Topic Alias Maximum of 0).

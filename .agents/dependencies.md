@@ -15,6 +15,7 @@
 | `clap`               | 4       | CLI (derive API); single positional `<CONFIG>` arg                                                                                  |
 | `serde`              | 1       | `Deserialize` for the config tree (derive)                                                                                          |
 | `toml`               | 1.1     | Decodes the `.toml` config file                                                                                                     |
+| `signal-hook`        | 0.4     | SIGTERM/SIGINT → shared `AtomicBool` for graceful shutdown (glommio pulls its own 0.3 transitively)                                |
 
 ## Key Types by Source
 

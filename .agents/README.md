@@ -1,6 +1,6 @@
 # Agentic Context for Rusquitto
 
-Internal working notes. Last refreshed 2026-07-02 (Phase 3a–3e — sessions, will, negotiation, auth + ACL).
+Internal working notes. Last refreshed 2026-07-02 (Phase 3a–3f — sessions, will, negotiation, auth+ACL, shutdown).
 
 | File                               | Contents                                                                       |
 |------------------------------------|--------------------------------------------------------------------------------|

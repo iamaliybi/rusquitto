@@ -87,10 +87,20 @@ Topic Alias support (we advertise 0, i.e. none accepted inbound, and send none o
 
 `No Local`, `Retain As Published`, `Retain Handling`, and `$share/...` group subscriptions.
 
-## 7. Observability & ops
+## 7. Observability & ops — graceful shutdown ✅, rest remaining
 
-`$SYS` metrics topics, connection/throughput counters, graceful shutdown on SIGTERM, and a documented
-`RLIMIT_MEMLOCK` requirement (io_uring buffer registration `ENOMEM` under load — see progress.md).
+**Graceful shutdown done.** `main` registers a SIGTERM/SIGINT handler (`signal-hook`) that sets a shared
+`Arc<AtomicBool>`; each shard's accept loop races `accept()` against a 500 ms tick and breaks when the flag is
+set, so `init()` returns, the executor pool unwinds, and `main` returns normally — flushing the non-blocking
+log guards (previously a signal killed the process mid-write, losing buffered logs). Exits with code 0.
+
+**Remaining:**
+- **Drain active connections on shutdown** — currently in-flight connection tasks are dropped (no client
+  DISCONNECT, and `run()` cleanup / will handling doesn't run). Send DISCONNECT `ServerShuttingDown` (0x8B) and
+  let sessions suspend cleanly. Needs a per-connection shutdown signal (e.g. a shard-local broadcast the event
+  loop selects on).
+- `$SYS` metrics topics, connection/throughput counters.
+- Documented `RLIMIT_MEMLOCK` requirement (io_uring buffer registration `ENOMEM` under load — see progress.md).
 
 ## Code map for the above
 

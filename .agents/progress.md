@@ -123,6 +123,23 @@ subscribe to `secret/#` → `subscribe not authorized` (SubAck NotAuthorized) �
 
 **Known limitation:** plaintext passwords; anonymous clients are unrestricted (no anonymous ACL).
 
+## Phase 3f — Graceful shutdown (2026-07-02)
+
+| Item | Description | Status |
+|------|-------------|--------|
+| Signal handling | `main` registers SIGTERM + SIGINT via `signal-hook` → sets a shared `Arc<AtomicBool>` | ✅ |
+| Accept-loop stop | `worker::init` takes the flag; the accept loop races `accept()` against a 500 ms tick (`AcceptTurn` enum, `.or`) and breaks when set — `.or` polls accept first so no ready connection is lost to the tick | ✅ |
+| Clean exit + flush | shards return, `LocalExecutorPoolBuilder::join_all` unwinds, `main` returns `Ok` → log guards drop and flush; exit code 0 | ✅ |
+| New dep | `signal-hook = "0.4"` (glommio also pulls its own 0.3 transitively) | ✅ |
+
+**Verification (single shard):** `kill -TERM` → broker exits with code 0; logs contain `shutdown signal
+received, stopping accept loop` and `broker shut down` (previously SIGTERM killed the process before the
+non-blocking appender flushed).
+
+**Known limitation:** in-flight connection tasks are dropped on shutdown — no client DISCONNECT and `run()`
+cleanup (session suspend / will) doesn't run. Draining connections is the next ops step
+(see [next-steps.md](next-steps.md) item 7).
+
 ## Architecture decisions locked in
 
 - **Mailbox payload:** `Rc<Publish>` for local fan-out; the mesh carries owned `Publish`, re-wrapped in `Rc` on the
