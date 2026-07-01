@@ -4,19 +4,34 @@ use crate::config::Config;
 use crate::net::socket::create_socket;
 use crate::net::tcp_listener::create_tcp_listener;
 use crate::server::connection::Connection;
+use futures_lite::FutureExt;
 use glommio::channels::channel_mesh::{Full, MeshBuilder};
+use glommio::net::TcpStream;
 use mqttbytes::v5::Publish;
 use std::cell::Cell;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::Instrument;
 
 /// How often each shard reclaims suspended sessions past their expiry deadline.
 const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
-pub async fn init(mesh: MeshBuilder<Publish, Full>, config: Arc<Config>) {
+/// How often the accept loop wakes to check the shutdown flag. Bounds the
+/// shutdown latency; kept coarse so it barely touches the steady-state hot path.
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// One turn of the accept loop: either a connection outcome, or a periodic tick
+/// that lets the loop re-check the shutdown flag while `accept()` is blocked.
+enum AcceptTurn {
+	Accepted(TcpStream),
+	Failed,
+	Tick,
+}
+
+pub async fn init(mesh: MeshBuilder<Publish, Full>, config: Arc<Config>, shutdown: Arc<AtomicBool>) {
 	let shard_id: usize = glommio::executor().id();
 	let socket_addr = SocketAddr::new(config.server.bind, config.server.port);
 
@@ -85,42 +100,64 @@ pub async fn init(mesh: MeshBuilder<Publish, Full>, config: Arc<Config>) {
 	// Shard-local live-connection counter (single-threaded, so a plain Cell).
 	let conn_count = Rc::new(Cell::new(0usize));
 
-	loop {
-		match tcp_listener.accept().await {
-			Ok(stream) => {
-				if conn_count.get() >= max_conns {
-					tracing::warn!(
-						shard = shard_id,
-						max = max_conns,
-						"max connections per shard reached, rejecting"
-					);
-					drop(stream); // closes the socket
-					continue;
-				}
-				conn_count.set(conn_count.get() + 1);
-
-				let state = state.clone();
-				let counter = conn_count.clone();
-				let auth = auth.clone();
-				// One span per connection. `client_id` is recorded later, once the
-				// client sends CONNECT, so every log line for this connection — on
-				// either side of an `.await` — automatically carries it.
-				let span = tracing::info_span!(
-					"connection",
-					shard = shard_id,
-					client_id = tracing::field::Empty,
-				);
-				glommio::spawn_local(
-					async move {
-						let mut connection = Connection::new(stream, shard_id, state, limits, auth);
-						let _ = connection.run().await;
-						counter.set(counter.get() - 1);
+	while !shutdown.load(Ordering::Relaxed) {
+		// Race the (otherwise unbounded) accept against a periodic tick so a
+		// shutdown signal is noticed even while no client is connecting. `.or`
+		// polls the accept first, so a ready connection is never lost to the tick.
+		let turn = {
+			let accept = async {
+				match tcp_listener.accept().await {
+					Ok(stream) => AcceptTurn::Accepted(stream),
+					Err(e) => {
+						tracing::warn!(shard = shard_id, error = %e, "accept failed");
+						AcceptTurn::Failed
 					}
-					.instrument(span),
-				)
-				.detach();
-			}
-			Err(e) => tracing::warn!(shard = shard_id, error = %e, "accept failed"),
+				}
+			};
+			let tick = async {
+				glommio::timer::sleep(SHUTDOWN_POLL_INTERVAL).await;
+				AcceptTurn::Tick
+			};
+			accept.or(tick).await
+		};
+
+		let stream = match turn {
+			AcceptTurn::Accepted(stream) => stream,
+			AcceptTurn::Failed | AcceptTurn::Tick => continue,
+		};
+
+		if conn_count.get() >= max_conns {
+			tracing::warn!(
+				shard = shard_id,
+				max = max_conns,
+				"max connections per shard reached, rejecting"
+			);
+			drop(stream); // closes the socket
+			continue;
 		}
+		conn_count.set(conn_count.get() + 1);
+
+		let state = state.clone();
+		let counter = conn_count.clone();
+		let auth = auth.clone();
+		// One span per connection. `client_id` is recorded later, once the
+		// client sends CONNECT, so every log line for this connection — on
+		// either side of an `.await` — automatically carries it.
+		let span = tracing::info_span!(
+			"connection",
+			shard = shard_id,
+			client_id = tracing::field::Empty,
+		);
+		glommio::spawn_local(
+			async move {
+				let mut connection = Connection::new(stream, shard_id, state, limits, auth);
+				let _ = connection.run().await;
+				counter.set(counter.get() - 1);
+			}
+			.instrument(span),
+		)
+		.detach();
 	}
+
+	tracing::info!(shard = shard_id, "shutdown signal received, stopping accept loop");
 }
