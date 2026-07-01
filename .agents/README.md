@@ -1,6 +1,6 @@
 # Agentic Context for Rusquitto
 
-Internal working notes. Last refreshed 2026-07-02 (Phase 3a — shard-local persistent sessions).
+Internal working notes. Last refreshed 2026-07-02 (Phase 3a/3b — persistent sessions + will messages).
 
 | File                               | Contents                                                                       |
 |------------------------------------|--------------------------------------------------------------------------------|

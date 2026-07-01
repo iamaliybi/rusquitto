@@ -66,6 +66,10 @@ pub struct Connection {
 	/// `open_session` and handed back to `close_session` so a takeover by a
 	/// newer connection isn't torn down by this one's cleanup.
 	session_generation: u64,
+	/// The client's Will Message (from CONNECT), pre-built as a `Publish` ready
+	/// to fan out. Published when the connection ends abnormally; cleared by a
+	/// normal DISCONNECT so it is suppressed. `None` when no will was set.
+	will: Option<mqtt_v5::Publish>,
 }
 
 impl Connection {
@@ -94,6 +98,7 @@ impl Connection {
 			limits,
 			session_expiry: 0,
 			session_generation: 0,
+			will: None,
 		}
 	}
 
@@ -114,18 +119,29 @@ impl Connection {
 		// subscriptions) or suspends it for a later reconnect, handing over our
 		// durable QoS state so it survives the gap. The generation guard makes this
 		// a no-op if a newer connection already took over our client id.
+		//
+		// If we still owned the session and a Will Message survives (i.e. the loop
+		// ended abnormally, not via a normal DISCONNECT), publish it. A takeover
+		// returns `owned == false`, so a displaced connection never fires its will.
 		if !self.client_id.is_empty() {
 			let snapshot = SessionSnapshot {
 				inflight: std::mem::take(&mut self.inflight),
 				incoming_qos2: std::mem::take(&mut self.incoming_qos2),
 				next_pkid: self.next_pkid,
 			};
-			self.state.borrow_mut().close_session(
+			let will = self.will.take();
+			let mut state = self.state.borrow_mut();
+			let owned = state.close_session(
 				&self.client_id,
 				self.session_generation,
 				self.session_expiry,
 				snapshot,
 			);
+			if owned && let Some(will) = will {
+				debug!(topic = %will.topic, "publishing will message");
+				state.broadcast(&will);
+				state.deliver_local(will);
+			}
 		}
 
 		debug!("connection closed");
@@ -196,10 +212,12 @@ impl Connection {
 					// Need more bytes.
 				}
 				// mqttbytes rejects any zero-length packet other than PING as
-				// `PayloadRequired`, but a bare `E0 00` DISCONNECT is valid MQTT 5.
-				// Treat it as a clean client close.
+				// `PayloadRequired`, but a bare `E0 00` DISCONNECT is a valid MQTT 5
+				// normal disconnect. Synthesize one so it flows through
+				// `handle_disconnect` (which suppresses the will) instead of being
+				// mistaken for an abrupt EOF, which would wrongly fire the will.
 				Err(MqttError::PayloadRequired) if first_byte.map(|b| b >> 4) == Some(14) => {
-					return Ok(None);
+					return Ok(Some(Packet::Disconnect(mqtt_v5::Disconnect::new())));
 				}
 				Err(e) => {
 					return Err(Error::new(
@@ -285,7 +303,7 @@ impl Connection {
 			Packet::Subscribe(subscribe) => self.handle_subscribe(subscribe).await,
 			Packet::Unsubscribe(unsubscribe) => self.handle_unsubscribe(unsubscribe).await,
 			Packet::PingReq => self.handle_ping().await,
-			Packet::Disconnect(_) => self.handle_disconnect().await,
+			Packet::Disconnect(disconnect) => self.handle_disconnect(disconnect).await,
 
 			// QoS 1 & 2 Flows (Client Responses)
 			Packet::PubAck(puback) => self.handle_puback(puback).await,
@@ -322,6 +340,15 @@ impl Connection {
 		} else {
 			connect.client_id
 		};
+
+		// Stash the Will Message (if any) as a ready-to-route Publish. Will Delay
+		// Interval is not yet honoured — the will fires immediately on abnormal
+		// disconnect (see .agents/next-steps.md).
+		self.will = connect.last_will.map(|w| {
+			let mut publish = mqtt_v5::Publish::new(w.topic, w.qos, w.message.to_vec());
+			publish.retain = w.retain;
+			publish
+		});
 
 		// Backfill the connection span's `client_id` so every subsequent log line
 		// for this connection carries it automatically.
@@ -440,8 +467,14 @@ impl Connection {
 		Ok(())
 	}
 
-	async fn handle_disconnect(&mut self) -> Result<()> {
-		info!("client sent disconnect");
+	async fn handle_disconnect(&mut self, disconnect: mqtt_v5::Disconnect) -> Result<()> {
+		// A normal DISCONNECT (0x00) suppresses the will; reason 0x04 explicitly
+		// asks for it, and any other reason code leaves it to fire.
+		let reason = disconnect.reason_code;
+		if reason == mqtt_v5::DisconnectReasonCode::NormalDisconnection {
+			self.will = None;
+		}
+		info!(reason = ?reason, "client sent disconnect");
 		// Returning an error unwinds the event loop and closes the connection.
 		Err(Error::new(ErrorKind::ConnectionAborted, "Client Disconnected"))
 	}

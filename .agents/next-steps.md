@@ -31,9 +31,22 @@ port) on a different shard, where its session doesn't exist. Needs a cross-shard
 MQTT 5 Server Reference redirect. Until then, resume is exact only within a shard (always, for
 `runtime.shards = 1`). This overlaps with item 1 (cross-shard reliability) and the clustering goal.
 
-## 3. Will messages
+## 3. Will messages ✅
 
-Store the CONNECT will; publish it on ungraceful disconnect (EOF/error), suppress it on clean DISCONNECT.
+**Done.** The CONNECT Will Message is stored as a ready-to-route `Publish` on the connection
+(`connection.rs::handle_connect`) and fired in `run()` cleanup when the loop ends abnormally
+(EOF / IO error / non-normal DISCONNECT reason). A normal DISCONNECT (`0x00`) clears it so it is suppressed;
+reason `0x04` (Disconnect With Will Message) keeps it. Takeover does **not** fire the displaced connection's
+will — `close_session` returns whether this connection still owned the session, and the will is gated on that.
+
+Also fixed here: a bare `E0 00` (zero-length) DISCONNECT — the usual graceful close — was being framed as an
+EOF and skipping `handle_disconnect`; it is now synthesized into a normal `Disconnect` packet so the will is
+correctly suppressed.
+
+**Remaining — Will Delay Interval.** Currently treated as `0` (the will fires immediately on abnormal
+disconnect). Honouring a non-zero delay needs a timer that publishes the will after
+`min(will_delay, session_expiry)` and is cancelled if the client reconnects first — the same machinery as the
+session expiry sweep. Reuse `sweep_expired` / the per-shard timer task.
 
 ## 4. Authentication / ACL
 

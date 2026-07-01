@@ -48,6 +48,21 @@ wait → swept, reconnect `false` ✅; 3× QoS 1 published while offline → all
 **Known limitation:** cross-shard resume (see [next-steps.md](next-steps.md) item 2) — `SO_REUSEPORT` may
 rehash a reconnecting client to another shard. Exact within a shard; always exact for `runtime.shards = 1`.
 
+## Phase 3b — Will messages (2026-07-02)
+
+| Item | Description | Status |
+|------|-------------|--------|
+| Storage | CONNECT `last_will` → pre-built `Publish` on `Connection` (`will: Option<Publish>`), retain flag preserved | ✅ |
+| Fire on abnormal close | `run()` cleanup publishes the will (broadcast + `deliver_local`) when the loop ends via EOF / IO error / non-normal DISCONNECT | ✅ |
+| Suppress on graceful | `handle_disconnect` clears the will on reason `0x00`; keeps it on `0x04` (Disconnect With Will Message) | ✅ |
+| No spurious will on takeover | `close_session` now returns `owned: bool`; will fires only if this connection still owned the session | ✅ |
+| Zero-length DISCONNECT fix | `E0 00` was framed as EOF (skipping `handle_disconnect`); now synthesized into a normal `Disconnect` so the will is suppressed | ✅ |
+
+**Verification (single shard):** will fires on `kill -9` (subscriber receives it) ✅; suppressed on a graceful
+`mosquitto_pub` DISCONNECT (subscriber does *not* receive it) ✅; exactly one `publishing will message` logged.
+
+**Known limitation:** Will Delay Interval treated as `0` (immediate) — see [next-steps.md](next-steps.md) item 3.
+
 ## Architecture decisions locked in
 
 - **Mailbox payload:** `Rc<Publish>` for local fan-out; the mesh carries owned `Publish`, re-wrapped in `Rc` on the
