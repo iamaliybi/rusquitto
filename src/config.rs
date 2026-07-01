@@ -163,11 +163,19 @@ pub struct AuthConfig {
 /// Passwords are stored in plaintext in the config file, so protect it with file
 /// permissions and treat it as a secret. (Hashed passwords are a planned
 /// enhancement.)
+///
+/// `publish` / `subscribe` are optional topic-filter allow-lists (each may use
+/// `+` / `#` wildcards). When a list is omitted the user is unrestricted for
+/// that operation; when present, only matching topics are permitted.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserConfig {
 	pub username: String,
 	pub password: String,
+	#[serde(default)]
+	pub publish: Option<Vec<String>>,
+	#[serde(default)]
+	pub subscribe: Option<Vec<String>>,
 }
 
 impl LimitsConfig {

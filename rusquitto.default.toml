@@ -155,11 +155,20 @@ allow_anonymous = true
 # (name + password). Passwords are stored in plaintext, so protect this file
 # with restrictive permissions and treat it as a secret.
 #
+# Each user may carry optional `publish` / `subscribe` topic-filter allow-lists
+# (with `+` / `#` wildcards). When a list is omitted the user is unrestricted
+# for that operation; when present, only matching topics are permitted. A
+# denied publish is dropped (QoS 0) or Not-Authorized-acked (QoS 1/2); a denied
+# subscribe gets a Not Authorized reason code. Anonymous clients are always
+# unrestricted.
+#
 # Add one [[auth.users]] table per user, for example:
 #
 #   [[auth.users]]
 #   username = "alice"
 #   password = "s3cret"
+#   publish   = ["sensors/#"]              # may publish only under sensors/
+#   subscribe = ["sensors/#", "cmd/alice"] # may subscribe only to these
 #
-# Type: array of { username, password }   Default: [] (none)
+# Type: array of { username, password, publish?, subscribe? }   Default: [] (none)
 users = []

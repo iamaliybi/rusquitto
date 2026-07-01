@@ -60,6 +60,10 @@ retain_available = true            # Whether retained messages are accepted/serv
 allow_anonymous = true             # false = clients must present a valid username/password.
 
 # One table per user. Passwords are plaintext, so keep this file secret.
+# Optional publish/subscribe allow-lists (topic filters) restrict a user;
+# omit them for unrestricted access. Anonymous clients are always unrestricted.
 # [[auth.users]]
-# username = "alice"
-# password = "s3cret"
+# username  = "alice"
+# password  = "s3cret"
+# publish   = ["sensors/#"]                # may publish only under sensors/
+# subscribe = ["sensors/#", "cmd/alice"]   # may subscribe only to these
