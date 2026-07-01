@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Error, ErrorKind, Result};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tracing::{debug, info, warn};
 
@@ -94,6 +94,9 @@ pub struct Connection {
 	/// Whether this connection has been counted as connected, so the matching
 	/// decrement happens exactly once (only after a successful CONNECT).
 	counted: bool,
+	/// Broker-wide shutdown flag; when set, a closed mailbox means the server is
+	/// stopping (rather than a session takeover) so we send DISCONNECT first.
+	shutdown: Arc<AtomicBool>,
 }
 
 impl Connection {
@@ -108,6 +111,7 @@ impl Connection {
 		limits: LimitsConfig,
 		auth: Rc<Authenticator>,
 		metrics: Arc<Metrics>,
+		shutdown: Arc<AtomicBool>,
 	) -> Self {
 		let (mailbox_tx, mailbox_rx) = local_channel::new_unbounded();
 		Self {
@@ -132,6 +136,7 @@ impl Connection {
 			username: None,
 			metrics,
 			counted: false,
+			shutdown,
 		}
 	}
 
@@ -252,13 +257,33 @@ impl Connection {
 						return Err(e);
 					}
 				}
-				// The mailbox sender was dropped from the registry — e.g. a new
-				// connection reused our client_id and took over the session.
-				Event::Outgoing(None) => break,
+				// The mailbox sender was dropped — either the server is shutting down
+				// (tell the client and suppress the will) or a new connection took
+				// over our client id (just close).
+				Event::Outgoing(None) => {
+					if self.shutdown.load(Ordering::Relaxed) {
+						self.will = None;
+						let _ = self
+							.send_disconnect(mqtt_v5::DisconnectReasonCode::ServerShuttingDown)
+							.await;
+					}
+					break;
+				}
 			}
 		}
 
 		Ok(())
+	}
+
+	/// Sends a server-initiated DISCONNECT with the given reason (best effort).
+	async fn send_disconnect(&mut self, reason: mqtt_v5::DisconnectReasonCode) -> Result<()> {
+		let mut disconnect = mqtt_v5::Disconnect::new();
+		disconnect.reason_code = reason;
+		let mut buf = BytesMut::new();
+		disconnect
+			.write(&mut buf)
+			.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+		self.stream.write_all(&buf).await
 	}
 
 	/// Reads from `stream` into `buffer` until a complete MQTT packet can be

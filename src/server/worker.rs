@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::Instrument;
 
 /// How often each shard reclaims suspended sessions past their expiry deadline.
@@ -23,6 +23,13 @@ const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 /// How often the accept loop wakes to check the shutdown flag. Bounds the
 /// shutdown latency; kept coarse so it barely touches the steady-state hot path.
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Longest a shard waits for its connections to drain during shutdown before
+/// giving up and letting the executor tear down whatever remains.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// How often the drain loop re-checks the live-connection count.
+const SHUTDOWN_DRAIN_POLL: Duration = Duration::from_millis(25);
 
 /// One turn of the accept loop: either a connection outcome, or a periodic tick
 /// that lets the loop re-check the shutdown flag while `accept()` is blocked.
@@ -175,6 +182,7 @@ pub async fn init(
 		let counter = conn_count.clone();
 		let auth = auth.clone();
 		let metrics = metrics.clone();
+		let shutdown = shutdown.clone();
 		// One span per connection. `client_id` is recorded later, once the
 		// client sends CONNECT, so every log line for this connection — on
 		// either side of an `.await` — automatically carries it.
@@ -186,7 +194,7 @@ pub async fn init(
 		glommio::spawn_local(
 			async move {
 				let mut connection =
-					Connection::new(stream, shard_id, state, limits, auth, metrics);
+					Connection::new(stream, shard_id, state, limits, auth, metrics, shutdown);
 				let _ = connection.run().await;
 				counter.set(counter.get() - 1);
 			}
@@ -195,5 +203,24 @@ pub async fn init(
 		.detach();
 	}
 
-	tracing::info!(shard = shard_id, "shutdown signal received, stopping accept loop");
+	// Drain: wake every live connection (closing its mailbox → `Outgoing(None)`)
+	// so it sends DISCONNECT and runs its own cleanup, then wait for them to
+	// finish (bounded) before returning and letting the executor tear down.
+	let live = conn_count.get();
+	tracing::info!(
+		shard = shard_id,
+		connections = live,
+		"shutdown signal received, draining connections"
+	);
+	state.borrow_mut().shutdown_connections();
+
+	let deadline = Instant::now() + SHUTDOWN_GRACE;
+	while conn_count.get() > 0 && Instant::now() < deadline {
+		glommio::timer::sleep(SHUTDOWN_DRAIN_POLL).await;
+	}
+	tracing::info!(
+		shard = shard_id,
+		remaining = conn_count.get(),
+		"shard stopped"
+	);
 }

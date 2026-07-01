@@ -160,6 +160,20 @@ reality — `clients/total = 3`, `clients/connected = 1`, `messages/received = 2
 (`hello`+`world`), version/uptime correct. `messages/sent` includes the `$SYS` deliveries to the subscriber
 (expected). 8/8 unit tests pass.
 
+## Phase 3h — Connection draining on shutdown (2026-07-02)
+
+Completes graceful shutdown: connected clients are told the server is stopping instead of being dropped.
+
+| Item | Description | Status |
+|------|-------------|--------|
+| Wake mechanism | `ShardState::shutdown_connections` drops every session's mailbox → each connection wakes via its existing `Outgoing(None)` arm (no per-connection timers) | ✅ |
+| Client notice | on `Outgoing(None)` with the shutdown flag set, the connection sends DISCONNECT `ServerShuttingDown` (0x8B) via `send_disconnect`, suppresses its will, then runs normal cleanup (session suspends per expiry) | ✅ |
+| Bounded drain | after breaking the accept loop, the shard calls `shutdown_connections` and waits (poll `conn_count`, `SHUTDOWN_GRACE = 5 s`) before returning | ✅ |
+| Wiring | `Connection` gains the shared `Arc<AtomicBool>` shutdown flag (via `Connection::new`) | ✅ |
+
+**Verification (single shard):** with clients connected, `kill -TERM` → the client logs `Received DISCONNECT
+(139)` (0x8B), broker logs `draining connections connections:N` then `shard stopped remaining:0`, exit code 0.
+
 ## Architecture decisions locked in
 
 - **Mailbox payload:** `Rc<Publish>` for local fan-out; the mesh carries owned `Publish`, re-wrapped in `Rc` on the
