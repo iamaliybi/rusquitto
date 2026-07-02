@@ -143,6 +143,12 @@ Deliberately out of scope for now (tracked in `.agents/progress.md`):
 - **Passwords are plaintext** in the config file (protect it with permissions); there is no hashed-password
   support or enhanced (SASL-style) authentication yet. Anonymous clients bypass ACL (they are unrestricted).
 
+## Releases
+
+Version history is in [CHANGELOG.md](CHANGELOG.md); each release is tagged and published on
+[GitHub Releases](https://github.com/iamaliybi/rusquitto/releases). The project follows semantic
+versioning (pre-1.0: minor for features, patch for fixes).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
