@@ -26,16 +26,20 @@ isolated, shard-local executor — no `Mutex`, no `RwLock`, no work-stealing.
   core. A Clean Start connect discards the session cluster-wide.
 - **Will messages** — the CONNECT Will is published when a client drops abnormally (EOF, network error, or a
   DISCONNECT that requests it) and suppressed on a normal DISCONNECT; a session takeover never fires the
-  displaced connection's will. *(Will Delay Interval is treated as immediate — see [Limitations](#limitations).)*
+  displaced connection's will. A **Will Delay Interval** delays the will by `min(will delay, session expiry)`
+  seconds and is cancelled if the client reconnects within the delay.
 - **CONNECT capability negotiation** — CONNACK advertises the server's Receive Maximum, Maximum Packet Size,
-  Maximum QoS, Retain Available, and wildcard/shared/subscription-identifier availability. The client's
-  **Receive Maximum** (a windowed outbound in-flight limit, with held messages drained as acks arrive) and
-  **Maximum Packet Size** (oversized outbound publishes are dropped) are enforced.
+  Maximum QoS, Retain Available, Topic Alias Maximum, and wildcard/shared/subscription-identifier availability.
+  The client's **Receive Maximum** (a windowed outbound in-flight limit) and **Maximum Packet Size** (oversized
+  outbound publishes are dropped) are enforced; the broker also enforces its **own** inbound Receive Maximum
+  (a client exceeding the concurrent-QoS-2 quota is disconnected with `0x93`), and resolves **inbound topic
+  aliases** so clients can shrink repeated topics.
 - **Authentication & ACL** — optional username/password at CONNECT via the `[auth]` config (`allow_anonymous`
-  plus a list of users). Failures are rejected with the proper CONNACK reason code (`0x86` bad credentials,
-  `0x87` anonymous not allowed). Each user may carry `publish` / `subscribe` topic-filter allow-lists: a denied
-  publish is dropped (QoS 0) or Not-Authorized-acked (QoS 1/2), and a denied subscribe gets a Not Authorized
-  reason code. Defaults are open, so nothing is required until you configure it.
+  plus a list of users). Passwords may be stored as plaintext `password` or a SHA-256 `password_hash`. Failures
+  are rejected with the proper CONNACK reason code (`0x86` bad credentials, `0x87` anonymous not allowed). Each
+  user may carry `publish` / `subscribe` topic-filter allow-lists: a denied publish is dropped (QoS 0) or
+  Not-Authorized-acked (QoS 1/2), and a denied subscribe gets a Not Authorized reason code. Defaults are open,
+  so nothing is required until you configure it.
 - **Cross-shard routing** over a `glommio` channel mesh, so a publisher and subscriber on different cores still reach
   each other. QoS 1/2 forwards apply **backpressure** (an awaiting mesh send), so the delivery guarantee holds across
   shards — the publisher waits rather than dropping when a mesh link is full. QoS 0 stays fire-and-forget.
@@ -61,6 +65,9 @@ isolated, shard-local executor — no `Mutex`, no `RwLock`, no work-stealing.
 
 - **Linux** with a kernel supporting `io_uring` (**5.8+**).
 - A Rust toolchain (2024 edition).
+- **`RLIMIT_MEMLOCK`** high enough for `io_uring` buffer registration. The default (often 64 KiB) is fine for
+  light use, but under connection bursts a low limit surfaces as a `glommio` `ENOMEM`. Raise it before running:
+  `ulimit -l unlimited` (shell) or `LimitMEMLOCK=infinity` (systemd unit).
 - For the example clients below: `mosquitto-clients` (`mosquitto_pub` / `mosquitto_sub`).
 
 ## Quick start
@@ -150,13 +157,13 @@ Deliberately out of scope for now (tracked in `.agents/progress.md`):
   one member per shard rather than exactly one across the cluster. Fully single-delivery for `runtime.shards = 1`
   or when a group's members share a shard; globally-coordinated shared delivery is future work (overlaps the
   cross-shard items above).
-- **Will Delay Interval is not yet honoured** — a will fires immediately on abnormal disconnect rather than
-  after the requested delay. (Will messages themselves work; only the *delay* is unimplemented.)
-- **Negotiation is outbound-only.** The client's Receive Maximum and Maximum Packet Size are enforced, but the
-  server does not yet enforce an *inbound* Receive Maximum quota, and Topic Aliases are unsupported (CONNACK
-  advertises a Topic Alias Maximum of 0).
-- **Passwords are plaintext** in the config file (protect it with permissions); there is no hashed-password
-  support or enhanced (SASL-style) authentication yet. Anonymous clients bypass ACL (they are unrestricted).
+- **No outbound topic aliases or subscription identifiers.** The broker accepts *inbound* topic aliases but never
+  assigns aliases on the publishes it sends, and it doesn't support subscription identifiers (CONNACK advertises
+  both as unavailable). Delayed wills are forwarded to peer shards best-effort (the sweep timer uses a
+  non-blocking mesh send).
+- **Passwords: plaintext or SHA-256.** A `password_hash` avoids storing the secret in the clear, but there is no
+  salting or a slow KDF (Argon2/bcrypt) yet, and no enhanced (SASL-style) authentication. Anonymous clients
+  bypass ACL (they are unrestricted). Protect the config file with restrictive permissions regardless.
 
 ## Releases
 

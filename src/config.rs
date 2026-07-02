@@ -173,9 +173,10 @@ pub struct SysConfig {
 
 /// A single `[[auth.users]]` entry.
 ///
-/// Passwords are stored in plaintext in the config file, so protect it with file
-/// permissions and treat it as a secret. (Hashed passwords are a planned
-/// enhancement.)
+/// A user carries exactly one credential: either a plaintext `password` or a
+/// `password_hash` (a lowercase-hex SHA-256 of the password). Prefer the hash so
+/// the config file doesn't hold the secret in the clear; either way protect the
+/// file with restrictive permissions.
 ///
 /// `publish` / `subscribe` are optional topic-filter allow-lists (each may use
 /// `+` / `#` wildcards). When a list is omitted the user is unrestricted for
@@ -184,7 +185,12 @@ pub struct SysConfig {
 #[serde(deny_unknown_fields)]
 pub struct UserConfig {
 	pub username: String,
-	pub password: String,
+	/// Plaintext password. Mutually exclusive with `password_hash`.
+	#[serde(default)]
+	pub password: Option<String>,
+	/// Lowercase-hex SHA-256 of the password. Mutually exclusive with `password`.
+	#[serde(default)]
+	pub password_hash: Option<String>,
 	#[serde(default)]
 	pub publish: Option<Vec<String>>,
 	#[serde(default)]
@@ -348,6 +354,21 @@ impl Config {
 			if !seen.insert(user.username.as_str()) {
 				return Err(ConfigError::Validation(format!(
 					"duplicate auth user '{}'",
+					user.username
+				)));
+			}
+			// Each user carries exactly one credential.
+			if user.password.is_some() == user.password_hash.is_some() {
+				return Err(ConfigError::Validation(format!(
+					"auth user '{}' must set exactly one of `password` or `password_hash`",
+					user.username
+				)));
+			}
+			if let Some(hash) = &user.password_hash
+				&& (hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()))
+			{
+				return Err(ConfigError::Validation(format!(
+					"auth user '{}' password_hash must be a 64-char hex SHA-256",
 					user.username
 				)));
 			}

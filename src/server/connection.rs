@@ -108,6 +108,14 @@ pub struct Connection {
 	/// Broker-wide shutdown flag; when set, a closed mailbox means the server is
 	/// stopping (rather than a session takeover) so we send DISCONNECT first.
 	shutdown: Arc<AtomicBool>,
+	/// Will Delay Interval (seconds) from CONNECT: the will is published this many
+	/// seconds after an abnormal disconnect (capped by the session expiry), or
+	/// immediately when 0. See [`ShardState::arm_will`].
+	will_delay: u32,
+	/// Inbound topic-alias table (MQTT 5): maps an alias the client has registered
+	/// (by sending a PUBLISH with both a topic and an alias) to its topic, so later
+	/// PUBLISHes may carry the alias with an empty topic.
+	inbound_aliases: HashMap<u16, String>,
 }
 
 impl Connection {
@@ -148,8 +156,14 @@ impl Connection {
 			metrics,
 			counted: false,
 			shutdown,
+			will_delay: 0,
+			inbound_aliases: HashMap::new(),
 		}
 	}
+
+	/// Largest inbound topic alias the broker accepts, advertised to clients as the
+	/// CONNACK Topic Alias Maximum.
+	const INBOUND_TOPIC_ALIAS_MAX: u16 = 16;
 
 	/// The outbound in-flight ceiling: the smaller of the client's Receive Maximum
 	/// and our own configured `max_inflight`, and always at least 1.
@@ -243,10 +257,25 @@ impl Connection {
 				pending,
 			);
 			if owned && let Some(will) = will {
-				debug!(topic = %will.topic, "publishing will message");
-				// Broker-originated, so no publisher for No Local. Reuses the reliable
-				// forward path (QoS > 0 wills apply mesh backpressure like any publish).
-				self.fan_out(will, None).await;
+				// Will Delay Interval: fire after min(will delay, session expiry). A
+				// zero delay (or a session that didn't outlive us) publishes now; a
+				// non-zero delay arms the will on the suspended session for the sweep
+				// timer to publish later, cancelled if the client reconnects first.
+				let delay = self.will_delay.min(self.session_expiry);
+				if delay == 0 {
+					debug!(topic = %will.topic, "publishing will message");
+					// Broker-originated, so no publisher for No Local. Reuses the
+					// reliable forward path (QoS > 0 wills apply mesh backpressure).
+					self.fan_out(will, None).await;
+				} else {
+					debug!(topic = %will.topic, delay, "arming delayed will message");
+					self.state.borrow_mut().arm_will(
+						&self.client_id,
+						self.session_generation,
+						will,
+						delay,
+					);
+				}
 			}
 		}
 
@@ -526,14 +555,20 @@ impl Connection {
 			connect.client_id
 		};
 
-		// Stash the Will Message (if any) as a ready-to-route Publish. Will Delay
-		// Interval is not yet honoured — the will fires immediately on abnormal
-		// disconnect (see .agents/next-steps.md).
-		self.will = connect.last_will.map(|w| {
+		// Stash the Will Message (if any) as a ready-to-route Publish, and capture its
+		// Will Delay Interval — the will is published this many seconds after an
+		// abnormal disconnect (capped by the session expiry), armed on the session in
+		// `run()` cleanup.
+		if let Some(w) = connect.last_will {
+			self.will_delay = w
+				.properties
+				.as_ref()
+				.and_then(|p| p.delay_interval)
+				.unwrap_or(0);
 			let mut publish = mqtt_v5::Publish::new(w.topic, w.qos, w.message.to_vec());
 			publish.retain = w.retain;
-			publish
-		});
+			self.will = Some(publish);
+		}
 
 		// Backfill the connection span's `client_id` so every subsequent log line
 		// for this connection carries it automatically.
@@ -665,12 +700,13 @@ impl Connection {
 		if !self.limits.retain_available {
 			ack_props.retain_available = Some(0);
 		}
-		// We support wildcard and shared subscriptions, but not subscription
-		// identifiers or inbound topic aliases (yet).
+		// We support wildcard and shared subscriptions and inbound topic aliases, but
+		// not subscription identifiers (yet).
 		ack_props.wildcard_subscription_available = Some(1);
 		ack_props.subscription_identifiers_available = Some(0);
 		ack_props.shared_subscription_available = Some(1);
-		ack_props.topic_alias_max = Some(0);
+		// We accept inbound topic aliases up to this maximum (we send none outbound).
+		ack_props.topic_alias_max = Some(Self::INBOUND_TOPIC_ALIAS_MAX);
 
 		conn_ack.properties = Some(ack_props);
 		let mut buf = BytesMut::new();
@@ -807,7 +843,32 @@ impl Connection {
 		self.stream.write_all(&buf).await
 	}
 
-	async fn handle_publish(&mut self, publish: mqtt_v5::Publish) -> Result<()> {
+	async fn handle_publish(&mut self, mut publish: mqtt_v5::Publish) -> Result<()> {
+		// Resolve an inbound topic alias (MQTT 5) before anything else reads the
+		// topic. A PUBLISH may register an alias (topic + alias) or use one (empty
+		// topic + alias); an out-of-range or unknown alias is a protocol error.
+		if let Some(alias) = publish.properties.as_ref().and_then(|p| p.topic_alias) {
+			if alias == 0 || alias > Self::INBOUND_TOPIC_ALIAS_MAX {
+				warn!(alias, "topic alias out of range, disconnecting");
+				self.send_disconnect(mqtt_v5::DisconnectReasonCode::TopicAliasInvalid)
+					.await?;
+				return Err(Error::new(ErrorKind::InvalidData, "topic alias invalid"));
+			}
+			if publish.topic.is_empty() {
+				match self.inbound_aliases.get(&alias) {
+					Some(topic) => publish.topic = topic.clone(),
+					None => {
+						warn!(alias, "unknown topic alias, disconnecting");
+						self.send_disconnect(mqtt_v5::DisconnectReasonCode::TopicAliasInvalid)
+							.await?;
+						return Err(Error::new(ErrorKind::InvalidData, "unknown topic alias"));
+					}
+				}
+			} else {
+				self.inbound_aliases.insert(alias, publish.topic.clone());
+			}
+		}
+
 		// Payload contents are never logged — only topic, QoS, and byte length.
 		debug!(
 			topic = %publish.topic,
@@ -877,6 +938,21 @@ impl Connection {
 			// Actual delivery is deferred to PUBREL so it happens exactly once even
 			// if the publisher re-sends the PUBLISH.
 			QoS::ExactlyOnce => {
+				// Enforce the inbound Receive Maximum we advertised: bound the number
+				// of concurrent unacknowledged QoS 2 PUBLISHes. A fresh pkid past the
+				// quota is a protocol violation → DISCONNECT (0x93). A re-send of a
+				// pkid we already hold doesn't count against the quota.
+				if !self.incoming_qos2.contains_key(&publish.pkid)
+					&& self.incoming_qos2.len() >= usize::from(self.limits.max_inflight)
+				{
+					warn!(
+						quota = self.limits.max_inflight,
+						"inbound receive maximum exceeded, disconnecting"
+					);
+					self.send_disconnect(mqtt_v5::DisconnectReasonCode::ReceiveMaximumExceeded)
+						.await?;
+					return Err(Error::new(ErrorKind::InvalidData, "receive maximum exceeded"));
+				}
 				self.incoming_qos2.insert(publish.pkid, msg);
 				let mut buf = BytesMut::new();
 				mqtt_v5::PubRec::new(publish.pkid)

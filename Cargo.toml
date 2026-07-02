@@ -24,6 +24,9 @@ toml = "1.1"
 # Process signals (graceful shutdown on SIGTERM / SIGINT)
 signal-hook = "0.4"
 
+# Password hashing (SHA-256 for `[[auth.users]]` password_hash)
+sha2 = "0.10"
+
 [[bin]]
 name = "mosquitto"
 path = "src/bin/mosquitto.rs"

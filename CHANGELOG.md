@@ -21,6 +21,19 @@ version is bumped for new features, the patch version for fixes).
   get their own copy. Retained messages are not replayed to shared subscriptions,
   and CONNACK now advertises shared-subscription support. *(Load balancing is
   per-shard; see the README limitations.)*
+- **Will Delay Interval** — a Will Message with a non-zero delay is now published
+  after `min(will delay, session expiry)` seconds instead of immediately, and is
+  cancelled if the client reconnects within the delay.
+- **Inbound Receive Maximum** — the broker now enforces the Receive Maximum it
+  advertises: a client that exceeds the concurrent unacknowledged QoS 2 quota is
+  disconnected with reason `0x93` (Receive Maximum exceeded).
+- **Inbound topic aliases** — CONNACK advertises a Topic Alias Maximum and the
+  broker resolves aliases on inbound PUBLISH (registering topic↔alias mappings and
+  substituting the topic for alias-only publishes); an invalid alias is rejected
+  with `0x94`.
+- **Hashed passwords** — `[[auth.users]]` accepts a `password_hash` (lowercase-hex
+  SHA-256) as an alternative to plaintext `password`, so the config need not store
+  the secret in the clear.
 
 ## [0.3.0] - 2026-07-03
 

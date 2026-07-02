@@ -101,7 +101,14 @@ pub async fn init(
 		glommio::spawn_local(async move {
 			loop {
 				glommio::timer::sleep(SESSION_SWEEP_INTERVAL).await;
-				state.borrow_mut().sweep_expired();
+				// Reclaim lapsed sessions and publish any Will Messages whose delay
+				// interval has now elapsed (best-effort mesh forward, like `$SYS`).
+				let wills = state.borrow_mut().sweep_expired();
+				for will in wills {
+					let mut shard_state = state.borrow_mut();
+					shard_state.broadcast(&will);
+					shard_state.deliver_local(will, None);
+				}
 			}
 		})
 		.detach();

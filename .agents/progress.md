@@ -263,6 +263,28 @@ burst** (50× the mesh buffer). All four subscribers — including the two cross
 messages, zero loss. Under the previous drop-on-full forward the cross-shard subscribers would have lost most.
 13/13 unit tests pass.
 
+## Phase 3m — Protocol completions (2026-07-03)
+
+A bundle of remaining MQTT 5 / ops items, shipped together.
+
+| Item | Description | Status |
+|------|-------------|--------|
+| Will Delay Interval | `Connection.will_delay` from the will's `delay_interval`. `run()` cleanup publishes immediately when `min(will_delay, session_expiry) == 0`, else `ShardState::arm_will` stores `Session.pending_will = (will, deadline)`. `sweep_expired` returns due wills (delay elapsed, or session expired first); the sweep timer publishes them (best-effort). `open_session` clears `pending_will` on resume → reconnect within the delay cancels the will | ✅ |
+| Inbound Receive Maximum | QoS 2 path: a new pkid past `incoming_qos2.len() >= max_inflight` → DISCONNECT `ReceiveMaximumExceeded` (0x93) | ✅ |
+| Inbound topic aliases | CONNACK advertises `topic_alias_max = 16`; `handle_publish` resolves aliases first via `Connection.inbound_aliases` (register on topic+alias, substitute on empty-topic+alias); invalid → DISCONNECT `TopicAliasInvalid` (0x94) | ✅ |
+| Hashed passwords | `[[auth.users]]` accepts `password_hash` (hex SHA-256) instead of `password`; config validates exactly one is set + 64 hex chars; `auth::Credential { Plain \| Sha256 }` verifies via the `sha2` crate | ✅ |
+| RLIMIT_MEMLOCK | documented in the README Requirements section | ✅ |
+| Tests | `auth::sha256_hashed_password`; 14/14 unit tests pass | ✅ |
+
+**Verification (paho-mqtt v5, `runtime.shards = 1`):** one script, all PASS —
+- **hashed password:** `alice` with `password_hash = sha256("s3cret")` → correct password connects (rc 0), wrong password rejected (rc 134);
+- **will delay:** a will with delay 3 s + session expiry 60 s, victim killed abruptly → **not** delivered at 1.5 s, delivered exactly once at ~4 s (broker logs `arming delayed will message`);
+- **will cancel:** same, but the client reconnects within the delay → the will is **not** delivered;
+- **topic alias:** register alias 1 → `alias/topic`, then publish alias-only (empty topic) → subscriber receives both payloads on `alias/topic`.
+
+Inbound Receive Maximum is a guard on the QoS 2 receive path (a conforming client can't exceed the quota it was
+told), so it's covered by construction plus the unchanged QoS 2 flow.
+
 ## Architecture decisions locked in
 
 - **Mailbox payload:** `Rc<Publish>` for local fan-out; the mesh carries owned `Publish`, re-wrapped in `Rc` on the
