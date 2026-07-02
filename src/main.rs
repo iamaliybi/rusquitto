@@ -12,8 +12,8 @@ use std::sync::atomic::AtomicBool;
 
 use glommio::channels::channel_mesh::{Full, MeshBuilder};
 use glommio::{CpuSet, LocalExecutorPoolBuilder, PoolPlacement};
-use mqttbytes::v5::Publish;
 
+use crate::broker::engine::MeshMsg;
 use crate::config::{Cli, Config, LogFormat, Placement};
 
 fn main() -> ExitCode {
@@ -71,8 +71,9 @@ fn run(config: Config) -> std::io::Result<()> {
 		"starting rusquitto broker"
 	);
 
-	// Full mesh connecting all shards. Cloned into each shard, which then joins.
-	let mesh: MeshBuilder<Publish, Full> =
+	// Full mesh connecting all shards, carrying forwarded publishes and cross-shard
+	// session-control messages. Cloned into each shard, which then joins.
+	let mesh: MeshBuilder<MeshMsg, Full> =
 		MeshBuilder::full(shards, config.runtime.mesh_capacity);
 
 	// Shared, read-only config handed to every shard.

@@ -18,16 +18,26 @@ use std::sync::Arc;
 
 use crate::auth::{AuthResult, Authenticator};
 use crate::broker::engine::{
-	Delivery, InflightMessage, InflightState, Mailbox, SessionSnapshot, ShardState,
+	Delivery, InflightMessage, InflightState, Mailbox, MigratedSession, SessionSnapshot, ShardState,
 };
 use crate::config::LimitsConfig;
 use crate::logger::redact;
 use crate::metrics::Metrics;
 
+use std::time::Duration;
+
 /// Monotonic counter for assigning identifiers to clients that connect without
 /// one (MQTT 5 allows an empty client id, leaving the server to assign it).
 /// Combined with the shard id it is unique across the whole broker.
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(0);
+
+/// How long a CONNECT handler waits for peers to answer a cross-shard session
+/// [`Claim`](crate::broker::engine::SessionControl::Claim) before giving up and
+/// treating the session as fresh. Mesh replies normally arrive in microseconds;
+/// this only bounds the wait if a reply is dropped (drop-on-full mesh) or a peer
+/// is wedged, so it can be generous without slowing the common case (which
+/// resolves as soon as every peer has answered).
+const SESSION_CLAIM_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// One iteration of the connection event loop resolves to exactly one of these:
 /// either the client sent us bytes, or the broker routed a message to us.
@@ -574,6 +584,28 @@ impl Connection {
 			offline_queue = handle.offline_queue;
 		}
 
+		// Cross-shard session resume. `SO_REUSEPORT` may have landed this reconnect
+		// on a different shard than the one holding the client's session, so if we
+		// opened a *fresh* session on a non-clean connect, ask our peers whether one
+		// of them owns it and migrate it here. A Clean Start instead tells peers to
+		// discard any session they may still hold from an earlier rehash.
+		if clean_start {
+			self.state.borrow().broadcast_claim(&self.client_id, false);
+		} else if !session_present
+			&& let Some(migrated) = self.claim_remote_session().await
+		{
+			info!("resumed session migrated from another shard");
+			let (snapshot, offline) = self
+				.state
+				.borrow_mut()
+				.install_migrated(&self.client_id, migrated);
+			self.inflight = snapshot.inflight;
+			self.incoming_qos2 = snapshot.incoming_qos2;
+			self.next_pkid = snapshot.next_pkid;
+			offline_queue = offline;
+			session_present = true;
+		}
+
 		// The CONNECT succeeded; count this client until it disconnects.
 		self.metrics.client_connected();
 		self.counted = true;
@@ -630,6 +662,57 @@ impl Connection {
 		}
 
 		Ok(())
+	}
+
+	/// Broadcasts a session Claim to peer shards and waits (bounded) for their
+	/// replies, returning a session if a peer handed one over.
+	///
+	/// Every peer answers a claim — with its session or a negative reply — so this
+	/// normally resolves the instant the last peer responds (or the first session
+	/// arrives). The timeout only guards against a reply lost to the drop-on-full
+	/// mesh or a wedged peer, so treating that as "no session" is safe (the stranded
+	/// session simply expires on its old shard).
+	async fn claim_remote_session(&mut self) -> Option<MigratedSession> {
+		let nr_peers = self.state.borrow().mesh_peers();
+		if nr_peers == 0 {
+			return None; // Single-shard broker: no peers to claim from.
+		}
+
+		// Register a mailbox for the Handoff replies, then broadcast the claim.
+		let (tx, rx) = local_channel::new_unbounded::<Option<MigratedSession>>();
+		{
+			let mut state = self.state.borrow_mut();
+			state.register_claim(self.client_id.clone(), tx);
+			state.broadcast_claim(&self.client_id, true);
+		}
+		debug!(peers = nr_peers, "claiming session from peer shards");
+
+		// Resolve as soon as a session arrives or every peer has answered.
+		let collect = async {
+			let mut remaining = nr_peers;
+			let mut found = None;
+			while remaining > 0 {
+				match rx.recv().await {
+					Some(reply) => {
+						remaining -= 1;
+						if let Some(session) = reply {
+							found = Some(session);
+							break;
+						}
+					}
+					None => break,
+				}
+			}
+			found
+		};
+		let timeout = async {
+			glommio::timer::sleep(SESSION_CLAIM_TIMEOUT).await;
+			None
+		};
+		let found = collect.or(timeout).await;
+
+		self.state.borrow_mut().unregister_claim(&self.client_id);
+		found
 	}
 
 	/// Restores message flow on a resumed session: first retransmit the unacked

@@ -19,8 +19,11 @@ isolated, shard-local executor — no `Mutex`, no `RwLock`, no work-stealing.
 - **Persistent sessions** — honours the Session Expiry Interval: a disconnect *suspends* the session (keeping its
   subscriptions), a reconnect with the same Client ID and Clean Start `false` resumes it (CONNACK `session_present`),
   QoS > 0 messages published while offline are queued and flushed on resume, and unacknowledged in-flight QoS 1/2
-  messages are retransmitted with the DUP flag. Session takeover on Client ID reuse is handled. *(Shard-local — see
-  [Limitations](#limitations).)*
+  messages are retransmitted with the DUP flag. Session takeover on Client ID reuse is handled.
+- **Cross-shard session resume** — because `SO_REUSEPORT` may load-balance a reconnecting client onto a *different*
+  core than the one holding its session, the session is **migrated across the channel mesh** to wherever the client
+  lands: its subscriptions, in-flight QoS 1/2 state, and offline queue all move with it, so resume is seamless on any
+  core. A Clean Start connect discards the session cluster-wide.
 - **Will messages** — the CONNECT Will is published when a client drops abnormally (EOF, network error, or a
   DISCONNECT that requests it) and suppressed on a normal DISCONNECT; a session takeover never fires the
   displaced connection's will. *(Will Delay Interval is treated as immediate — see [Limitations](#limitations).)*
@@ -130,11 +133,13 @@ Deliberately out of scope for now (tracked in `.agents/progress.md`):
   at-least/exactly-once guarantee holds *within* a shard but is best-effort *across* shards. Under heavy
   connection bursts you may also hit a `glommio` io_uring `ENOMEM` from a low `RLIMIT_MEMLOCK`; raise it
   (`ulimit -l unlimited` or `LimitMEMLOCK=infinity`).
-- **Session resume is shard-local.** Sessions are stored per shard, keyed by Client ID. `SO_REUSEPORT`
-  hashes each connection's TCP 4-tuple to a shard, and a reconnecting client uses a new ephemeral port, so
-  it may land on a *different* shard where its suspended session doesn't exist (and is treated as fresh).
-  Resume is reliable when the client rehashes to the same shard, and **always exact for
-  `runtime.shards = 1`**. A cross-shard session directory / MQTT 5 Server Reference redirect is future work.
+- **Cross-shard session migration is best-effort under mesh overload.** A reconnecting client that lands on a
+  different shard triggers a session `Claim` over the channel mesh; the owning shard hands the session back. The
+  mesh uses non-blocking sends (drop-on-full), so under a saturated mesh a claim or hand-off could be dropped and
+  the reconnect would fall back to a fresh session (the stranded one then expires on its old shard). In normal
+  operation this is seamless (verified across a 2-shard broker); it shares the backpressure limitation above.
+  A cross-shard *takeover* of a still-live connection drops the old connection without migrating its in-flight
+  state.
 - **Will Delay Interval is not yet honoured** — a will fires immediately on abnormal disconnect rather than
   after the requested delay. (Will messages themselves work; only the *delay* is unimplemented.)
 - **Negotiation is outbound-only.** The client's Receive Maximum and Maximum Packet Size are enforced, but the

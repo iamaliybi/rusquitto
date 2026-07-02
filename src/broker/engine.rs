@@ -85,6 +85,72 @@ struct Match {
 /// client by `client_id` rather than holding their own sender.
 pub type Mailbox = LocalSender<Delivery>;
 
+/// A message crossing the inter-shard channel mesh. Most carry a `Publish` to be
+/// re-routed on the receiving shard; a smaller number carry a [`SessionControl`]
+/// message for cross-shard session migration. The control variant is boxed so the
+/// common publish path keeps the enum (and thus the mesh ring buffers) small.
+pub enum MeshMsg {
+	Publish(Publish),
+	Control(Box<SessionControl>),
+}
+
+/// Cross-shard session-migration protocol, exchanged over the mesh.
+///
+/// A reconnecting client can land — via the `SO_REUSEPORT` 4-tuple hash on its new
+/// ephemeral port — on a different shard than the one holding its suspended
+/// session. Since every shard shares one listening address there is nothing to
+/// redirect the client to, so the *session* moves instead: the shard the client
+/// reached broadcasts a [`Claim`], and whichever peer owns the session replies
+/// with a [`Handoff`] carrying it.
+///
+/// [`Claim`]: SessionControl::Claim
+/// [`Handoff`]: SessionControl::Handoff
+pub enum SessionControl {
+	/// "Client `client_id` just (re)connected to me (`requester`); if you hold its
+	/// session, hand it over." `resume = false` — a Clean Start connect — instead
+	/// asks peers to *discard* any session they hold for this client id.
+	Claim {
+		client_id: String,
+		/// Mesh peer id of the shard to send the [`Handoff`](SessionControl::Handoff)
+		/// reply back to.
+		requester: usize,
+		resume: bool,
+	},
+	/// Reply to a [`Claim`](SessionControl::Claim): the owning peer's session for
+	/// `client_id`, or `None` if it held none (or the claim was a discard).
+	Handoff {
+		client_id: String,
+		session: Option<MigratedSession>,
+	},
+}
+
+/// A whole session serialized for migration to another shard.
+///
+/// Carries owned data only — the mesh moves values between executors, so the
+/// offline queue's `Rc<Publish>` is unwrapped to an owned `Publish` here and
+/// re-wrapped on arrival. Subscriptions travel as flat tuples rather than trie
+/// nodes.
+pub struct MigratedSession {
+	/// The client's subscriptions (filter, granted QoS, and options).
+	pub subscriptions: Vec<MigratedSub>,
+	/// Outbound QoS 1/2 messages awaiting acknowledgement.
+	pub inflight: HashMap<u16, InflightMessage>,
+	/// Inbound QoS 2 messages received but not yet released.
+	pub incoming_qos2: HashMap<u16, Publish>,
+	/// Where the outbound packet-id allocator left off.
+	pub next_pkid: u16,
+	/// QoS > 0 messages buffered while offline, as owned `(publish, qos, retain)`.
+	pub offline: Vec<(Publish, QoS, bool)>,
+}
+
+/// One migrated subscription (a flattened [`TopicTrie`] entry).
+pub struct MigratedSub {
+	pub filter: String,
+	pub qos: QoS,
+	pub nolocal: bool,
+	pub retain_as_published: bool,
+}
+
 /// Durable per-client session state, keyed by `client_id` in [`ShardState`].
 ///
 /// A session outlives the [`Connection`](crate::server::connection::Connection)
@@ -151,7 +217,11 @@ pub struct ShardState {
 	retained: HashMap<String, Publish>,
 	/// Senders to every other shard in the full channel mesh. `None` until the
 	/// shard joins the mesh in `worker::init`.
-	mesh: Option<Senders<Publish>>,
+	mesh: Option<Senders<MeshMsg>>,
+	/// In-flight cross-shard session claims this shard is awaiting, keyed by client
+	/// id. When a `Handoff` reply arrives on the mesh it is delivered through the
+	/// matching sender, waking the CONNECT handler blocked on the claim.
+	pending_claims: HashMap<String, LocalSender<Option<MigratedSession>>>,
 }
 
 impl ShardState {
@@ -161,7 +231,7 @@ impl ShardState {
 	}
 
 	/// Stores this shard's mesh senders so publishes can be forwarded to peers.
-	pub fn set_mesh(&mut self, senders: Senders<Publish>) {
+	pub fn set_mesh(&mut self, senders: Senders<MeshMsg>) {
 		self.mesh = Some(senders);
 	}
 
@@ -180,8 +250,176 @@ impl ShardState {
 			if idx == me {
 				continue;
 			}
-			let _ = senders.try_send_to(idx, publish.clone());
+			let _ = senders.try_send_to(idx, MeshMsg::Publish(publish.clone()));
 		}
+	}
+
+	/// The number of *other* shards in the mesh (peers this shard can talk to).
+	/// Zero for a single-shard broker, which short-circuits cross-shard migration.
+	pub fn mesh_peers(&self) -> usize {
+		self.mesh
+			.as_ref()
+			.map_or(0, |s| s.nr_consumers().saturating_sub(1))
+	}
+
+	/// Sends a single control message to one peer shard (best effort, drop-on-full).
+	fn send_control_to(&self, peer: usize, control: SessionControl) {
+		if let Some(senders) = &self.mesh {
+			let _ = senders.try_send_to(peer, MeshMsg::Control(Box::new(control)));
+		}
+	}
+
+	/// Broadcasts a session [`Claim`](SessionControl::Claim) to every peer shard.
+	/// With `resume = true` peers holding a suspended session hand it back; with
+	/// `resume = false` (Clean Start) they discard it instead. A no-op when there
+	/// are no peers.
+	pub fn broadcast_claim(&self, client_id: &str, resume: bool) {
+		let Some(senders) = &self.mesh else {
+			return;
+		};
+		let me = senders.peer_id();
+		for idx in 0..senders.nr_consumers() {
+			if idx == me {
+				continue;
+			}
+			let _ = senders.try_send_to(
+				idx,
+				MeshMsg::Control(Box::new(SessionControl::Claim {
+					client_id: client_id.to_string(),
+					requester: me,
+					resume,
+				})),
+			);
+		}
+	}
+
+	/// Registers a pending claim: the CONNECT handler awaits `tx`'s receiver while
+	/// this sender is delivered any [`Handoff`](SessionControl::Handoff) replies.
+	pub fn register_claim(
+		&mut self,
+		client_id: String,
+		tx: LocalSender<Option<MigratedSession>>,
+	) {
+		self.pending_claims.insert(client_id, tx);
+	}
+
+	/// Removes a pending claim once the CONNECT handler is done waiting.
+	pub fn unregister_claim(&mut self, client_id: &str) {
+		self.pending_claims.remove(client_id);
+	}
+
+	/// Dispatches a control message received from a peer over the mesh.
+	pub fn on_control(&mut self, control: SessionControl) {
+		match control {
+			SessionControl::Claim {
+				client_id,
+				requester,
+				resume,
+			} => self.handle_claim(client_id, requester, resume),
+			SessionControl::Handoff { client_id, session } => {
+				// Route the reply to whichever CONNECT handler is awaiting it. If none
+				// is (timed out, or a stray/duplicate reply), it is simply dropped.
+				if let Some(tx) = self.pending_claims.get(&client_id) {
+					let _ = tx.try_send(session);
+				}
+			}
+		}
+	}
+
+	/// Handles a peer's session [`Claim`](SessionControl::Claim): reply with the
+	/// session if we own one and this is a resume, otherwise discard/none.
+	fn handle_claim(&mut self, client_id: String, requester: usize, resume: bool) {
+		// Decide with an immutable peek first so the borrow ends before we mutate.
+		let session = match self.sessions.get(&client_id).map(|s| s.mailbox.is_none()) {
+			// Suspended session and the client wants to resume: migrate it wholesale.
+			Some(true) if resume => Some(self.extract_session(&client_id)),
+			// A still-live session (cross-shard takeover) or a Clean Start discard:
+			// drop it here — dropping the mailbox also disconnects the live client —
+			// without migrating any durable state.
+			Some(_) => {
+				self.sessions.remove(&client_id);
+				self.trie.remove_client(&client_id);
+				None
+			}
+			// Nothing for this client id.
+			None => None,
+		};
+		self.send_control_to(requester, SessionControl::Handoff { client_id, session });
+	}
+
+	/// Removes a suspended session from this shard and packages it for migration:
+	/// its subscriptions (pulled from the trie), durable QoS state, and offline
+	/// queue (unwrapped from `Rc` to owned publishes).
+	fn extract_session(&mut self, client_id: &str) -> MigratedSession {
+		let subscriptions = self
+			.trie
+			.take_client(client_id)
+			.into_iter()
+			.map(|(filter, qos, nolocal, retain_as_published)| MigratedSub {
+				filter,
+				qos,
+				nolocal,
+				retain_as_published,
+			})
+			.collect();
+
+		let session = self
+			.sessions
+			.remove(client_id)
+			.expect("extract_session called for a client without a session");
+		let offline = session
+			.offline_queue
+			.into_iter()
+			.map(|d| ((*d.publish).clone(), d.qos, d.retain))
+			.collect();
+
+		MigratedSession {
+			subscriptions,
+			inflight: session.snapshot.inflight,
+			incoming_qos2: session.snapshot.incoming_qos2,
+			next_pkid: session.snapshot.next_pkid,
+			offline,
+		}
+	}
+
+	/// Installs a session migrated from another shard onto the freshly-opened
+	/// local session for `client_id`: re-arms its subscriptions in the trie and
+	/// returns the durable QoS state and offline queue for the connection to load.
+	///
+	/// The local session must already exist (just created by `open_session`); its
+	/// expiry is governed by the current CONNECT, so the migrated deadline is not
+	/// carried over.
+	pub fn install_migrated(
+		&mut self,
+		client_id: &str,
+		migrated: MigratedSession,
+	) -> (SessionSnapshot, VecDeque<Delivery>) {
+		for sub in migrated.subscriptions {
+			self.trie.insert(
+				&sub.filter,
+				client_id,
+				sub.qos,
+				sub.nolocal,
+				sub.retain_as_published,
+			);
+		}
+
+		let offline = migrated
+			.offline
+			.into_iter()
+			.map(|(publish, qos, retain)| Delivery {
+				publish: Rc::new(publish),
+				qos,
+				retain,
+			})
+			.collect();
+
+		let snapshot = SessionSnapshot {
+			inflight: migrated.inflight,
+			incoming_qos2: migrated.incoming_qos2,
+			next_pkid: migrated.next_pkid,
+		};
+		(snapshot, offline)
 	}
 
 	/// Opens (or resumes) a session for a connecting client, installing its live

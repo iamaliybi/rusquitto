@@ -1,5 +1,5 @@
 use crate::auth::Authenticator;
-use crate::broker::engine::ShardState;
+use crate::broker::engine::{MeshMsg, ShardState};
 use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::net::socket::create_socket;
@@ -40,7 +40,7 @@ enum AcceptTurn {
 }
 
 pub async fn init(
-	mesh: MeshBuilder<Publish, Full>,
+	mesh: MeshBuilder<MeshMsg, Full>,
 	config: Arc<Config>,
 	shutdown: Arc<AtomicBool>,
 	metrics: Arc<Metrics>,
@@ -77,15 +77,19 @@ pub async fn init(
 	let state = ShardState::new();
 	state.borrow_mut().set_mesh(senders);
 
-	// Drain inbound cross-shard publishes: re-wrap each in Rc and fan it out to
-	// this shard's local subscribers, exactly as a local publish would be.
+	// Drain inbound cross-shard messages. A forwarded publish is re-wrapped in Rc
+	// and fanned out to this shard's local subscribers, exactly as a local publish
+	// would be; a control message drives cross-shard session migration.
 	for (_producer, receiver) in receivers.streams() {
 		let state = state.clone();
 		glommio::spawn_local(async move {
-			while let Some(publish) = receiver.recv().await {
-				// Mesh-forwarded: the publisher is on another shard, so No Local
-				// never applies here.
-				state.borrow_mut().deliver_local(publish, None);
+			while let Some(msg) = receiver.recv().await {
+				match msg {
+					// Mesh-forwarded: the publisher is on another shard, so No Local
+					// never applies here.
+					MeshMsg::Publish(publish) => state.borrow_mut().deliver_local(publish, None),
+					MeshMsg::Control(control) => state.borrow_mut().on_control(*control),
+				}
 			}
 		})
 		.detach();

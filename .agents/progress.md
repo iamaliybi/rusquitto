@@ -191,6 +191,36 @@ No Local, Retain As Published, Retain Handling — all three MQTT 5 SUBSCRIBE op
 Retain As Published (retain kept for =1, cleared for =0 on live delivery); Retain Handling (Never / every /
 new-vs-resubscribe). 11/11 cargo unit tests pass.
 
+## Phase 3j — Cross-shard session resume (2026-07-03)
+
+Completes the session story: a reconnecting client resumes even when `SO_REUSEPORT` lands it on a different
+shard than the one holding its session. All shards share one bind address, so there is nothing to redirect to
+(an MQTT 5 Server Reference is a dead end here) — the *session* migrates over the mesh instead.
+
+| Item | Description | Status |
+|------|-------------|--------|
+| Mesh message type | `Senders<Publish>` → `Senders<MeshMsg>`; `MeshMsg { Publish(Publish), Control(Box<SessionControl>) }` (control boxed to keep the hot publish path small) | ✅ |
+| Migration protocol | `SessionControl { Claim { client_id, requester, resume }, Handoff { client_id, session } }` exchanged over the mesh; `Claim` broadcast to peers, `Handoff` sent back to `requester` (targeted `try_send_to`) | ✅ |
+| Session payload | `MigratedSession` carries owned data (mesh moves values across executors): subscriptions (flat `MigratedSub`), `inflight`, `incoming_qos2`, `next_pkid`, offline queue as `(Publish, QoS, bool)` (Rc unwrapped, re-wrapped on arrival) | ✅ |
+| Trie extraction | `TopicTrie::take_client` removes a client's subscriptions and returns them with reconstructed filter paths | ✅ |
+| Claim/await | `handle_connect`: on a non-clean connect that opened a *fresh* local session, `claim_remote_session` broadcasts a `Claim` and awaits replies (resolves when all peers answer or the first session arrives; `SESSION_CLAIM_TIMEOUT = 250 ms` fallback for a mesh-dropped reply). Clean Start broadcasts a discard | ✅ |
+| Install | `install_migrated` re-arms subscriptions in the trie and hands the snapshot + offline queue to the connection, which resumes delivery (retransmit in-flight, flush offline) exactly as a local resume | ✅ |
+| Single-shard no-op | `mesh_peers() == 0` short-circuits — the claim path never runs for `runtime.shards = 1`, so behaviour there is unchanged | ✅ |
+| Pending claims | `ShardState::pending_claims: HashMap<client_id, LocalSender<Option<MigratedSession>>>` routes a `Handoff` back to the awaiting CONNECT handler; `on_control` dispatches inbound `Claim`/`Handoff` | ✅ |
+| Unit test | `topic_trie::take_client_removes_and_returns_filters` (12/12 unit tests pass) | ✅ |
+
+**Verification (paho-mqtt v5, `runtime.shards = 2`):** a `mover` client repeatedly disconnected (suspending its
+session with a subscription), had 3 QoS 1 messages published while offline, and reconnected on a fresh socket
+(new ephemeral port). **10/10 reconnects resumed** (`session_present = true`) and delivered all 3 queued messages
+in order; broker logs show **7 cross-shard migrations** (`resumed session migrated from another shard`) with the
+`mover` session bouncing between shard 1 and shard 2 — proving subscriptions *and* the offline queue travel with
+the session (a lost subscription would starve the offline queue on the next iteration). The 8th claim was the
+initial fresh connect (found nothing).
+
+**Known limitations:** migration is best-effort under a saturated mesh (drop-on-full `try_send_to`) — a dropped
+claim/hand-off falls back to a fresh session and the stranded one expires on its old shard (shares item 1's
+backpressure gap). A cross-shard *takeover* of a still-live connection drops it without migrating in-flight state.
+
 ## Architecture decisions locked in
 
 - **Mailbox payload:** `Rc<Publish>` for local fan-out; the mesh carries owned `Publish`, re-wrapped in `Rc` on the
