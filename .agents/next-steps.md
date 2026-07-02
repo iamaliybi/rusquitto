@@ -6,11 +6,17 @@ See [progress.md](progress.md) for the build log and design decisions.
 
 The remaining work is correctness/robustness hardening, roughly in priority order.
 
-## 1. Cross-shard QoS backpressure
+## 1. Cross-shard QoS backpressure ✅ (Phase 3l)
 
-The mesh forwards with non-blocking `try_send_to` (drop-on-full), so cross-shard QoS > 0 is best-effort.
-Make it reliable: async `send_to` with per-link flow control, or a bounded retry/queue. Touch
-`broker/engine.rs::broadcast` and the drain task in `worker.rs`.
+**Done.** A QoS 1/2 publish forwarded to another shard now uses the awaiting mesh `send_to` (backpressure)
+instead of the drop-on-full `try_send_to`, so a full mesh link makes the publisher wait rather than dropping.
+The mesh `Senders` are held in an `Rc` (`ShardState::mesh_senders`) so `Connection::fan_out` can clone the
+handle, drop the `ShardState` borrow, and `await` the send; the PUBACK/PUBREC is written only after the forward
+returns, so the guarantee holds cross-shard. QoS 0 keeps `try_send_to` (fire-and-forget). No deadlock: each
+shard's mesh drain task never blocks (it only routes to local unbounded mailboxes), so it keeps freeing peer
+links while connection tasks await. Wills reuse the same reliable path; only `$SYS` metric publishes remain
+best-effort (QoS 0, retained). Verified: `mesh_capacity = 4`, a 200-message QoS 1 burst, 2 shards — all four
+subscribers (two on the publisher's shard, two cross-shard) received all 200 with zero loss.
 
 ## 2. Persistent sessions & expiry ✅ (cross-shard)
 

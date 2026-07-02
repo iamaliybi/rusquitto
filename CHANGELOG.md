@@ -9,6 +9,12 @@ version is bumped for new features, the patch version for fixes).
 
 ### Added
 
+- **Cross-shard QoS > 0 backpressure** — a QoS 1/2 publish forwarded to another
+  shard is now sent with an awaiting mesh `send_to` instead of the old drop-on-full
+  `try_send_to`, so a full mesh link makes the publisher wait (its PUBACK/PUBREC is
+  written only after the message is accepted on every shard) rather than silently
+  dropping the message. The at-least/exactly-once guarantee now holds *across*
+  shards, not just within one. QoS 0 stays fire-and-forget.
 - **Shared subscriptions** (`$share/{group}/{filter}`) — members of a group split
   the load: each matching message is delivered to exactly one member, chosen
   round-robin (preferring connected members), while ordinary subscribers still each

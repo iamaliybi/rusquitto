@@ -37,7 +37,8 @@ isolated, shard-local executor — no `Mutex`, no `RwLock`, no work-stealing.
   publish is dropped (QoS 0) or Not-Authorized-acked (QoS 1/2), and a denied subscribe gets a Not Authorized
   reason code. Defaults are open, so nothing is required until you configure it.
 - **Cross-shard routing** over a `glommio` channel mesh, so a publisher and subscriber on different cores still reach
-  each other.
+  each other. QoS 1/2 forwards apply **backpressure** (an awaiting mesh send), so the delivery guarantee holds across
+  shards — the publisher waits rather than dropping when a mesh link is full. QoS 0 stays fire-and-forget.
 - **Thread-per-core, shared-nothing**: `SO_REUSEPORT` kernel load balancing, one `io_uring` ring and one `LocalExecutor`
   per shard, lock-free shard-local state.
 - **Structured logging** (`tracing`): non-blocking file appenders, daily rotation, a dedicated error log, per-connection
@@ -133,10 +134,10 @@ for the protocol details.
 
 Deliberately out of scope for now (tracked in `.agents/progress.md`):
 
-- **Cross-shard QoS > 0 is best-effort.** The mesh uses non-blocking sends (drop-on-full), so the
-  at-least/exactly-once guarantee holds *within* a shard but is best-effort *across* shards. Under heavy
-  connection bursts you may also hit a `glommio` io_uring `ENOMEM` from a low `RLIMIT_MEMLOCK`; raise it
-  (`ulimit -l unlimited` or `LimitMEMLOCK=infinity`).
+- **Under heavy connection bursts** you may hit a `glommio` io_uring `ENOMEM` from a low `RLIMIT_MEMLOCK`; raise it
+  (`ulimit -l unlimited` or `LimitMEMLOCK=infinity`). *(Cross-shard QoS 1/2 publishes and Wills are now reliable —
+  the mesh forward applies backpressure instead of dropping. Only broker-internal `$SYS` metric publishes still use
+  best-effort sends, which is fine since they are QoS 0 and retained.)*
 - **Cross-shard session migration is best-effort under mesh overload.** A reconnecting client that lands on a
   different shard triggers a session `Claim` over the channel mesh; the owning shard hands the session back. The
   mesh uses non-blocking sends (drop-on-full), so under a saturated mesh a claim or hand-off could be dropped and

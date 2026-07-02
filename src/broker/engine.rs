@@ -217,8 +217,10 @@ pub struct ShardState {
 	/// locally.
 	retained: HashMap<String, Publish>,
 	/// Senders to every other shard in the full channel mesh. `None` until the
-	/// shard joins the mesh in `worker::init`.
-	mesh: Option<Senders<MeshMsg>>,
+	/// shard joins the mesh in `worker::init`. Held in an `Rc` so a connection can
+	/// clone the handle and `await` a cross-shard send without keeping this
+	/// `ShardState` borrowed across the await.
+	mesh: Option<Rc<Senders<MeshMsg>>>,
 	/// In-flight cross-shard session claims this shard is awaiting, keyed by client
 	/// id. When a `Handoff` reply arrives on the mesh it is delivered through the
 	/// matching sender, waking the CONNECT handler blocked on the claim.
@@ -237,15 +239,25 @@ impl ShardState {
 
 	/// Stores this shard's mesh senders so publishes can be forwarded to peers.
 	pub fn set_mesh(&mut self, senders: Senders<MeshMsg>) {
-		self.mesh = Some(senders);
+		self.mesh = Some(Rc::new(senders));
 	}
 
-	/// Forwards a publish to every *other* shard in the mesh. Each peer runs its
-	/// own local `route`, so a remote subscriber receives it identically.
+	/// A cloneable handle to this shard's mesh senders. Lets the publish path
+	/// `await` a cross-shard `send_to` (backpressure for QoS > 0) after dropping the
+	/// `ShardState` borrow, rather than dropping the message with `try_send_to`.
+	pub fn mesh_senders(&self) -> Option<Rc<Senders<MeshMsg>>> {
+		self.mesh.clone()
+	}
+
+	/// Forwards a publish to every *other* shard in the mesh, best-effort. Each peer
+	/// runs its own local `route`, so a remote subscriber receives it identically.
 	///
-	/// `try_send_to` is non-blocking (drop-on-full, matching QoS 0 semantics) and
-	/// the publisher never stalls on a slow peer. Self is skipped — the local
-	/// fan-out is handled directly by `route`.
+	/// `try_send_to` is non-blocking (drop-on-full), so the caller never stalls on a
+	/// slow peer — used for QoS 0 and broker-internal (`$SYS`) publishes where a drop
+	/// is acceptable. The QoS > 0 publish path instead awaits [`mesh_senders`]'s
+	/// `send_to` for backpressure. Self is skipped — local fan-out is done by `route`.
+	///
+	/// [`mesh_senders`]: Self::mesh_senders
 	pub fn broadcast(&self, publish: &Publish) {
 		let Some(senders) = &self.mesh else {
 			return;

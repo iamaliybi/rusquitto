@@ -244,6 +244,25 @@ remaining member (**6/0**). RESULT: PASS.
 group whose members span shards receives one message per shard. Exact single-delivery for `runtime.shards = 1`
 (or when a group's members share a shard). Globally-coordinated selection is future work.
 
+## Phase 3l — Cross-shard QoS backpressure (2026-07-03)
+
+Closes the last cross-shard best-effort gap: a QoS > 0 publish forwarded to a peer is no longer dropped when the
+mesh link is full.
+
+| Item | Description | Status |
+|------|-------------|--------|
+| Mesh handle | `ShardState.mesh` is now `Option<Rc<Senders<MeshMsg>>>`; `mesh_senders()` returns a clone so the publish path can `await send_to` without holding the `ShardState` borrow across the await | ✅ |
+| Reliable forward | `Connection::fan_out` is async: QoS > 0 uses the awaiting `senders.send_to` (backpressure), QoS 0 keeps `try_send_to` (fire-and-forget). Local `deliver_local` runs after. The PUBACK/PUBREC is written only after `fan_out` returns, so the publisher is throttled instead of dropping | ✅ |
+| Callers | `handle_publish` (QoS 0/1), `handle_pubrel` (QoS 2 commit), and the Will publish in `run()` cleanup all `.await` `fan_out`; the Will now forwards reliably too | ✅ |
+| Best-effort remnant | `ShardState::broadcast` (sync `try_send_to`) is kept only for `$SYS` metric publishes (QoS 0, retained) | ✅ |
+| No deadlock | each shard's mesh drain task only routes to local unbounded mailboxes (never blocks), so it keeps consuming — freeing peer links — while connection tasks await their sends | ✅ |
+
+**Verification (`runtime.shards = 2`, `mesh_capacity = 4`, paho-mqtt v5):** four subscribers to `burst/topic`
+(placement showed two on the publisher's shard 1, two on shard 2) + a publisher firing a **200-message QoS 1
+burst** (50× the mesh buffer). All four subscribers — including the two cross-shard — received **all 200**
+messages, zero loss. Under the previous drop-on-full forward the cross-shard subscribers would have lost most.
+13/13 unit tests pass.
+
 ## Architecture decisions locked in
 
 - **Mailbox payload:** `Rc<Publish>` for local fan-out; the mesh carries owned `Publish`, re-wrapped in `Rc` on the

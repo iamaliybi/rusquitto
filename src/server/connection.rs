@@ -18,7 +18,8 @@ use std::sync::Arc;
 
 use crate::auth::{AuthResult, Authenticator};
 use crate::broker::engine::{
-	Delivery, InflightMessage, InflightState, Mailbox, MigratedSession, SessionSnapshot, ShardState,
+	Delivery, InflightMessage, InflightState, Mailbox, MeshMsg, MigratedSession, SessionSnapshot,
+	ShardState,
 };
 use crate::config::LimitsConfig;
 use crate::logger::redact;
@@ -181,12 +182,35 @@ impl Connection {
 		Ok(())
 	}
 
-	/// Forwards a publish to peer shards and fans it out to local subscribers.
-	/// This connection's client is the publisher, so it is passed for No Local.
-	fn fan_out(&self, message: mqtt_v5::Publish) {
-		let mut state = self.state.borrow_mut();
-		state.broadcast(&message);
-		state.deliver_local(message, Some(&self.client_id));
+	/// Forwards a publish to peer shards, then fans it out to local subscribers.
+	///
+	/// The cross-shard forward is where at-least/exactly-once could previously be
+	/// lost: a full mesh link dropped the message. Now a **QoS > 0** publish is sent
+	/// with the awaiting `send_to`, so the publisher applies backpressure (its own
+	/// PUBACK/PUBREC is only written after this returns) rather than dropping —
+	/// making the guarantee hold across shards, not just within one. A **QoS 0**
+	/// publish keeps the non-blocking `try_send_to` (fire-and-forget). The mesh
+	/// senders are cloned out of `ShardState` so its borrow isn't held across the
+	/// await. `publisher` is this connection's client id for a client publish (No
+	/// Local), or `None` for a broker-originated one such as a Will Message.
+	async fn fan_out(&self, message: mqtt_v5::Publish, publisher: Option<&str>) {
+		let senders = self.state.borrow().mesh_senders();
+		if let Some(senders) = senders {
+			let me = senders.peer_id();
+			for idx in 0..senders.nr_consumers() {
+				if idx == me {
+					continue;
+				}
+				if message.qos == QoS::AtMostOnce {
+					let _ = senders.try_send_to(idx, MeshMsg::Publish(message.clone()));
+				} else {
+					// Backpressure: wait for room so a QoS > 0 message is never dropped
+					// on a full mesh link. Err means the peer is gone — nothing to do.
+					let _ = senders.send_to(idx, MeshMsg::Publish(message.clone())).await;
+				}
+			}
+		}
+		self.state.borrow_mut().deliver_local(message, publisher);
 	}
 
 	pub async fn run(&mut self) -> Result<()> {
@@ -211,8 +235,7 @@ impl Connection {
 			};
 			let pending = std::mem::take(&mut self.pending_outbound);
 			let will = self.will.take();
-			let mut state = self.state.borrow_mut();
-			let owned = state.close_session(
+			let owned = self.state.borrow_mut().close_session(
 				&self.client_id,
 				self.session_generation,
 				self.session_expiry,
@@ -221,8 +244,9 @@ impl Connection {
 			);
 			if owned && let Some(will) = will {
 				debug!(topic = %will.topic, "publishing will message");
-				state.broadcast(&will);
-				state.deliver_local(will, None);
+				// Broker-originated, so no publisher for No Local. Reuses the reliable
+				// forward path (QoS > 0 wills apply mesh backpressure like any publish).
+				self.fan_out(will, None).await;
 			}
 		}
 
@@ -835,12 +859,14 @@ impl Connection {
 		match publish.qos {
 			// Fire and forget.
 			QoS::AtMostOnce => {
-				self.fan_out(msg);
+				self.fan_out(msg, Some(&self.client_id)).await;
 				Ok(())
 			}
-			// At least once: deliver, then acknowledge.
+			// At least once: forward (awaiting mesh backpressure), then acknowledge —
+			// the PUBACK is only sent once the message has been accepted for delivery
+			// on every shard, so the guarantee holds cross-shard.
 			QoS::AtLeastOnce => {
-				self.fan_out(msg);
+				self.fan_out(msg, Some(&self.client_id)).await;
 				let mut buf = BytesMut::new();
 				mqtt_v5::PubAck::new(publish.pkid)
 					.write(&mut buf)
@@ -1002,7 +1028,7 @@ impl Connection {
 		// QoS 2, receiver side: the publisher has released the message. Commit it
 		// (deliver exactly once) if we still hold it, then finalize with PubComp.
 		if let Some(message) = self.incoming_qos2.remove(&pubrel.pkid) {
-			self.fan_out(message);
+			self.fan_out(message, Some(&self.client_id)).await;
 		}
 
 		let mut buf = BytesMut::new();
