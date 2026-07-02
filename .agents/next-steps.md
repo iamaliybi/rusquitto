@@ -12,7 +12,7 @@ The mesh forwards with non-blocking `try_send_to` (drop-on-full), so cross-shard
 Make it reliable: async `send_to` with per-link flow control, or a bounded retry/queue. Touch
 `broker/engine.rs::broadcast` and the drain task in `worker.rs`.
 
-## 2. Persistent sessions & expiry ✅ (shard-local)
+## 2. Persistent sessions & expiry ✅ (cross-shard)
 
 **Done.** `ShardState` now owns a `Session` per client id:
 
@@ -26,10 +26,16 @@ Make it reliable: async `send_to` with per-link flow control, or a bounded retry
 - Session takeover (same Client ID, live connection) is generation-guarded so the displaced connection's
   cleanup can't clobber the new session.
 
-**Remaining — cross-shard session resume.** `SO_REUSEPORT` may land a reconnecting client (new ephemeral
-port) on a different shard, where its session doesn't exist. Needs a cross-shard session directory or an
-MQTT 5 Server Reference redirect. Until then, resume is exact only within a shard (always, for
-`runtime.shards = 1`). This overlaps with item 1 (cross-shard reliability) and the clustering goal.
+**Cross-shard session resume — done (Phase 3j).** `SO_REUSEPORT` can land a reconnecting client (new
+ephemeral port) on a different shard than the one holding its session. Rather than redirect the client (all
+shards share one bind address, so there is nothing to redirect to), the *session* migrates: the mesh now
+carries a `MeshMsg::Control` variant with a `SessionControl { Claim, Handoff }` protocol. On a non-clean
+CONNECT that finds no local session, the shard broadcasts a `Claim`; the owning peer replies with a `Handoff`
+carrying the whole session (subscriptions pulled from the trie via `TopicTrie::take_client`, in-flight QoS
+state, and the offline queue as owned data), which the new shard installs. Clean Start broadcasts a discard.
+Verified across a 2-shard broker (a client bouncing between shards resumed with its offline queue intact every
+time). Best-effort under mesh overload (drop-on-full), overlapping item 1; cross-shard *takeover* of a live
+connection drops it without migrating in-flight state.
 
 ## 3. Will messages ✅
 

@@ -111,6 +111,38 @@ impl TopicTrie {
 		}
 	}
 
+	/// Removes every subscription belonging to a client and returns them as
+	/// `(filter, qos, nolocal, retain_as_published)` tuples, reconstructing each
+	/// filter from its path through the trie. Used to migrate a session's
+	/// subscriptions to another shard on cross-shard resume.
+	pub fn take_client(&mut self, client_id: &str) -> Vec<(String, QoS, bool, bool)> {
+		let mut out = Vec::new();
+		let mut segments: Vec<String> = Vec::new();
+		Self::take_client_rec(&mut self.root, client_id, &mut segments, &mut out);
+		out
+	}
+
+	fn take_client_rec(
+		node: &mut Node,
+		client_id: &str,
+		segments: &mut Vec<String>,
+		out: &mut Vec<(String, QoS, bool, bool)>,
+	) {
+		node.subscribers.retain(|s| {
+			if s.client_id == client_id {
+				out.push((segments.join("/"), s.qos, s.nolocal, s.retain_as_published));
+				false
+			} else {
+				true
+			}
+		});
+		for (seg, child) in node.children.iter_mut() {
+			segments.push(seg.clone());
+			Self::take_client_rec(child, client_id, segments, out);
+			segments.pop();
+		}
+	}
+
 	/// Collects every subscription whose filter matches the concrete `topic`.
 	pub fn matching<'a>(&'a self, topic: &str, out: &mut Vec<&'a Subscription>) {
 		let segments: Vec<&str> = topic.split('/').collect();
@@ -190,5 +222,29 @@ mod tests {
 		trie.insert("t", "c1", QoS::AtLeastOnce, false, false);
 		let got = matches(&trie, "t");
 		assert_eq!(got, vec![("c1".to_string(), false, false)]);
+	}
+
+	#[test]
+	fn take_client_removes_and_returns_filters() {
+		let mut trie = TopicTrie::default();
+		trie.insert("a/b", "c1", QoS::AtLeastOnce, true, false);
+		trie.insert("x/+/z", "c1", QoS::ExactlyOnce, false, true);
+		trie.insert("a/b", "c2", QoS::AtMostOnce, false, false);
+
+		let mut taken = trie.take_client("c1");
+		taken.sort_by(|a, b| a.0.cmp(&b.0));
+		assert_eq!(
+			taken,
+			vec![
+				("a/b".to_string(), QoS::AtLeastOnce, true, false),
+				("x/+/z".to_string(), QoS::ExactlyOnce, false, true),
+			]
+		);
+
+		// c1 is gone from both filters; c2 remains on a/b.
+		assert_eq!(matches(&trie, "a/b"), vec![("c2".to_string(), false, false)]);
+		assert!(matches(&trie, "x/y/z").is_empty());
+		// Taking a client with no subscriptions yields nothing.
+		assert!(trie.take_client("c1").is_empty());
 	}
 }

@@ -5,12 +5,26 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (pre-1.0: the minor
 version is bumped for new features, the patch version for fixes).
 
+## [0.3.0] - 2026-07-03
+
+### Added
+
+- **Cross-shard session resume** — when a client reconnects and the kernel's
+  `SO_REUSEPORT` load balancing lands it on a different shard than the one holding
+  its session, that session is now migrated to the new shard over the channel
+  mesh instead of being treated as fresh. Subscriptions, unacknowledged in-flight
+  QoS 1/2 state, and the offline message queue all move with it, so a resume is
+  seamless regardless of which core the client hashes to. A Clean Start connect
+  discards any session cluster-wide. Single-shard brokers are unaffected (there
+  are no peers to migrate from).
+
 ## [0.2.0] - 2026-07-03
 
 The broker grew from a basic pub/sub engine into a hardened MQTT 5 broker.
 All changes are additive; there are no breaking changes to existing behavior.
 
 ### Added
+
 - **Persistent sessions & expiry** — honors the Session Expiry Interval: a
   disconnect suspends the session (keeping subscriptions), a reconnect with the
   same Client ID resumes it (CONNACK `session_present`), QoS > 0 messages
@@ -35,11 +49,15 @@ All changes are additive; there are no breaking changes to existing behavior.
 ## [0.1.0] - 2026-06-30
 
 ### Added
+
 - Initial release: thread-per-core MQTT 5 broker on glommio (io_uring,
   `SO_REUSEPORT`). CONNECT/CONNACK, PUBLISH at QoS 0/1/2 (in and out),
   SUBSCRIBE/UNSUBSCRIBE, PINGREQ/PINGRESP, DISCONNECT; topic-trie wildcard
   matching (`+` / `#`); retained messages; cross-shard routing over a glommio
   channel mesh; structured `tracing` logging; and TOML configuration with a CLI.
 
+[0.3.0]: https://github.com/iamaliybi/rusquitto/releases/tag/v0.3.0
+
 [0.2.0]: https://github.com/iamaliybi/rusquitto/releases/tag/v0.2.0
+
 [0.1.0]: https://github.com/iamaliybi/rusquitto/releases/tag/v0.1.0
