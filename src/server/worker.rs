@@ -83,7 +83,9 @@ pub async fn init(
 		let state = state.clone();
 		glommio::spawn_local(async move {
 			while let Some(publish) = receiver.recv().await {
-				state.borrow_mut().deliver_local(publish);
+				// Mesh-forwarded: the publisher is on another shard, so No Local
+				// never applies here.
+				state.borrow_mut().deliver_local(publish, None);
 			}
 		})
 		.detach();
@@ -117,7 +119,7 @@ pub async fn init(
 					let mut publish = Publish::new(topic, QoS::AtMostOnce, value.into_bytes());
 					publish.retain = true;
 					shard_state.broadcast(&publish);
-					shard_state.deliver_local(publish);
+					shard_state.deliver_local(publish, None);
 				}
 			}
 		})

@@ -150,7 +150,8 @@ impl Connection {
 	/// otherwise holds it in the pending queue for later draining.
 	async fn deliver(&mut self, delivery: Delivery) -> Result<()> {
 		if delivery.qos == QoS::AtMostOnce || self.inflight.len() < self.outbound_window() {
-			self.send_publish(&delivery.publish, delivery.qos).await
+			self.send_publish(&delivery.publish, delivery.qos, delivery.retain)
+				.await
 		} else {
 			self.pending_outbound.push_back(delivery);
 			Ok(())
@@ -164,16 +165,18 @@ impl Connection {
 			let Some(delivery) = self.pending_outbound.pop_front() else {
 				break;
 			};
-			self.send_publish(&delivery.publish, delivery.qos).await?;
+			self.send_publish(&delivery.publish, delivery.qos, delivery.retain)
+				.await?;
 		}
 		Ok(())
 	}
 
 	/// Forwards a publish to peer shards and fans it out to local subscribers.
+	/// This connection's client is the publisher, so it is passed for No Local.
 	fn fan_out(&self, message: mqtt_v5::Publish) {
 		let mut state = self.state.borrow_mut();
 		state.broadcast(&message);
-		state.deliver_local(message);
+		state.deliver_local(message, Some(&self.client_id));
 	}
 
 	pub async fn run(&mut self) -> Result<()> {
@@ -209,7 +212,7 @@ impl Connection {
 			if owned && let Some(will) = will {
 				debug!(topic = %will.topic, "publishing will message");
 				state.broadcast(&will);
-				state.deliver_local(will);
+				state.deliver_local(will, None);
 			}
 		}
 
@@ -331,17 +334,24 @@ impl Connection {
 		}
 	}
 
-	/// Delivers a routed message to this client at the given effective QoS.
+	/// Delivers a routed message to this client at the given effective QoS and
+	/// retain flag.
 	///
 	/// QoS 0 is fire-and-forget. QoS 1/2 are assigned a fresh packet id, recorded
 	/// in the in-flight window, and delivered with their QoS set; the rest of the
 	/// handshake (PUBACK / PUBREC+PUBREL+PUBCOMP) is driven by the ack handlers.
-	/// The source `publish`'s retain flag is preserved (set for retained replay,
-	/// cleared for live fan-out).
-	async fn send_publish(&mut self, publish: &mqtt_v5::Publish, qos: QoS) -> Result<()> {
+	/// `retain` is decided by the caller (set for a retained replay or a
+	/// Retain-As-Published subscriber, cleared for ordinary live fan-out).
+	async fn send_publish(
+		&mut self,
+		publish: &mqtt_v5::Publish,
+		qos: QoS,
+		retain: bool,
+	) -> Result<()> {
 		let mut message = publish.clone();
 		message.qos = qos;
 		message.dup = false;
+		message.retain = retain;
 
 		let pkid = match qos {
 			QoS::AtMostOnce => {
@@ -791,9 +801,23 @@ impl Connection {
 
 			{
 				let mut state = self.state.borrow_mut();
-				state.subscribe(&filter.path, &self.client_id, granted);
-				for message in state.retained_matching(&filter.path) {
-					retained.push((message, granted));
+				let is_new = state.subscribe(
+					&filter.path,
+					&self.client_id,
+					granted,
+					filter.nolocal,
+					filter.preserve_retain,
+				);
+				// Retain Handling decides whether to replay retained messages now.
+				let send_retained = match filter.retain_forward_rule {
+					mqtt_v5::RetainForwardRule::OnEverySubscribe => true,
+					mqtt_v5::RetainForwardRule::OnNewSubscribe => is_new,
+					mqtt_v5::RetainForwardRule::Never => false,
+				};
+				if send_retained {
+					for message in state.retained_matching(&filter.path) {
+						retained.push((message, granted));
+					}
 				}
 			}
 
@@ -812,12 +836,12 @@ impl Connection {
 		// Replay matching retained messages, delivered with the retain flag set and
 		// downgraded to min(message QoS, granted QoS) for this subscription. Routed
 		// through `deliver` so the in-flight window is respected.
-		for (mut message, granted) in retained {
-			message.retain = true;
+		for (message, granted) in retained {
 			let qos = min_qos(message.qos, granted);
 			self.deliver(Delivery {
 				publish: Rc::new(message),
 				qos,
+				retain: true,
 			})
 			.await?;
 		}
