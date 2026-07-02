@@ -44,6 +44,10 @@ isolated, shard-local executor — no `Mutex`, no `RwLock`, no work-stealing.
   spans tagged with `client_id`, and redaction of passwords and payloads.
 - **Subscription options** — MQTT 5 **No Local**, **Retain As Published**, and **Retain Handling**
   (`OnEverySubscribe` / `OnNewSubscribe` / `Never`) are all honored on the SUBSCRIBE path.
+- **Shared subscriptions** — `$share/{group}/{filter}` groups load-balance: each matching message goes to just
+  one member of the group (round-robin, preferring connected members), while ordinary subscribers still each get
+  a copy. Retained messages are not replayed to shared subscriptions. *(Load balancing is per-shard — see
+  [Limitations](#limitations).)*
 - **`$SYS` metrics** — the broker publishes retained `$SYS/broker/...` topics (uptime, connected/total clients,
   messages and bytes in/out) on a configurable interval, so you can monitor it over MQTT by subscribing to
   `$SYS/#`.
@@ -140,6 +144,11 @@ Deliberately out of scope for now (tracked in `.agents/progress.md`):
   operation this is seamless (verified across a 2-shard broker); it shares the backpressure limitation above.
   A cross-shard *takeover* of a still-live connection drops the old connection without migrating its in-flight
   state.
+- **Shared-subscription load balancing is per-shard.** Each shard picks one of *its* local group members for a
+  matching message, so if a group's members are spread across shards (via `SO_REUSEPORT`), the message reaches
+  one member per shard rather than exactly one across the cluster. Fully single-delivery for `runtime.shards = 1`
+  or when a group's members share a shard; globally-coordinated shared delivery is future work (overlaps the
+  cross-shard items above).
 - **Will Delay Interval is not yet honoured** — a will fires immediately on abnormal disconnect rather than
   after the requested delay. (Will messages themselves work; only the *delay* is unimplemented.)
 - **Negotiation is outbound-only.** The client's Receive Maximum and Maximum Packet Size are enforced, but the

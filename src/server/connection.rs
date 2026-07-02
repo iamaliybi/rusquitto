@@ -641,11 +641,11 @@ impl Connection {
 		if !self.limits.retain_available {
 			ack_props.retain_available = Some(0);
 		}
-		// We support wildcard subscriptions but not subscription identifiers,
-		// shared subscriptions, or inbound topic aliases (yet).
+		// We support wildcard and shared subscriptions, but not subscription
+		// identifiers or inbound topic aliases (yet).
 		ack_props.wildcard_subscription_available = Some(1);
 		ack_props.subscription_identifiers_available = Some(0);
-		ack_props.shared_subscription_available = Some(0);
+		ack_props.shared_subscription_available = Some(1);
 		ack_props.topic_alias_max = Some(0);
 
 		conn_ack.properties = Some(ack_props);
@@ -869,13 +869,25 @@ impl Connection {
 		let mut retained = Vec::new();
 
 		for filter in &subscribe.filters {
+			// A Shared Subscription filter is `$share/{group}/{topic-filter}`; the
+			// effective filter used for matching, ACL, and retained replay is the
+			// `{topic-filter}` part, and `group` load-balances delivery.
+			let (effective, share_group) = match parse_shared_filter(&filter.path) {
+				Ok(pair) => pair,
+				Err(()) => {
+					warn!(filter = %filter.path, "invalid shared subscription filter");
+					return_codes.push(mqtt_v5::SubscribeReasonCode::TopicFilterInvalid);
+					continue;
+				}
+			};
+
 			// Deny unauthorized filters: no trie entry, no retained replay, and a
 			// Not Authorized reason code in the SubAck for this filter.
 			if !self
 				.auth
-				.authorize_subscribe(self.username.as_deref(), &filter.path)
+				.authorize_subscribe(self.username.as_deref(), effective)
 			{
-				warn!(filter = %filter.path, "subscribe not authorized, rejecting");
+				warn!(filter = %effective, "subscribe not authorized, rejecting");
 				return_codes.push(mqtt_v5::SubscribeReasonCode::NotAuthorized);
 				continue;
 			}
@@ -885,26 +897,29 @@ impl Connection {
 			{
 				let mut state = self.state.borrow_mut();
 				let is_new = state.subscribe(
-					&filter.path,
+					effective,
 					&self.client_id,
 					granted,
 					filter.nolocal,
 					filter.preserve_retain,
+					share_group,
 				);
 				// Retain Handling decides whether to replay retained messages now.
-				let send_retained = match filter.retain_forward_rule {
-					mqtt_v5::RetainForwardRule::OnEverySubscribe => true,
-					mqtt_v5::RetainForwardRule::OnNewSubscribe => is_new,
-					mqtt_v5::RetainForwardRule::Never => false,
-				};
+				// Shared subscriptions never receive retained messages on subscribe.
+				let send_retained = share_group.is_none()
+					&& match filter.retain_forward_rule {
+						mqtt_v5::RetainForwardRule::OnEverySubscribe => true,
+						mqtt_v5::RetainForwardRule::OnNewSubscribe => is_new,
+						mqtt_v5::RetainForwardRule::Never => false,
+					};
 				if send_retained {
-					for message in state.retained_matching(&filter.path) {
+					for message in state.retained_matching(effective) {
 						retained.push((message, granted));
 					}
 				}
 			}
 
-			debug!(filter = %filter.path, granted = ?granted, "subscribed");
+			debug!(filter = %effective, group = ?share_group, granted = ?granted, "subscribed");
 
 			return_codes.push(reason_code(granted));
 		}
@@ -936,8 +951,13 @@ impl Connection {
 		let mut reasons = Vec::with_capacity(unsubscribe.filters.len());
 
 		for filter in &unsubscribe.filters {
-			self.state.borrow_mut().unsubscribe(filter, &self.client_id);
-			debug!(filter = %filter, "unsubscribed");
+			// Mirror the SUBSCRIBE parse so a `$share/{group}/{topic}` unsubscribe
+			// removes the matching shared entry rather than a phantom literal filter.
+			let (effective, share_group) = parse_shared_filter(filter).unwrap_or((filter, None));
+			self.state
+				.borrow_mut()
+				.unsubscribe(effective, &self.client_id, share_group);
+			debug!(filter = %effective, group = ?share_group, "unsubscribed");
 			reasons.push(mqtt_v5::UnsubAckReason::Success);
 		}
 
@@ -1005,6 +1025,30 @@ impl Connection {
 /// Returns the lower of two QoS levels (the granted QoS is `min(requested, max)`).
 fn min_qos(a: QoS, b: QoS) -> QoS {
 	if (a as u8) <= (b as u8) { a } else { b }
+}
+
+/// Splits a subscription filter into `(effective_filter, share_group)`.
+///
+/// A Shared Subscription filter is `$share/{ShareName}/{topic-filter}`: the group
+/// is `ShareName` and the effective filter is `{topic-filter}`. An ordinary filter
+/// returns itself with `None`. A malformed `$share/…` (missing/empty ShareName or
+/// topic, or a wildcard in the ShareName) returns `Err(())` so the caller can
+/// answer the SUBSCRIBE with `TopicFilterInvalid`.
+fn parse_shared_filter(filter: &str) -> std::result::Result<(&str, Option<&str>), ()> {
+	let Some(rest) = filter.strip_prefix("$share/") else {
+		return Ok((filter, None));
+	};
+	match rest.split_once('/') {
+		Some((group, topic))
+			if !group.is_empty()
+				&& !topic.is_empty()
+				&& !group.contains('+')
+				&& !group.contains('#') =>
+		{
+			Ok((topic, Some(group)))
+		}
+		_ => Err(()),
+	}
 }
 
 /// Maps a granted QoS to its SubAck success reason code.

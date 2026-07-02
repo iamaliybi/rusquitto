@@ -5,6 +5,17 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (pre-1.0: the minor
 version is bumped for new features, the patch version for fixes).
 
+## [0.4.0] - 2026-07-03
+
+### Added
+
+- **Shared subscriptions** (`$share/{group}/{filter}`) — members of a group split
+  the load: each matching message is delivered to exactly one member, chosen
+  round-robin (preferring connected members), while ordinary subscribers still each
+  get their own copy. Retained messages are not replayed to shared subscriptions,
+  and CONNACK now advertises shared-subscription support. *(Load balancing is
+  per-shard; see the README limitations.)*
+
 ## [0.3.0] - 2026-07-03
 
 ### Added
@@ -55,6 +66,8 @@ All changes are additive; there are no breaking changes to existing behavior.
   SUBSCRIBE/UNSUBSCRIBE, PINGREQ/PINGRESP, DISCONNECT; topic-trie wildcard
   matching (`+` / `#`); retained messages; cross-shard routing over a glommio
   channel mesh; structured `tracing` logging; and TOML configuration with a CLI.
+
+[0.4.0]: https://github.com/iamaliybi/rusquitto/releases/tag/v0.4.0
 
 [0.3.0]: https://github.com/iamaliybi/rusquitto/releases/tag/v0.3.0
 
