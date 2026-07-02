@@ -89,7 +89,7 @@ Client limits are stored and **enforced on the outbound path** (`connection.rs`)
 **Remaining:** inbound Receive Maximum enforcement (limit concurrent inbound QoS 1/2 the *server* accepts) and
 Topic Alias support (we advertise 0, i.e. none accepted inbound, and send none outbound).
 
-## 6. Subscription options & shared subscriptions — options ✅, shared remaining
+## 6. Subscription options & shared subscriptions ✅
 
 **Subscription options done.** `mqttbytes` decodes them on each `SubscribeFilter`; the trie's `Subscription`
 now carries `nolocal` + `retain_as_published`, and `insert` returns whether the subscription is new.
@@ -101,8 +101,15 @@ now carries `nolocal` + `retain_as_published`, and `insert` returns whether the 
   `OnNewSubscribe`, never on `Never`. When a client has overlapping filters, routing uses the options of its
   highest-QoS match.
 
-**Remaining — shared subscriptions** (`$share/{group}/{filter}`): deliver each message to one member of the
-group (load balancing) instead of all. Needs group-aware entries in the trie/route and a per-group picker.
+**Shared subscriptions — done (Phase 3k).** `$share/{group}/{filter}` is parsed in `handle_subscribe` /
+`handle_unsubscribe` (`parse_shared_filter` → effective filter + group; malformed → `TopicFilterInvalid`).
+`TopicTrie::Subscription` gained `share_group`, and entries are keyed by `(client_id, share_group)` so a client
+can hold both an ordinary and a shared sub on one filter. `route` buckets shared matches by group and delivers
+to one member via a per-group round-robin cursor (`shared_cursor`), preferring connected members; ordinary subs
+still each get a copy. Retained messages are not replayed to shared subs; CONNACK now advertises
+`shared_subscription_available = 1`. Verified single-shard (5/5 round-robin split, exactly-once, coexists with
+an ordinary sub, unsubscribe redirects). **Load balancing is per-shard** (each shard picks among its local
+members) — globally-coordinated single delivery across shards is future work (overlaps items 1 & 2).
 
 ## 7. Observability & ops — graceful shutdown ✅, rest remaining
 

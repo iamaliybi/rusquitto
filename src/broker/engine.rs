@@ -149,6 +149,7 @@ pub struct MigratedSub {
 	pub qos: QoS,
 	pub nolocal: bool,
 	pub retain_as_published: bool,
+	pub share_group: Option<String>,
 }
 
 /// Durable per-client session state, keyed by `client_id` in [`ShardState`].
@@ -222,6 +223,10 @@ pub struct ShardState {
 	/// id. When a `Handoff` reply arrives on the mesh it is delivered through the
 	/// matching sender, waking the CONNECT handler blocked on the claim.
 	pending_claims: HashMap<String, LocalSender<Option<MigratedSession>>>,
+	/// Round-robin cursor per shared-subscription group (keyed by `group` + the
+	/// matched filter), advanced each time a message is load-balanced to a member so
+	/// deliveries rotate across the group.
+	shared_cursor: HashMap<String, usize>,
 }
 
 impl ShardState {
@@ -355,12 +360,15 @@ impl ShardState {
 			.trie
 			.take_client(client_id)
 			.into_iter()
-			.map(|(filter, qos, nolocal, retain_as_published)| MigratedSub {
-				filter,
-				qos,
-				nolocal,
-				retain_as_published,
-			})
+			.map(
+				|(filter, qos, nolocal, retain_as_published, share_group)| MigratedSub {
+					filter,
+					qos,
+					nolocal,
+					retain_as_published,
+					share_group,
+				},
+			)
 			.collect();
 
 		let session = self
@@ -401,6 +409,7 @@ impl ShardState {
 				sub.qos,
 				sub.nolocal,
 				sub.retain_as_published,
+				sub.share_group.as_deref(),
 			);
 		}
 
@@ -490,14 +499,16 @@ impl ShardState {
 		qos: QoS,
 		nolocal: bool,
 		retain_as_published: bool,
+		share_group: Option<&str>,
 	) -> bool {
 		self.trie
-			.insert(filter, client_id, qos, nolocal, retain_as_published)
+			.insert(filter, client_id, qos, nolocal, retain_as_published, share_group)
 	}
 
-	/// Removes a single subscription (used by UNSUBSCRIBE).
-	pub fn unsubscribe(&mut self, filter: &str, client_id: &str) {
-		self.trie.remove(filter, client_id);
+	/// Removes a single subscription (used by UNSUBSCRIBE). `share_group` selects
+	/// the ordinary (`None`) or shared entry.
+	pub fn unsubscribe(&mut self, filter: &str, client_id: &str, share_group: Option<&str>) {
+		self.trie.remove(filter, client_id, share_group);
 	}
 
 	/// Routes one publish on this shard: updates the retain table if the retain
@@ -538,24 +549,40 @@ impl ShardState {
 			.collect()
 	}
 
-	/// Fans a message out to every local subscriber whose filter matches the
-	/// publish topic.
+	/// Fans a message out to the local subscribers whose filter matches the publish
+	/// topic.
 	///
-	/// Wildcard-aware via the topic trie. A client matching through several
-	/// overlapping filters receives a single copy, using the options of its
-	/// highest-QoS matching subscription (capped by the publish QoS). Honours the
-	/// No Local and Retain As Published subscription options. Uses `try_send` so a
-	/// slow or full consumer never blocks the publisher.
+	/// Wildcard-aware via the topic trie. An *ordinary* subscriber matching through
+	/// several overlapping filters receives a single copy, using the options of its
+	/// highest-QoS matching subscription (capped by the publish QoS). A *shared*
+	/// subscription group (`$share/{group}/…`) instead delivers to exactly one of its
+	/// members, chosen round-robin, so the group load-balances. Honours the No Local
+	/// and Retain As Published options. Uses `try_send` so a slow or full consumer
+	/// never blocks the publisher.
 	fn route(&mut self, publish: Rc<Publish>, publisher: Option<&str>, was_retained: bool) {
 		let mut matches = Vec::new();
 		self.trie.matching(&publish.topic, &mut matches);
 
-		// Collapse overlapping subscriptions to one per client, keeping the options
-		// of the highest-QoS match. Owned keys so the trie borrow ends before we
-		// touch `sessions`.
+		// Collapse overlapping subscriptions to one Match per client, keeping the
+		// options of the highest-QoS match. Ordinary subscribers go in `best` (each
+		// gets a copy); shared subscribers are bucketed by group name in `groups`
+		// (one member of each is picked below). Owned keys so the trie borrow ends
+		// before we touch `sessions`.
 		let mut best: HashMap<String, Match> = HashMap::new();
+		let mut groups: HashMap<String, HashMap<String, Match>> = HashMap::new();
 		for sub in matches {
-			let entry = best.entry(sub.client_id.clone()).or_insert(Match {
+			let bucket = match &sub.share_group {
+				None => &mut best,
+				Some(group) => {
+					// No Local: the publisher is never a load-balance candidate for
+					// its own shared subscription, so it is dropped from the group here.
+					if sub.nolocal && publisher == Some(sub.client_id.as_str()) {
+						continue;
+					}
+					groups.entry(group.clone()).or_default()
+				}
+			};
+			let entry = bucket.entry(sub.client_id.clone()).or_insert(Match {
 				qos: sub.qos,
 				nolocal: sub.nolocal,
 				retain_as_published: sub.retain_as_published,
@@ -567,39 +594,73 @@ impl ShardState {
 			}
 		}
 
+		// Ordinary subscribers: one copy each.
 		for (client_id, m) in best {
 			// No Local: never echo a message back to the client that published it.
 			if m.nolocal && publisher == Some(client_id.as_str()) {
 				continue;
 			}
-			let Some(session) = self.sessions.get_mut(&client_id) else {
-				continue;
-			};
 			let qos = min_qos(publish.qos, m.qos);
 			let retain = was_retained && m.retain_as_published;
+			self.deliver_to(&client_id, &publish, qos, retain);
+		}
 
-			match &session.mailbox {
-				// Online: hand straight to the live mailbox.
-				Some(mailbox) => {
-					let _ = mailbox.try_send(Delivery {
-						publish: publish.clone(),
-						qos,
-						retain,
-					});
-				}
-				// Suspended: buffer QoS > 0 for delivery on resume; drop QoS 0.
-				None if qos != QoS::AtMostOnce => {
-					if session.offline_queue.len() >= OFFLINE_QUEUE_LIMIT {
-						session.offline_queue.pop_front();
-					}
-					session.offline_queue.push_back(Delivery {
-						publish: publish.clone(),
-						qos,
-						retain,
-					});
-				}
-				None => {}
+		// Shared groups: one member each, round-robin (preferring connected members
+		// so a message isn't parked in an offline queue while a peer is live).
+		for (group, members) in groups {
+			let mut ids: Vec<String> = members.keys().cloned().collect();
+			if ids.is_empty() {
+				continue;
 			}
+			ids.sort();
+			let online: Vec<String> = ids
+				.iter()
+				.filter(|id| {
+					self.sessions
+						.get(*id)
+						.is_some_and(|s| s.mailbox.is_some())
+				})
+				.cloned()
+				.collect();
+			let pool = if online.is_empty() { ids } else { online };
+
+			let cursor = self.shared_cursor.entry(group).or_insert(0);
+			let client_id = pool[*cursor % pool.len()].clone();
+			*cursor = cursor.wrapping_add(1);
+
+			let m = &members[&client_id];
+			let qos = min_qos(publish.qos, m.qos);
+			let retain = was_retained && m.retain_as_published;
+			self.deliver_to(&client_id, &publish, qos, retain);
+		}
+	}
+
+	/// Delivers one message to a single client's session: straight to its live
+	/// mailbox if connected, otherwise buffered in its offline queue (QoS > 0 only;
+	/// QoS 0 is dropped for a suspended session).
+	fn deliver_to(&mut self, client_id: &str, publish: &Rc<Publish>, qos: QoS, retain: bool) {
+		let Some(session) = self.sessions.get_mut(client_id) else {
+			return;
+		};
+		match &session.mailbox {
+			Some(mailbox) => {
+				let _ = mailbox.try_send(Delivery {
+					publish: publish.clone(),
+					qos,
+					retain,
+				});
+			}
+			None if qos != QoS::AtMostOnce => {
+				if session.offline_queue.len() >= OFFLINE_QUEUE_LIMIT {
+					session.offline_queue.pop_front();
+				}
+				session.offline_queue.push_back(Delivery {
+					publish: publish.clone(),
+					qos,
+					retain,
+				});
+			}
+			None => {}
 		}
 	}
 

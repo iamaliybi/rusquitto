@@ -221,6 +221,29 @@ initial fresh connect (found nothing).
 claim/hand-off falls back to a fresh session and the stranded one expires on its old shard (shares item 1's
 backpressure gap). A cross-shard *takeover* of a still-live connection drops it without migrating in-flight state.
 
+## Phase 3k — Shared subscriptions (2026-07-03)
+
+MQTT 5 `$share/{group}/{filter}`: a group of sessions splits the load instead of every member getting a copy.
+
+| Item | Description | Status |
+|------|-------------|--------|
+| Parse | `parse_shared_filter` in `connection.rs` splits `$share/{group}/{topic}` → `(effective, group)`; malformed (empty/wildcard group or empty topic) → SubAck `TopicFilterInvalid`. UNSUBSCRIBE mirrors the parse | ✅ |
+| Trie | `Subscription` gains `share_group`; entries keyed by `(client_id, share_group)`, so a client may hold both an ordinary and a shared sub on the same filter. `remove` / `take_client` carry the group | ✅ |
+| Route | `route` buckets shared matches by group into `groups: HashMap<group, HashMap<client, Match>>` and delivers to one member per group via a per-group round-robin cursor (`ShardState::shared_cursor`), preferring connected members; ordinary subs unchanged (each gets a copy). Extracted a `deliver_to` helper (online → mailbox, suspended → offline queue) shared by both paths | ✅ |
+| Retained | shared subs never get retained replay on subscribe (`send_retained && share_group.is_none()`) | ✅ |
+| CONNACK | `shared_subscription_available` flipped `0 → 1` | ✅ |
+| Migration | `MigratedSub` carries `share_group` so shared subs survive cross-shard session resume | ✅ |
+| Tests | `topic_trie::shared_and_regular_on_same_filter_coexist`; 13/13 unit tests pass | ✅ |
+
+**Verification (paho-mqtt v5, `runtime.shards = 1`):** two members of `$share/g/shared/topic` + one ordinary
+subscriber to `shared/topic`; 10 QoS 1 publishes → members split **5/5** with **each message delivered exactly
+once**, ordinary sub got all **10**; after one member unsubscribed the group, the next **6** all went to the
+remaining member (**6/0**). RESULT: PASS.
+
+**Known limitation:** load balancing is per-shard — each shard selects among its *local* group members, so a
+group whose members span shards receives one message per shard. Exact single-delivery for `runtime.shards = 1`
+(or when a group's members share a shard). Globally-coordinated selection is future work.
+
 ## Architecture decisions locked in
 
 - **Mailbox payload:** `Rc<Publish>` for local fan-out; the mesh carries owned `Publish`, re-wrapped in `Rc` on the
