@@ -7,8 +7,39 @@
 
 use std::collections::HashMap;
 
+use sha2::{Digest, Sha256};
+
 use crate::broker::topic_trie::filter_matches;
 use crate::config::AuthConfig;
+
+/// A configured user's credential: either a plaintext password or a SHA-256 hash
+/// (lowercase hex) of it. Verification hashes the client-supplied password when
+/// the stored form is a hash, so the plaintext is never kept in that case.
+enum Credential {
+	Plain(String),
+	Sha256(String),
+}
+
+impl Credential {
+	/// Whether `provided` (the client's password) matches this credential.
+	fn verify(&self, provided: &str) -> bool {
+		match self {
+			Credential::Plain(expected) => expected == provided,
+			Credential::Sha256(hash) => &sha256_hex(provided) == hash,
+		}
+	}
+}
+
+/// Lowercase-hex SHA-256 of a string.
+fn sha256_hex(s: &str) -> String {
+	let digest = Sha256::digest(s.as_bytes());
+	let mut out = String::with_capacity(64);
+	for byte in digest {
+		use std::fmt::Write;
+		let _ = write!(out, "{byte:02x}");
+	}
+	out
+}
 
 /// Result of an authentication check. The caller maps each variant to the
 /// matching CONNACK reason code.
@@ -24,7 +55,7 @@ pub enum AuthResult {
 
 /// A configured user's credentials and per-operation topic authorization.
 struct UserEntry {
-	password: String,
+	credential: Credential,
 	/// Topic-filter allow-list for publishing; `None` means unrestricted.
 	publish_acl: Option<Vec<String>>,
 	/// Topic-filter allow-list for subscribing; `None` means unrestricted.
@@ -55,10 +86,15 @@ impl Authenticator {
 			.users
 			.iter()
 			.map(|u| {
+				// Config validation guarantees exactly one credential is set.
+				let credential = match &u.password_hash {
+					Some(hash) => Credential::Sha256(hash.to_ascii_lowercase()),
+					None => Credential::Plain(u.password.clone().unwrap_or_default()),
+				};
 				(
 					u.username.clone(),
 					UserEntry {
-						password: u.password.clone(),
+						credential,
 						publish_acl: u.publish.clone(),
 						subscribe_acl: u.subscribe.clone(),
 					},
@@ -86,7 +122,9 @@ impl Authenticator {
 	pub fn check(&self, username: Option<&str>, password: Option<&str>) -> AuthResult {
 		match username {
 			Some(name) => match self.users.get(name) {
-				Some(entry) if entry.password == password.unwrap_or("") => AuthResult::Granted,
+				Some(entry) if entry.credential.verify(password.unwrap_or("")) => {
+					AuthResult::Granted
+				}
 				_ => AuthResult::BadUserNamePassword,
 			},
 			None if self.allow_anonymous => AuthResult::Granted,
@@ -125,7 +163,8 @@ mod tests {
 				.iter()
 				.map(|(u, p)| UserConfig {
 					username: u.to_string(),
-					password: p.to_string(),
+					password: Some(p.to_string()),
+					password_hash: None,
 					publish: None,
 					subscribe: None,
 				})
@@ -166,7 +205,8 @@ mod tests {
 			allow_anonymous: true,
 			users: vec![UserConfig {
 				username: "u".into(),
-				password: "p".into(),
+				password: Some("p".into()),
+				password_hash: None,
 				publish: to_vec(publish),
 				subscribe: to_vec(subscribe),
 			}],
@@ -205,5 +245,26 @@ mod tests {
 	fn empty_acl_denies_everything() {
 		let auth = Authenticator::from_config(&acl_cfg(Some(&[]), None));
 		assert!(!auth.authorize_publish(Some("u"), "anything"));
+	}
+
+	#[test]
+	fn sha256_hashed_password() {
+		// SHA-256("s3cret") in lowercase hex.
+		let hash = sha256_hex("s3cret");
+		let auth = Authenticator::from_config(&AuthConfig {
+			allow_anonymous: false,
+			users: vec![UserConfig {
+				username: "alice".into(),
+				password: None,
+				password_hash: Some(hash.to_ascii_uppercase()), // stored uppercase, normalized on load
+				publish: None,
+				subscribe: None,
+			}],
+		});
+		assert_eq!(auth.check(Some("alice"), Some("s3cret")), AuthResult::Granted);
+		assert_eq!(
+			auth.check(Some("alice"), Some("wrong")),
+			AuthResult::BadUserNamePassword
+		);
 	}
 }

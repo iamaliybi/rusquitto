@@ -180,6 +180,10 @@ struct Session {
 	/// QoS > 0 messages that matched while the client was offline, delivered in
 	/// order when it reconnects. Bounded by [`OFFLINE_QUEUE_LIMIT`].
 	offline_queue: VecDeque<Delivery>,
+	/// A Will Message armed with a non-zero Will Delay Interval: `(will, deadline)`.
+	/// Published by [`sweep_expired`](ShardState::sweep_expired) once the deadline
+	/// passes (or the session ends first), and cancelled if the client reconnects.
+	pending_will: Option<(Publish, Instant)>,
 }
 
 /// Outcome of opening a session at CONNECT, returned to the connection so it can
@@ -217,8 +221,10 @@ pub struct ShardState {
 	/// locally.
 	retained: HashMap<String, Publish>,
 	/// Senders to every other shard in the full channel mesh. `None` until the
-	/// shard joins the mesh in `worker::init`.
-	mesh: Option<Senders<MeshMsg>>,
+	/// shard joins the mesh in `worker::init`. Held in an `Rc` so a connection can
+	/// clone the handle and `await` a cross-shard send without keeping this
+	/// `ShardState` borrowed across the await.
+	mesh: Option<Rc<Senders<MeshMsg>>>,
 	/// In-flight cross-shard session claims this shard is awaiting, keyed by client
 	/// id. When a `Handoff` reply arrives on the mesh it is delivered through the
 	/// matching sender, waking the CONNECT handler blocked on the claim.
@@ -237,15 +243,25 @@ impl ShardState {
 
 	/// Stores this shard's mesh senders so publishes can be forwarded to peers.
 	pub fn set_mesh(&mut self, senders: Senders<MeshMsg>) {
-		self.mesh = Some(senders);
+		self.mesh = Some(Rc::new(senders));
 	}
 
-	/// Forwards a publish to every *other* shard in the mesh. Each peer runs its
-	/// own local `route`, so a remote subscriber receives it identically.
+	/// A cloneable handle to this shard's mesh senders. Lets the publish path
+	/// `await` a cross-shard `send_to` (backpressure for QoS > 0) after dropping the
+	/// `ShardState` borrow, rather than dropping the message with `try_send_to`.
+	pub fn mesh_senders(&self) -> Option<Rc<Senders<MeshMsg>>> {
+		self.mesh.clone()
+	}
+
+	/// Forwards a publish to every *other* shard in the mesh, best-effort. Each peer
+	/// runs its own local `route`, so a remote subscriber receives it identically.
 	///
-	/// `try_send_to` is non-blocking (drop-on-full, matching QoS 0 semantics) and
-	/// the publisher never stalls on a slow peer. Self is skipped — the local
-	/// fan-out is handled directly by `route`.
+	/// `try_send_to` is non-blocking (drop-on-full), so the caller never stalls on a
+	/// slow peer — used for QoS 0 and broker-internal (`$SYS`) publishes where a drop
+	/// is acceptable. The QoS > 0 publish path instead awaits [`mesh_senders`]'s
+	/// `send_to` for backpressure. Self is skipped — local fan-out is done by `route`.
+	///
+	/// [`mesh_senders`]: Self::mesh_senders
 	pub fn broadcast(&self, publish: &Publish) {
 		let Some(senders) = &self.mesh else {
 			return;
@@ -461,6 +477,8 @@ impl ShardState {
 			existing.mailbox = Some(mailbox);
 			existing.expires_at = None;
 			existing.generation = generation;
+			// Reconnecting cancels any armed (delayed) Will Message.
+			existing.pending_will = None;
 			// Hand the durable state back to the resuming connection.
 			return SessionHandle {
 				resumed: true,
@@ -478,6 +496,7 @@ impl ShardState {
 				generation,
 				snapshot: SessionSnapshot::default(),
 				offline_queue: VecDeque::new(),
+				pending_will: None,
 			},
 		);
 		SessionHandle {
@@ -722,10 +741,39 @@ impl ShardState {
 		}
 	}
 
-	/// Discards every suspended session whose expiry deadline has passed, along
-	/// with its subscriptions. Driven periodically by a per-shard timer task.
-	pub fn sweep_expired(&mut self) {
+	/// Arms a delayed Will Message on a suspended session: it fires from
+	/// [`sweep_expired`](Self::sweep_expired) once `delay_secs` elapses, unless the
+	/// client reconnects first (which clears it in [`open_session`](Self::open_session)).
+	/// A no-op if the session was taken over (generation mismatch) or already gone.
+	pub fn arm_will(&mut self, client_id: &str, generation: u64, will: Publish, delay_secs: u32) {
+		if let Some(session) = self.sessions.get_mut(client_id)
+			&& session.generation == generation
+		{
+			let deadline = Instant::now() + Duration::from_secs(u64::from(delay_secs));
+			session.pending_will = Some((will, deadline));
+		}
+	}
+
+	/// Discards every suspended session whose expiry deadline has passed (along with
+	/// its subscriptions) and collects any Will Messages that are now due — either
+	/// because their delay elapsed or because their session ended first. Driven
+	/// periodically by a per-shard timer task, which publishes the returned wills.
+	pub fn sweep_expired(&mut self) -> Vec<Publish> {
 		let now = Instant::now();
+		let mut wills = Vec::new();
+
+		// Fire any delayed wills whose deadline has passed (the session may live on,
+		// e.g. a will delay shorter than the session expiry).
+		for session in self.sessions.values_mut() {
+			if session
+				.pending_will
+				.as_ref()
+				.is_some_and(|(_, deadline)| *deadline <= now)
+			{
+				wills.push(session.pending_will.take().unwrap().0);
+			}
+		}
+
 		let expired: Vec<String> = self
 			.sessions
 			.iter()
@@ -734,8 +782,15 @@ impl ShardState {
 			.collect();
 
 		for id in expired {
-			self.sessions.remove(&id);
-			self.trie.remove_client(&id);
+			// A session ending publishes any still-pending will (the deadline is
+			// `min(will_delay, session_expiry)`, so this is the delay==expiry case).
+			if let Some(session) = self.sessions.remove(&id) {
+				if let Some((will, _)) = session.pending_will {
+					wills.push(will);
+				}
+				self.trie.remove_client(&id);
+			}
 		}
+		wills
 	}
 }

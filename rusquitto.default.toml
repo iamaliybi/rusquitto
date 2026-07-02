@@ -151,9 +151,11 @@ retain_available = true
 # Type: boolean                   Default: true
 allow_anonymous = true
 
-# Known users. A client that presents a username must match one of these
-# (name + password). Passwords are stored in plaintext, so protect this file
-# with restrictive permissions and treat it as a secret.
+# Known users. A client that presents a username must match one of these. Each
+# user sets EXACTLY ONE credential: a plaintext `password`, or a `password_hash`
+# (lowercase-hex SHA-256 of the password). Prefer the hash so this file need not
+# hold the secret in the clear; protect the file with restrictive permissions
+# either way.
 #
 # Each user may carry optional `publish` / `subscribe` topic-filter allow-lists
 # (with `+` / `#` wildcards). When a list is omitted the user is unrestricted
@@ -166,11 +168,12 @@ allow_anonymous = true
 #
 #   [[auth.users]]
 #   username = "alice"
-#   password = "s3cret"
+#   password = "s3cret"                     # plaintext, OR:
+#   # password_hash = "1ec1c26b...f99fcba0" # printf %s 's3cret' | sha256sum
 #   publish   = ["sensors/#"]              # may publish only under sensors/
 #   subscribe = ["sensors/#", "cmd/alice"] # may subscribe only to these
 #
-# Type: array of { username, password, publish?, subscribe? }   Default: [] (none)
+# Type: array of { username, password?|password_hash?, publish?, subscribe? }   Default: [] (none)
 users = []
 
 # =============================================================================

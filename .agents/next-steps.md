@@ -6,11 +6,17 @@ See [progress.md](progress.md) for the build log and design decisions.
 
 The remaining work is correctness/robustness hardening, roughly in priority order.
 
-## 1. Cross-shard QoS backpressure
+## 1. Cross-shard QoS backpressure ✅ (Phase 3l)
 
-The mesh forwards with non-blocking `try_send_to` (drop-on-full), so cross-shard QoS > 0 is best-effort.
-Make it reliable: async `send_to` with per-link flow control, or a bounded retry/queue. Touch
-`broker/engine.rs::broadcast` and the drain task in `worker.rs`.
+**Done.** A QoS 1/2 publish forwarded to another shard now uses the awaiting mesh `send_to` (backpressure)
+instead of the drop-on-full `try_send_to`, so a full mesh link makes the publisher wait rather than dropping.
+The mesh `Senders` are held in an `Rc` (`ShardState::mesh_senders`) so `Connection::fan_out` can clone the
+handle, drop the `ShardState` borrow, and `await` the send; the PUBACK/PUBREC is written only after the forward
+returns, so the guarantee holds cross-shard. QoS 0 keeps `try_send_to` (fire-and-forget). No deadlock: each
+shard's mesh drain task never blocks (it only routes to local unbounded mailboxes), so it keeps freeing peer
+links while connection tasks await. Wills reuse the same reliable path; only `$SYS` metric publishes remain
+best-effort (QoS 0, retained). Verified: `mesh_capacity = 4`, a 200-message QoS 1 burst, 2 shards — all four
+subscribers (two on the publisher's shard, two cross-shard) received all 200 with zero loss.
 
 ## 2. Persistent sessions & expiry ✅ (cross-shard)
 
@@ -49,10 +55,13 @@ Also fixed here: a bare `E0 00` (zero-length) DISCONNECT — the usual graceful 
 EOF and skipping `handle_disconnect`; it is now synthesized into a normal `Disconnect` packet so the will is
 correctly suppressed.
 
-**Remaining — Will Delay Interval.** Currently treated as `0` (the will fires immediately on abnormal
-disconnect). Honouring a non-zero delay needs a timer that publishes the will after
-`min(will_delay, session_expiry)` and is cancelled if the client reconnects first — the same machinery as the
-session expiry sweep. Reuse `sweep_expired` / the per-shard timer task.
+**Will Delay Interval — done (Phase 3m).** `Connection` captures the will's `delay_interval`; `run()` cleanup
+publishes immediately when `min(will_delay, session_expiry) == 0`, else arms it on the suspended session
+(`ShardState::arm_will` → `Session.pending_will = (will, deadline)`). `sweep_expired` now returns the wills that
+have come due (delay elapsed, or the session expired first) and the per-shard timer task publishes them
+(best-effort mesh forward). `open_session` clears `pending_will` on resume, so a reconnect within the delay
+cancels the will. Verified: delay 3s not delivered at 1.5s, delivered once at 4s; reconnect within the delay
+cancels it.
 
 ## 4. Authentication / ACL ✅
 
@@ -66,9 +75,13 @@ with PUBACK/PUBREC `NotAuthorized` (0x87) for QoS 1/2 and drops QoS 0; `handle_s
 with SubAck `NotAuthorized` (0x87) and doesn't arm the trie; an unauthorized will topic is dropped at CONNECT.
 Anonymous clients are unrestricted.
 
+**Hashed passwords — done (Phase 3m).** `[[auth.users]]` accepts `password_hash` (lowercase-hex SHA-256) as an
+alternative to plaintext `password` (config validates exactly one is set and that the hash is 64 hex chars).
+`auth::Credential { Plain | Sha256 }` verifies by hashing the supplied password (`sha2` dependency). Verified
+end-to-end (good login accepted, wrong rejected).
+
 **Remaining:**
-- **Hashed passwords** — replace plaintext comparison with a salted hash (e.g. SHA-256 / Argon2); adds a
-  hashing dependency.
+- **Stronger hashing** — SHA-256 is unsalted and fast; a salted slow KDF (Argon2/bcrypt) would be better.
 - **ACL for anonymous clients** — currently anonymous is all-or-nothing (unrestricted); could add a default
   anonymous ACL if needed.
 
@@ -86,8 +99,15 @@ Client limits are stored and **enforced on the outbound path** (`connection.rs`)
 - **Maximum Packet Size** — an outbound PUBLISH larger than the client's limit is dropped (in-flight slot
   rolled back) rather than sent.
 
-**Remaining:** inbound Receive Maximum enforcement (limit concurrent inbound QoS 1/2 the *server* accepts) and
-Topic Alias support (we advertise 0, i.e. none accepted inbound, and send none outbound).
+**Inbound Receive Maximum + inbound Topic Aliases — done (Phase 3m).** CONNACK now advertises a Topic Alias
+Maximum (`Connection::INBOUND_TOPIC_ALIAS_MAX = 16`). `handle_publish` resolves inbound aliases up front
+(register on topic+alias, substitute on empty-topic+alias) via a per-connection `inbound_aliases` map; an
+out-of-range or unknown alias → DISCONNECT `TopicAliasInvalid` (0x94). The QoS 2 path enforces the advertised
+inbound Receive Maximum (`incoming_qos2.len() >= max_inflight` on a new pkid → DISCONNECT
+`ReceiveMaximumExceeded` 0x93). Topic-alias resolution verified end-to-end.
+
+**Remaining:** *outbound* topic aliases (the server assigning aliases on the publishes it sends) and
+subscription identifiers.
 
 ## 6. Subscription options & shared subscriptions ✅
 
@@ -129,8 +149,8 @@ sees the shutdown flag set, sends DISCONNECT `ServerShuttingDown` (0x8B), suppre
 normal cleanup (session suspends per expiry). The shard then waits (bounded by `SHUTDOWN_GRACE = 5 s`) for the
 live-connection count to reach 0 before returning. No per-connection timers — the wakeup reuses the mailbox.
 
-**Remaining:**
-- Documented `RLIMIT_MEMLOCK` requirement (io_uring buffer registration `ENOMEM` under load — see progress.md).
+**`RLIMIT_MEMLOCK` — documented (Phase 3m).** The README Requirements section now calls out raising it
+(`ulimit -l unlimited` / `LimitMEMLOCK=infinity`) to avoid the io_uring buffer-registration `ENOMEM` under load.
 
 ## Code map for the above
 
