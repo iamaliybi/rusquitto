@@ -174,6 +174,23 @@ Completes graceful shutdown: connected clients are told the server is stopping i
 **Verification (single shard):** with clients connected, `kill -TERM` → the client logs `Received DISCONNECT
 (139)` (0x8B), broker logs `draining connections connections:N` then `shard stopped remaining:0`, exit code 0.
 
+## Phase 3i — Subscription options (2026-07-02)
+
+No Local, Retain As Published, Retain Handling — all three MQTT 5 SUBSCRIBE options.
+
+| Item | Description | Status |
+|------|-------------|--------|
+| Trie | `Subscription` gains `nolocal` + `retain_as_published`; `insert` returns `is_new` for Retain Handling | ✅ |
+| No Local | `route` receives the publisher client id (via `deliver_local`/`fan_out`; `None` for mesh/internal) and skips the publisher's own matching sub | ✅ |
+| Retain As Published | `Delivery.retain` = `was_retained && retain_as_published`; `send_publish` sets `message.retain` from it | ✅ |
+| Retain Handling | `handle_subscribe` replays retained per `OnEverySubscribe` / `OnNewSubscribe` (only if new) / `Never` | ✅ |
+| Overlap rule | when a client has several matching filters, routing uses the highest-QoS match's options (`Match` struct) | ✅ |
+| Tests | 3 trie unit tests (is_new, options stored, resubscribe replaces) | ✅ |
+
+**Verification (paho-mqtt v5, single shard):** 8/8 checks — No Local (publisher excluded, others included);
+Retain As Published (retain kept for =1, cleared for =0 on live delivery); Retain Handling (Never / every /
+new-vs-resubscribe). 11/11 cargo unit tests pass.
+
 ## Architecture decisions locked in
 
 - **Mailbox payload:** `Rc<Publish>` for local fan-out; the mesh carries owned `Publish`, re-wrapped in `Rc` on the

@@ -39,6 +39,8 @@ isolated, shard-local executor — no `Mutex`, no `RwLock`, no work-stealing.
   per shard, lock-free shard-local state.
 - **Structured logging** (`tracing`): non-blocking file appenders, daily rotation, a dedicated error log, per-connection
   spans tagged with `client_id`, and redaction of passwords and payloads.
+- **Subscription options** — MQTT 5 **No Local**, **Retain As Published**, and **Retain Handling**
+  (`OnEverySubscribe` / `OnNewSubscribe` / `Never`) are all honored on the SUBSCRIBE path.
 - **`$SYS` metrics** — the broker publishes retained `$SYS/broker/...` topics (uptime, connected/total clients,
   messages and bytes in/out) on a configurable interval, so you can monitor it over MQTT by subscribing to
   `$SYS/#`.

@@ -83,9 +83,20 @@ Client limits are stored and **enforced on the outbound path** (`connection.rs`)
 **Remaining:** inbound Receive Maximum enforcement (limit concurrent inbound QoS 1/2 the *server* accepts) and
 Topic Alias support (we advertise 0, i.e. none accepted inbound, and send none outbound).
 
-## 6. Subscription options & shared subscriptions
+## 6. Subscription options & shared subscriptions — options ✅, shared remaining
 
-`No Local`, `Retain As Published`, `Retain Handling`, and `$share/...` group subscriptions.
+**Subscription options done.** `mqttbytes` decodes them on each `SubscribeFilter`; the trie's `Subscription`
+now carries `nolocal` + `retain_as_published`, and `insert` returns whether the subscription is new.
+- **No Local** — `route` takes the publisher's client id (threaded through `deliver_local` / `fan_out`, `None`
+  for mesh-forwarded and broker-internal publishes) and skips a matching subscriber that is the publisher.
+- **Retain As Published** — `Delivery` carries a per-subscriber `retain` flag (`was_retained &&
+  retain_as_published`); `send_publish` sets it, so live delivery keeps the retain bit only for RAP subs.
+- **Retain Handling** — `handle_subscribe` replays retained on `OnEverySubscribe`, only when new on
+  `OnNewSubscribe`, never on `Never`. When a client has overlapping filters, routing uses the options of its
+  highest-QoS match.
+
+**Remaining — shared subscriptions** (`$share/{group}/{filter}`): deliver each message to one member of the
+group (load balancing) instead of all. Needs group-aware entries in the trie/route and a per-group picker.
 
 ## 7. Observability & ops — graceful shutdown ✅, rest remaining
 

@@ -64,6 +64,18 @@ fn min_qos(a: QoS, b: QoS) -> QoS {
 pub struct Delivery {
 	pub publish: Rc<Publish>,
 	pub qos: QoS,
+	/// The retain flag to set on the delivered PUBLISH. Cleared on ordinary live
+	/// fan-out, but kept for a Retain-As-Published subscriber, and set for a
+	/// retained-message replay.
+	pub retain: bool,
+}
+
+/// The chosen subscription for a client during routing: the options of its
+/// highest-QoS matching filter.
+struct Match {
+	qos: QoS,
+	nolocal: bool,
+	retain_as_published: bool,
 }
 
 /// Sender half of a connection's mailbox.
@@ -229,10 +241,20 @@ impl ShardState {
 		}
 	}
 
-	/// Subscribes a client to a topic filter with a granted QoS. The filter may
-	/// contain the `+` and `#` wildcards. Re-subscribing replaces the prior entry.
-	pub fn subscribe(&mut self, filter: &str, client_id: &str, qos: QoS) {
-		self.trie.insert(filter, client_id, qos);
+	/// Subscribes a client to a topic filter with a granted QoS and its options.
+	/// The filter may contain the `+` and `#` wildcards. Re-subscribing replaces
+	/// the prior entry. Returns `true` if the subscription is new (for Retain
+	/// Handling).
+	pub fn subscribe(
+		&mut self,
+		filter: &str,
+		client_id: &str,
+		qos: QoS,
+		nolocal: bool,
+		retain_as_published: bool,
+	) -> bool {
+		self.trie
+			.insert(filter, client_id, qos, nolocal, retain_as_published)
 	}
 
 	/// Removes a single subscription (used by UNSUBSCRIBE).
@@ -243,14 +265,19 @@ impl ShardState {
 	/// Routes one publish on this shard: updates the retain table if the retain
 	/// flag is set, then fans it out to local subscribers. Shared by the local
 	/// publish path and the mesh drain task.
-	pub fn deliver_local(&mut self, mut publish: Publish) {
-		if publish.retain {
+	///
+	/// `publisher` is the client id that produced this message, when it is local
+	/// to this shard (`None` for mesh-forwarded publishes and broker-internal
+	/// ones); it drives the No Local subscription option.
+	pub fn deliver_local(&mut self, mut publish: Publish, publisher: Option<&str>) {
+		let was_retained = publish.retain;
+		if was_retained {
 			self.update_retain(&publish);
 		}
-		// The retain flag is only set when a message is delivered because of a new
-		// subscription; on live fan-out it is always cleared.
+		// Clear the wire retain flag; each delivery's flag is decided per subscriber
+		// in `route` (kept only for Retain-As-Published subscribers).
 		publish.retain = false;
-		self.route(Rc::new(publish));
+		self.route(Rc::new(publish), publisher, was_retained);
 	}
 
 	/// Inserts or clears a retained message. A retained publish with an empty
@@ -277,30 +304,41 @@ impl ShardState {
 	/// publish topic.
 	///
 	/// Wildcard-aware via the topic trie. A client matching through several
-	/// overlapping filters receives a single copy, at the highest QoS it was
-	/// granted across those filters (capped by the publish QoS). Uses `try_send`
-	/// so a slow or full consumer never blocks the publisher.
-	fn route(&mut self, publish: Rc<Publish>) {
+	/// overlapping filters receives a single copy, using the options of its
+	/// highest-QoS matching subscription (capped by the publish QoS). Honours the
+	/// No Local and Retain As Published subscription options. Uses `try_send` so a
+	/// slow or full consumer never blocks the publisher.
+	fn route(&mut self, publish: Rc<Publish>, publisher: Option<&str>, was_retained: bool) {
 		let mut matches = Vec::new();
 		self.trie.matching(&publish.topic, &mut matches);
 
-		// Collapse overlapping subscriptions to the best granted QoS per client.
-		// Owned keys so the borrow of the trie ends before we touch `sessions`.
-		let mut best: HashMap<String, QoS> = HashMap::new();
+		// Collapse overlapping subscriptions to one per client, keeping the options
+		// of the highest-QoS match. Owned keys so the trie borrow ends before we
+		// touch `sessions`.
+		let mut best: HashMap<String, Match> = HashMap::new();
 		for sub in matches {
-			let entry = best
-				.entry(sub.client_id.clone())
-				.or_insert(sub.qos);
-			if (sub.qos as u8) > (*entry as u8) {
-				*entry = sub.qos;
+			let entry = best.entry(sub.client_id.clone()).or_insert(Match {
+				qos: sub.qos,
+				nolocal: sub.nolocal,
+				retain_as_published: sub.retain_as_published,
+			});
+			if (sub.qos as u8) > (entry.qos as u8) {
+				entry.qos = sub.qos;
+				entry.nolocal = sub.nolocal;
+				entry.retain_as_published = sub.retain_as_published;
 			}
 		}
 
-		for (client_id, granted) in best {
+		for (client_id, m) in best {
+			// No Local: never echo a message back to the client that published it.
+			if m.nolocal && publisher == Some(client_id.as_str()) {
+				continue;
+			}
 			let Some(session) = self.sessions.get_mut(&client_id) else {
 				continue;
 			};
-			let qos = min_qos(publish.qos, granted);
+			let qos = min_qos(publish.qos, m.qos);
+			let retain = was_retained && m.retain_as_published;
 
 			match &session.mailbox {
 				// Online: hand straight to the live mailbox.
@@ -308,6 +346,7 @@ impl ShardState {
 					let _ = mailbox.try_send(Delivery {
 						publish: publish.clone(),
 						qos,
+						retain,
 					});
 				}
 				// Suspended: buffer QoS > 0 for delivery on resume; drop QoS 0.
@@ -318,6 +357,7 @@ impl ShardState {
 					session.offline_queue.push_back(Delivery {
 						publish: publish.clone(),
 						qos,
+						retain,
 					});
 				}
 				None => {}

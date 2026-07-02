@@ -2,10 +2,16 @@ use std::collections::HashMap;
 
 use mqttbytes::QoS;
 
-/// One client's subscription, with the QoS the broker granted.
+/// One client's subscription, with the QoS the broker granted and its options.
 pub struct Subscription {
 	pub client_id: String,
 	pub qos: QoS,
+	/// No Local: don't deliver a message to this subscriber if it was the one
+	/// that published it.
+	pub nolocal: bool,
+	/// Retain As Published: forward the publisher's original retain flag rather
+	/// than clearing it on live fan-out.
+	pub retain_as_published: bool,
 }
 
 /// Tests whether a subscription `filter` (possibly containing `+`/`#`) matches a
@@ -55,17 +61,30 @@ pub struct TopicTrie {
 
 impl TopicTrie {
 	/// Inserts (or refreshes) a subscription for `filter`. Re-subscribing from
-	/// the same client to the same filter replaces the prior entry.
-	pub fn insert(&mut self, filter: &str, client_id: &str, qos: QoS) {
+	/// the same client to the same filter replaces the prior entry. Returns
+	/// `true` if this was a new subscription (the client was not already
+	/// subscribed to this exact filter) — used for Retain Handling.
+	pub fn insert(
+		&mut self,
+		filter: &str,
+		client_id: &str,
+		qos: QoS,
+		nolocal: bool,
+		retain_as_published: bool,
+	) -> bool {
 		let mut node = &mut self.root;
 		for seg in filter.split('/') {
 			node = node.children.entry(seg.to_string()).or_default();
 		}
+		let is_new = !node.subscribers.iter().any(|s| s.client_id == client_id);
 		node.subscribers.retain(|s| s.client_id != client_id);
 		node.subscribers.push(Subscription {
 			client_id: client_id.to_string(),
 			qos,
+			nolocal,
+			retain_as_published,
 		});
+		is_new
 	}
 
 	/// Removes a single subscription (used by UNSUBSCRIBE).
@@ -131,5 +150,45 @@ impl TopicTrie {
 				out.extend(child.subscribers.iter());
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn matches(trie: &TopicTrie, topic: &str) -> Vec<(String, bool, bool)> {
+		let mut out = Vec::new();
+		trie.matching(topic, &mut out);
+		out.iter()
+			.map(|s| (s.client_id.clone(), s.nolocal, s.retain_as_published))
+			.collect()
+	}
+
+	#[test]
+	fn insert_reports_new_then_existing() {
+		let mut trie = TopicTrie::default();
+		assert!(trie.insert("a/b", "c1", QoS::AtLeastOnce, false, false));
+		// Re-subscribing the same client to the same filter is not new.
+		assert!(!trie.insert("a/b", "c1", QoS::ExactlyOnce, false, false));
+		// A different client on the same filter is new.
+		assert!(trie.insert("a/b", "c2", QoS::AtMostOnce, false, false));
+	}
+
+	#[test]
+	fn options_are_stored_and_matched() {
+		let mut trie = TopicTrie::default();
+		trie.insert("sensors/#", "c1", QoS::AtLeastOnce, true, true);
+		let got = matches(&trie, "sensors/kitchen/temp");
+		assert_eq!(got, vec![("c1".to_string(), true, true)]);
+	}
+
+	#[test]
+	fn resubscribe_replaces_options() {
+		let mut trie = TopicTrie::default();
+		trie.insert("t", "c1", QoS::AtLeastOnce, true, true);
+		trie.insert("t", "c1", QoS::AtLeastOnce, false, false);
+		let got = matches(&trie, "t");
+		assert_eq!(got, vec![("c1".to_string(), false, false)]);
 	}
 }
