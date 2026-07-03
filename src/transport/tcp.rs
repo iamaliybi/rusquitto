@@ -14,7 +14,11 @@ use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 /// incoming connections across them, so there is no shared accept socket and no
 /// cross-core contention on the listener.
 pub fn bind_listener(address: SocketAddr, backlog: i32) -> std::io::Result<TcpListener> {
-	let domain = if address.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+	let domain = if address.is_ipv4() {
+		Domain::IPV4
+	} else {
+		Domain::IPV6
+	};
 	let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
 
 	if address.is_ipv6() {

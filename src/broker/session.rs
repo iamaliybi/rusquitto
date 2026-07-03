@@ -8,7 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use glommio::channels::local_channel::LocalSender;
-use mqttbytes::{v5::Publish, QoS};
+use mqttbytes::{QoS, v5::Publish};
 
 /// Upper bound on QoS > 0 messages buffered for a suspended (offline) session.
 /// The oldest are dropped once full, so a client that never returns can't grow an

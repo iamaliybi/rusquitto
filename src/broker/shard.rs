@@ -5,13 +5,11 @@ use std::time::{Duration, Instant};
 
 use glommio::channels::channel_mesh::Senders;
 use glommio::channels::local_channel::LocalSender;
-use mqttbytes::{v5::Publish, QoS};
+use mqttbytes::{QoS, v5::Publish};
 
 use crate::broker::mesh::{MeshMsg, MigratedSession, MigratedSub, SessionControl};
-use crate::broker::session::{
-	Delivery, Mailbox, SessionHandle, SessionSnapshot, OFFLINE_QUEUE_LIMIT,
-};
-use crate::broker::topics::{filter_matches, SubOptions, TopicTrie};
+use crate::broker::session::{Delivery, Mailbox, OFFLINE_QUEUE_LIMIT, SessionHandle, SessionSnapshot};
+use crate::broker::topics::{SubOptions, TopicTrie, filter_matches};
 use crate::protocol::min_qos;
 
 /// MQTT 5 Session Expiry Interval sentinel meaning "the session never expires".
@@ -184,11 +182,7 @@ impl ShardState {
 
 	/// Registers a pending claim: the CONNECT handler awaits `tx`'s receiver while
 	/// this sender is delivered any [`Handoff`](SessionControl::Handoff) replies.
-	pub fn register_claim(
-		&mut self,
-		client_id: String,
-		tx: LocalSender<Option<MigratedSession>>,
-	) {
+	pub fn register_claim(&mut self, client_id: String, tx: LocalSender<Option<MigratedSession>>) {
 		self.pending_claims.insert(client_id, tx);
 	}
 
@@ -200,11 +194,7 @@ impl ShardState {
 	/// Dispatches a control message received from a peer over the mesh.
 	pub fn on_control(&mut self, control: SessionControl) {
 		match control {
-			SessionControl::Claim {
-				client_id,
-				requester,
-				resume,
-			} => self.handle_claim(client_id, requester, resume),
+			SessionControl::Claim { client_id, requester, resume } => self.handle_claim(client_id, requester, resume),
 			SessionControl::Handoff { client_id, session } => {
 				// Route the reply to whichever CONNECT handler is awaiting it. If none
 				// is (timed out, or a stray/duplicate reply), it is simply dropped.
@@ -302,12 +292,7 @@ impl ShardState {
 		let offline = migrated
 			.offline
 			.into_iter()
-			.map(|(publish, qos, retain, sub_ids)| Delivery {
-				publish: Rc::new(publish),
-				qos,
-				retain,
-				sub_ids,
-			})
+			.map(|(publish, qos, retain, sub_ids)| Delivery { publish: Rc::new(publish), qos, retain, sub_ids })
 			.collect();
 
 		let snapshot = SessionSnapshot {
@@ -331,12 +316,7 @@ impl ShardState {
 	/// installing the new mailbox drops the old sender, which closes the old
 	/// connection's channel and ends it: a session takeover. The returned
 	/// generation lets the displaced connection detect that it was taken over.
-	pub fn open_session(
-		&mut self,
-		client_id: &str,
-		mailbox: Mailbox,
-		clean_start: bool,
-	) -> SessionHandle {
+	pub fn open_session(&mut self, client_id: &str, mailbox: Mailbox, clean_start: bool) -> SessionHandle {
 		self.next_generation += 1;
 		let generation = self.next_generation;
 
@@ -510,14 +490,14 @@ impl ShardState {
 			ids.sort();
 			let online: Vec<String> = ids
 				.iter()
-				.filter(|id| {
-					self.sessions
-						.get(*id)
-						.is_some_and(|s| s.mailbox.is_some())
-				})
+				.filter(|id| self.sessions.get(*id).is_some_and(|s| s.mailbox.is_some()))
 				.cloned()
 				.collect();
-			let pool = if online.is_empty() { ids } else { online };
+			let pool = if online.is_empty() {
+				ids
+			} else {
+				online
+			};
 
 			let cursor = self.shared_cursor.entry(group).or_insert(0);
 			let client_id = pool[*cursor % pool.len()].clone();
@@ -534,36 +514,21 @@ impl ShardState {
 	/// mailbox if connected, otherwise buffered in its offline queue (QoS > 0 only;
 	/// QoS 0 is dropped for a suspended session). `sub_ids` are the Subscription
 	/// Identifiers to echo on the delivered PUBLISH.
-	fn deliver_to(
-		&mut self,
-		client_id: &str,
-		publish: &Rc<Publish>,
-		qos: QoS,
-		retain: bool,
-		sub_ids: Vec<usize>,
-	) {
+	fn deliver_to(&mut self, client_id: &str, publish: &Rc<Publish>, qos: QoS, retain: bool, sub_ids: Vec<usize>) {
 		let Some(session) = self.sessions.get_mut(client_id) else {
 			return;
 		};
 		match &session.mailbox {
 			Some(mailbox) => {
-				let _ = mailbox.try_send(Delivery {
-					publish: publish.clone(),
-					qos,
-					retain,
-					sub_ids,
-				});
+				let _ = mailbox.try_send(Delivery { publish: publish.clone(), qos, retain, sub_ids });
 			}
 			None if qos != QoS::AtMostOnce => {
 				if session.offline_queue.len() >= OFFLINE_QUEUE_LIMIT {
 					session.offline_queue.pop_front();
 				}
-				session.offline_queue.push_back(Delivery {
-					publish: publish.clone(),
-					qos,
-					retain,
-					sub_ids,
-				});
+				session
+					.offline_queue
+					.push_back(Delivery { publish: publish.clone(), qos, retain, sub_ids });
 			}
 			None => {}
 		}
@@ -699,13 +664,7 @@ mod tests {
 		share_group: Option<&str>,
 		sub_id: Option<usize>,
 	) -> SubOptions<'_> {
-		SubOptions {
-			qos,
-			nolocal,
-			retain_as_published,
-			share_group,
-			sub_id,
-		}
+		SubOptions { qos, nolocal, retain_as_published, share_group, sub_id }
 	}
 
 	/// Installs a *suspended* session (no live mailbox) for `client`, so any message
@@ -733,10 +692,17 @@ mod tests {
 	fn route_fans_out_and_downgrades_qos_to_granted() {
 		let mut s = ShardState::default();
 		arm(&mut s, "c1");
-		s.subscribe("home/+/temp", "c1", opts(QoS::AtLeastOnce, false, false, None, None));
+		s.subscribe(
+			"home/+/temp",
+			"c1",
+			opts(QoS::AtLeastOnce, false, false, None, None),
+		);
 
 		// A QoS 2 publish to a QoS 1 subscription is delivered at QoS 1.
-		s.deliver_local(pubm("home/kitchen/temp", QoS::ExactlyOnce, b"21", false), None);
+		s.deliver_local(
+			pubm("home/kitchen/temp", QoS::ExactlyOnce, b"21", false),
+			None,
+		);
 
 		let q = offline(&s, "c1");
 		assert_eq!(q.len(), 1);
@@ -748,8 +714,16 @@ mod tests {
 		let mut s = ShardState::default();
 		arm(&mut s, "c1");
 		// Two overlapping subscriptions from the same client, different sub ids.
-		s.subscribe("a/+", "c1", opts(QoS::AtLeastOnce, false, false, None, Some(1)));
-		s.subscribe("a/b", "c1", opts(QoS::AtLeastOnce, false, false, None, Some(2)));
+		s.subscribe(
+			"a/+",
+			"c1",
+			opts(QoS::AtLeastOnce, false, false, None, Some(1)),
+		);
+		s.subscribe(
+			"a/b",
+			"c1",
+			opts(QoS::AtLeastOnce, false, false, None, Some(2)),
+		);
 
 		s.deliver_local(pubm("a/b", QoS::AtLeastOnce, b"x", false), None);
 
@@ -781,12 +755,19 @@ mod tests {
 		arm(&mut s, "keep");
 		arm(&mut s, "clear");
 		s.subscribe("t", "keep", opts(QoS::AtLeastOnce, false, true, None, None));
-		s.subscribe("t", "clear", opts(QoS::AtLeastOnce, false, false, None, None));
+		s.subscribe(
+			"t",
+			"clear",
+			opts(QoS::AtLeastOnce, false, false, None, None),
+		);
 
 		s.deliver_local(pubm("t", QoS::AtLeastOnce, b"x", true), None);
 
 		assert!(offline(&s, "keep")[0].retain, "RAP subscriber keeps retain");
-		assert!(!offline(&s, "clear")[0].retain, "ordinary subscriber clears it");
+		assert!(
+			!offline(&s, "clear")[0].retain,
+			"ordinary subscriber clears it"
+		);
 	}
 
 	#[test]
@@ -794,8 +775,16 @@ mod tests {
 		let mut s = ShardState::default();
 		arm(&mut s, "c1");
 		arm(&mut s, "c2");
-		s.subscribe("t", "c1", opts(QoS::AtLeastOnce, false, false, Some("g"), None));
-		s.subscribe("t", "c2", opts(QoS::AtLeastOnce, false, false, Some("g"), None));
+		s.subscribe(
+			"t",
+			"c1",
+			opts(QoS::AtLeastOnce, false, false, Some("g"), None),
+		);
+		s.subscribe(
+			"t",
+			"c2",
+			opts(QoS::AtLeastOnce, false, false, Some("g"), None),
+		);
 
 		// Two messages to a two-member group -> one each (members sorted: c1, c2).
 		s.deliver_local(pubm("t", QoS::AtLeastOnce, b"1", false), None);
@@ -824,7 +813,13 @@ mod tests {
 		assert!(!h.resumed);
 
 		// Suspend (non-zero expiry), then reconnect resumes.
-		assert!(s.close_session("c1", h.generation, 60, SessionSnapshot::default(), VecDeque::new()));
+		assert!(s.close_session(
+			"c1",
+			h.generation,
+			60,
+			SessionSnapshot::default(),
+			VecDeque::new()
+		));
 		let (tx2, _rx2) = local_channel::new_unbounded::<Delivery>();
 		let h2 = s.open_session("c1", tx2, false);
 		assert!(h2.resumed);
@@ -838,7 +833,13 @@ mod tests {
 		let h = s.open_session("c1", tx, false);
 		s.subscribe("t", "c1", opts(QoS::AtLeastOnce, false, false, None, None));
 
-		assert!(s.close_session("c1", h.generation, 0, SessionSnapshot::default(), VecDeque::new()));
+		assert!(s.close_session(
+			"c1",
+			h.generation,
+			0,
+			SessionSnapshot::default(),
+			VecDeque::new()
+		));
 		assert!(!s.sessions.contains_key("c1"));
 		let mut m = Vec::new();
 		s.trie.matching("t", &mut m);
@@ -858,16 +859,25 @@ mod tests {
 	fn sweep_fires_due_delayed_will_and_reaps_expired_session() {
 		let mut s = ShardState::default();
 		arm(&mut s, "willed");
-		s.sessions.get_mut("willed").unwrap().pending_will =
-			Some((pubm("will/topic", QoS::AtLeastOnce, b"bye", false), Instant::now()));
+		s.sessions.get_mut("willed").unwrap().pending_will = Some((
+			pubm("will/topic", QoS::AtLeastOnce, b"bye", false),
+			Instant::now(),
+		));
 
 		arm(&mut s, "gone");
-		s.subscribe("t", "gone", opts(QoS::AtLeastOnce, false, false, None, None));
+		s.subscribe(
+			"t",
+			"gone",
+			opts(QoS::AtLeastOnce, false, false, None, None),
+		);
 		s.sessions.get_mut("gone").unwrap().expires_at = Some(Instant::now());
 
 		let wills = s.sweep_expired();
 		assert_eq!(wills.len(), 1);
 		assert_eq!(wills[0].topic, "will/topic");
-		assert!(!s.sessions.contains_key("gone"), "expired session reclaimed");
+		assert!(
+			!s.sessions.contains_key("gone"),
+			"expired session reclaimed"
+		);
 	}
 }

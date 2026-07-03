@@ -5,13 +5,17 @@
 //! parsing. Keeping them here (rather than on `Connection` or `ShardState`) makes
 //! them trivially unit-testable and reusable.
 
-use mqttbytes::{v5 as mqtt_v5, QoS};
+use mqttbytes::{QoS, v5 as mqtt_v5};
 
 /// The lower of two QoS levels — used both for the granted QoS
 /// (`min(requested, server max)`) and per-subscriber delivery
 /// (`min(publish, granted)`).
 pub fn min_qos(a: QoS, b: QoS) -> QoS {
-	if (a as u8) <= (b as u8) { a } else { b }
+	if (a as u8) <= (b as u8) {
+		a
+	} else {
+		b
+	}
 }
 
 /// Maps a granted QoS to its SubAck success reason code.
@@ -36,10 +40,7 @@ pub fn parse_shared_filter(filter: &str) -> Result<(&str, Option<&str>), ()> {
 	};
 	match rest.split_once('/') {
 		Some((group, topic))
-			if !group.is_empty()
-				&& !topic.is_empty()
-				&& !group.contains('+')
-				&& !group.contains('#') =>
+			if !group.is_empty() && !topic.is_empty() && !group.contains('+') && !group.contains('#') =>
 		{
 			Ok((topic, Some(group)))
 		}
@@ -81,7 +82,10 @@ mod tests {
 
 	#[test]
 	fn qos_min() {
-		assert_eq!(min_qos(QoS::ExactlyOnce, QoS::AtLeastOnce), QoS::AtLeastOnce);
+		assert_eq!(
+			min_qos(QoS::ExactlyOnce, QoS::AtLeastOnce),
+			QoS::AtLeastOnce
+		);
 		assert_eq!(min_qos(QoS::AtMostOnce, QoS::ExactlyOnce), QoS::AtMostOnce);
 	}
 

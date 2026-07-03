@@ -4,4 +4,4 @@ mod interner;
 mod trie;
 
 pub use interner::SegmentInterner;
-pub use trie::{filter_matches, FlatSub, SubOptions, Subscription, TopicTrie};
+pub use trie::{FlatSub, SubOptions, Subscription, TopicTrie, filter_matches};

@@ -2,8 +2,8 @@ use bytes::BytesMut;
 use futures_lite::FutureExt;
 use glommio::channels::local_channel::{self, LocalReceiver};
 use mqttbytes::{
-	v5::{self as mqtt_v5, Packet},
 	Error as MqttError, QoS,
+	v5::{self as mqtt_v5, Packet},
 };
 use std::cell::RefCell;
 use std::collections::hash_map::RandomState;
@@ -19,9 +19,7 @@ use std::sync::Arc;
 
 use crate::auth::{AuthResult, Authenticator};
 use crate::broker::mesh::{MeshMsg, MigratedSession};
-use crate::broker::session::{
-	Delivery, InflightMessage, InflightState, Mailbox, SessionSnapshot,
-};
+use crate::broker::session::{Delivery, InflightMessage, InflightState, Mailbox, SessionSnapshot};
 use crate::broker::shard::ShardState;
 use crate::broker::topics::SubOptions;
 use crate::config::LimitsConfig;
@@ -212,8 +210,13 @@ impl<S: ByteStream> Connection<S> {
 	/// rather than growing broker memory without limit.
 	async fn deliver(&mut self, delivery: Delivery) -> Result<()> {
 		if delivery.qos == QoS::AtMostOnce || self.inflight.len() < self.outbound_window() {
-			self.send_publish(&delivery.publish, delivery.qos, delivery.retain, &delivery.sub_ids)
-				.await
+			self.send_publish(
+				&delivery.publish,
+				delivery.qos,
+				delivery.retain,
+				&delivery.sub_ids,
+			)
+			.await
 		} else {
 			if self.pending_outbound.len() >= PENDING_OUTBOUND_LIMIT {
 				self.pending_outbound.pop_front();
@@ -230,8 +233,13 @@ impl<S: ByteStream> Connection<S> {
 			let Some(delivery) = self.pending_outbound.pop_front() else {
 				break;
 			};
-			self.send_publish(&delivery.publish, delivery.qos, delivery.retain, &delivery.sub_ids)
-				.await?;
+			self.send_publish(
+				&delivery.publish,
+				delivery.qos,
+				delivery.retain,
+				&delivery.sub_ids,
+			)
+			.await?;
 		}
 		Ok(())
 	}
@@ -260,7 +268,9 @@ impl<S: ByteStream> Connection<S> {
 				} else {
 					// Backpressure: wait for room so a QoS > 0 message is never dropped
 					// on a full mesh link. Err means the peer is gone — nothing to do.
-					let _ = senders.send_to(idx, MeshMsg::Publish(message.clone())).await;
+					let _ = senders
+						.send_to(idx, MeshMsg::Publish(message.clone()))
+						.await;
 				}
 			}
 		}
@@ -309,12 +319,9 @@ impl<S: ByteStream> Connection<S> {
 					self.fan_out(will, None).await;
 				} else {
 					debug!(topic = %will.topic, delay, "arming delayed will message");
-					self.state.borrow_mut().arm_will(
-						&self.client_id,
-						self.session_generation,
-						will,
-						delay,
-					);
+					self.state
+						.borrow_mut()
+						.arm_will(&self.client_id, self.session_generation, will, delay);
 				}
 			}
 		}
@@ -426,11 +433,7 @@ impl<S: ByteStream> Connection<S> {
 	/// Reads from `stream` into `buffer` until a complete MQTT packet can be
 	/// framed. Takes the fields directly (not `&mut self`) so it can race against
 	/// the mailbox receiver, which borrows a different field.
-	async fn read_packet(
-		stream: &mut S,
-		buffer: &mut BytesMut,
-		max_packet: usize,
-	) -> Result<Option<Packet>> {
+	async fn read_packet(stream: &mut S, buffer: &mut BytesMut, max_packet: usize) -> Result<Option<Packet>> {
 		let mut temp_buf = [0u8; READ_BUFFER_SIZE];
 
 		// One read may carry several MQTT packets; frame as many as are complete.
@@ -557,13 +560,8 @@ impl<S: ByteStream> Connection<S> {
 	/// Records an outbound QoS 1/2 message in the in-flight window, keeping a copy
 	/// of the PUBLISH so it can be retransmitted with the DUP flag on resume.
 	fn track_inflight(&mut self, pkid: u16, message: &mqtt_v5::Publish, state: InflightState) {
-		self.inflight.insert(
-			pkid,
-			InflightMessage {
-				publish: message.clone(),
-				state,
-			},
-		);
+		self.inflight
+			.insert(pkid, InflightMessage { publish: message.clone(), state });
 	}
 
 	/// Allocates the next unused packet id (1..=65535) for an outbound message.
@@ -703,9 +701,10 @@ impl<S: ByteStream> Connection<S> {
 		// Authenticate before logging a successful connection or opening any session
 		// state. On failure, reply with the matching CONNACK reason code and close.
 		let login = connect.login.as_ref();
-		let auth = self
-			.auth
-			.check(login.map(|l| l.username.as_str()), login.map(|l| l.password.as_str()));
+		let auth = self.auth.check(
+			login.map(|l| l.username.as_str()),
+			login.map(|l| l.password.as_str()),
+		);
 		if auth != AuthResult::Granted {
 			let code = match auth {
 				AuthResult::BadUserNamePassword => mqtt_v5::ConnectReturnCode::BadUserNamePassword,
@@ -757,10 +756,10 @@ impl<S: ByteStream> Connection<S> {
 		let mut session_present = false;
 		let mut offline_queue = VecDeque::new();
 		if let Some(mailbox) = self.mailbox_tx.take() {
-			let handle =
-				self.state
-					.borrow_mut()
-					.open_session(&self.client_id, mailbox, clean_start);
+			let handle = self
+				.state
+				.borrow_mut()
+				.open_session(&self.client_id, mailbox, clean_start);
 			self.session_generation = handle.generation;
 			session_present = handle.resumed;
 			self.inflight = handle.snapshot.inflight;
@@ -776,9 +775,7 @@ impl<S: ByteStream> Connection<S> {
 		// discard any session they may still hold from an earlier rehash.
 		if clean_start {
 			self.state.borrow().broadcast_claim(&self.client_id, false);
-		} else if !session_present
-			&& let Some(migrated) = self.claim_remote_session().await
-		{
+		} else if !session_present && let Some(migrated) = self.claim_remote_session().await {
 			info!("resumed session migrated from another shard");
 			self.subscription_count = migrated.subscriptions.len();
 			let (snapshot, offline) = self
@@ -802,8 +799,7 @@ impl<S: ByteStream> Connection<S> {
 		// length byte when `properties` is `None`, producing a malformed packet
 		// that clients reject. Attach an empty property set so the 0-length is
 		// emitted. (SubAck/Publish/PubAck handle the None case correctly.)
-		let mut conn_ack =
-			mqtt_v5::ConnAck::new(mqtt_v5::ConnectReturnCode::Success, session_present);
+		let mut conn_ack = mqtt_v5::ConnAck::new(mqtt_v5::ConnectReturnCode::Success, session_present);
 		let mut ack_props = mqtt_v5::ConnAckProperties::new();
 		// Advertise the server keep-alive so clients adopt our ceiling.
 		if self.limits.keep_alive > 0 {
@@ -848,10 +844,12 @@ impl<S: ByteStream> Connection<S> {
 		// effective keep-alive is the server override if set, else the client's value;
 		// the broker drops the connection after 1.5× that with no traffic (MQTT §3.1.2.10).
 		self.connected = true;
-		let effective_ka =
-			if self.limits.keep_alive > 0 { self.limits.keep_alive } else { connect.keep_alive };
-		self.keepalive =
-			(effective_ka > 0).then(|| Duration::from_millis(1500 * u64::from(effective_ka)));
+		let effective_ka = if self.limits.keep_alive > 0 {
+			self.limits.keep_alive
+		} else {
+			connect.keep_alive
+		};
+		self.keepalive = (effective_ka > 0).then(|| Duration::from_millis(1500 * u64::from(effective_ka)));
 		self.deadline = self.keepalive.map(|w| Instant::now() + w);
 
 		// After CONNACK, resurrect message flow for a resumed session.
@@ -970,7 +968,10 @@ impl<S: ByteStream> Connection<S> {
 		}
 		info!(reason = ?reason, "client sent disconnect");
 		// Returning an error unwinds the event loop and closes the connection.
-		Err(Error::new(ErrorKind::ConnectionAborted, "Client Disconnected"))
+		Err(Error::new(
+			ErrorKind::ConnectionAborted,
+			"Client Disconnected",
+		))
 	}
 
 	async fn handle_ping(&mut self) -> Result<()> {
@@ -1099,7 +1100,10 @@ impl<S: ByteStream> Connection<S> {
 					);
 					self.send_disconnect(mqtt_v5::DisconnectReasonCode::ReceiveMaximumExceeded)
 						.await?;
-					return Err(Error::new(ErrorKind::InvalidData, "receive maximum exceeded"));
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"receive maximum exceeded",
+					));
 				}
 				self.incoming_qos2.insert(publish.pkid, msg);
 				let mut buf = BytesMut::new();
@@ -1234,10 +1238,10 @@ impl<S: ByteStream> Connection<S> {
 			// Mirror the SUBSCRIBE parse so a `$share/{group}/{topic}` unsubscribe
 			// removes the matching shared entry rather than a phantom literal filter.
 			let (effective, share_group) = parse_shared_filter(filter).unwrap_or((filter, None));
-			let removed =
-				self.state
-					.borrow_mut()
-					.unsubscribe(effective, &self.client_id, share_group);
+			let removed = self
+				.state
+				.borrow_mut()
+				.unsubscribe(effective, &self.client_id, share_group);
 			if removed {
 				self.subscription_count = self.subscription_count.saturating_sub(1);
 			}
@@ -1305,4 +1309,3 @@ impl<S: ByteStream> Connection<S> {
 		Ok(())
 	}
 }
-

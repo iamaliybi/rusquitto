@@ -232,7 +232,17 @@ pub async fn init(
 		);
 		glommio::spawn_local(
 			async move {
-				serve(stream, is_websocket, shard_id, state, limits, auth, metrics, shutdown).await;
+				serve(
+					stream,
+					is_websocket,
+					shard_id,
+					state,
+					limits,
+					auth,
+					metrics,
+					shutdown,
+				)
+				.await;
 				counter.set(counter.get() - 1);
 			}
 			.instrument(span),
@@ -254,7 +264,11 @@ pub async fn init(
 	while conn_count.get() > 0 && Instant::now() < deadline {
 		glommio::timer::sleep(SHUTDOWN_DRAIN_POLL).await;
 	}
-	tracing::info!(shard = shard_id, remaining = conn_count.get(), "shard stopped");
+	tracing::info!(
+		shard = shard_id,
+		remaining = conn_count.get(),
+		"shard stopped"
+	);
 }
 
 /// Serves one accepted socket. A WebSocket socket first completes the RFC 6455
@@ -274,8 +288,7 @@ async fn serve(
 	if is_websocket {
 		match WsStream::accept(stream, limits.max_payload_size).await {
 			Ok(ws) => {
-				let mut conn =
-					Connection::new(ws, shard_id, state, limits, auth, metrics, shutdown);
+				let mut conn = Connection::new(ws, shard_id, state, limits, auth, metrics, shutdown);
 				let _ = conn.run().await;
 			}
 			Err(e) => tracing::warn!(error = %e, "WebSocket handshake failed"),

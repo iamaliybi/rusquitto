@@ -131,7 +131,11 @@ impl WsStream {
 				self.send_control(0xA, &frame.payload).await?;
 			}
 			0xA => {} // Pong: ignore.
-			other => return Err(protocol(&format!("unsupported websocket opcode {other:#x}"))),
+			other => {
+				return Err(protocol(&format!(
+					"unsupported websocket opcode {other:#x}"
+				)));
+			}
 		}
 		Ok(true)
 	}
@@ -235,7 +239,11 @@ impl Frame {
 		}
 		let mask = [buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]];
 		let data = &buf[key_end..key_end + len];
-		let payload: Vec<u8> = data.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]).collect();
+		let payload: Vec<u8> = data
+			.iter()
+			.enumerate()
+			.map(|(i, b)| b ^ mask[i % 4])
+			.collect();
 
 		Ok(Some(Frame { opcode, payload, total_len: key_end + len }))
 	}
@@ -249,17 +257,14 @@ fn handshake_accept(request: &str) -> Result<String> {
 		return Err(protocol("websocket upgrade must be a GET"));
 	}
 
-	let upgrade_ok = header_line(request, "upgrade")
-		.is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
-	let connection_ok = header_line(request, "connection")
-		.is_some_and(|v| v.to_ascii_lowercase().contains("upgrade"));
+	let upgrade_ok = header_line(request, "upgrade").is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+	let connection_ok = header_line(request, "connection").is_some_and(|v| v.to_ascii_lowercase().contains("upgrade"));
 	let version_ok = header_line(request, "sec-websocket-version").is_some_and(|v| v.trim() == "13");
 	if !(upgrade_ok && connection_ok && version_ok) {
 		return Err(protocol("malformed websocket upgrade request"));
 	}
 
-	let key = header_line(request, "sec-websocket-key")
-		.ok_or_else(|| protocol("missing Sec-WebSocket-Key"))?;
+	let key = header_line(request, "sec-websocket-key").ok_or_else(|| protocol("missing Sec-WebSocket-Key"))?;
 
 	let mut hasher = Sha1::new();
 	hasher.update(key.trim().as_bytes());
@@ -308,7 +313,10 @@ mod tests {
 			Connection: Upgrade\r\n\
 			Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
 			Sec-WebSocket-Version: 13\r\n\r\n";
-		assert_eq!(handshake_accept(req).unwrap(), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+		assert_eq!(
+			handshake_accept(req).unwrap(),
+			"s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+		);
 	}
 
 	#[test]

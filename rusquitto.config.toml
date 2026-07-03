@@ -4,7 +4,9 @@
 
 [server]
 bind = "127.0.0.1"        # IP to bind; all shards share it via SO_REUSEPORT
-port = 1883               # TCP port
+port = 1883               # native MQTT TCP port
+websocket = true          # also accept MQTT-over-WebSocket (browser clients)
+websocket_port = 1884     # WebSocket listener port (must differ from `port`)
 listen_backlog = 1024     # per-shard listen(2) backlog (> 0)
 
 [runtime]
@@ -22,12 +24,16 @@ format = "pretty"                   # stdout format when enabled: pretty | json
 
 [limits]
 max_connections_per_shard = 16384   # further connections on a shard are refused
-max_payload_size = 65536            # largest accepted packet, bytes (> 0)
+max_payload_size = 65536            # largest accepted packet, bytes (> 0); also caps WebSocket frames
 initial_read_buffer = 4096          # per-connection read buffer, bytes (> 0)
 max_inflight = 128                  # outbound QoS 1/2 window; also the advertised inbound Receive Maximum
 max_qos = 2                         # max QoS granted to subscribers (0 | 1 | 2)
 keep_alive = 60                     # server keep-alive advertised in CONNACK; 0 disables the override
 retain_available = true             # accept and serve retained messages
+connect_timeout = 10                # seconds a new socket has to send CONNECT before it is dropped
+max_session_expiry = 86400          # cap on Session Expiry Interval, seconds (0 = uncapped)
+max_subscriptions_per_client = 1024 # cap on active subscriptions per client (0 = unlimited)
+max_retained_messages = 100000      # cap on distinct retained topics per shard (0 = unlimited)
 
 [auth]
 # Default (anonymous allowed, no users) makes auth a no-op.

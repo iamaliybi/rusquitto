@@ -1,0 +1,39 @@
+# systemd unit for rusquitto. Copy to /etc/systemd/system/, adjust the paths and
+# user, then: systemctl daemon-reload && systemctl enable --now rusquitto
+#
+# Run behind a TLS-terminating reverse proxy (nginx/Caddy/HAProxy) for mqtts:// and
+# wss://; rusquitto itself speaks plaintext MQTT and ws://.
+
+[Unit]
+Description=rusquitto MQTT 5 broker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rusquitto
+Group=rusquitto
+WorkingDirectory=/opt/rusquitto
+ExecStart=/opt/rusquitto/rusquitto /etc/rusquitto/rusquitto.config.toml
+Restart=on-failure
+RestartSec=2
+
+# io_uring buffer registration needs a high memlock limit (see README Requirements).
+LimitMEMLOCK=infinity
+# Raise the file-descriptor ceiling for large connection counts.
+LimitNOFILE=1048576
+
+# Hardening: the broker needs no elevated privileges.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+# The log directory is the only path the broker writes to.
+ReadWritePaths=/opt/rusquitto/logs
+
+[Install]
+WantedBy=multi-user.target

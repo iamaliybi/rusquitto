@@ -116,10 +116,7 @@ impl Authenticator {
 				)
 			})
 			.collect();
-		Self {
-			allow_anonymous: config.allow_anonymous,
-			users,
-		}
+		Self { allow_anonymous: config.allow_anonymous, users }
 	}
 
 	/// Whether authentication is effectively a no-op: anonymous access is allowed
@@ -137,9 +134,7 @@ impl Authenticator {
 	pub fn check(&self, username: Option<&str>, password: Option<&str>) -> AuthResult {
 		match username {
 			Some(name) => match self.users.get(name) {
-				Some(entry) if entry.credential.verify(password.unwrap_or("")) => {
-					AuthResult::Granted
-				}
+				Some(entry) if entry.credential.verify(password.unwrap_or("")) => AuthResult::Granted,
 				Some(_) => AuthResult::BadUserNamePassword,
 				// Unknown user: run a throwaway hash so the response time doesn't
 				// reveal whether the username exists (user-enumeration timing oracle).
@@ -209,7 +204,10 @@ mod tests {
 	#[test]
 	fn known_user_good_and_bad_password() {
 		let auth = Authenticator::from_config(&cfg(false, &[("alice", "s3cret")]));
-		assert_eq!(auth.check(Some("alice"), Some("s3cret")), AuthResult::Granted);
+		assert_eq!(
+			auth.check(Some("alice"), Some("s3cret")),
+			AuthResult::Granted
+		);
 		assert_eq!(
 			auth.check(Some("alice"), Some("wrong")),
 			AuthResult::BadUserNamePassword
@@ -282,7 +280,10 @@ mod tests {
 				subscribe: None,
 			}],
 		});
-		assert_eq!(auth.check(Some("alice"), Some("s3cret")), AuthResult::Granted);
+		assert_eq!(
+			auth.check(Some("alice"), Some("s3cret")),
+			AuthResult::Granted
+		);
 		assert_eq!(
 			auth.check(Some("alice"), Some("wrong")),
 			AuthResult::BadUserNamePassword

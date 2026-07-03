@@ -65,7 +65,7 @@ pub fn filter_matches(filter: &str, topic: &str) -> bool {
 
 	loop {
 		match (f.next(), t.next()) {
-			(Some("#"), _) => return true, // matches this level and all below
+			(Some("#"), _) => return true,    // matches this level and all below
 			(Some("+"), Some(_)) => continue, // matches exactly one level
 			(Some(fs), Some(ts)) if fs == ts => continue,
 			(None, None) => return true,
@@ -111,9 +111,7 @@ impl TopicTrie {
 			let key = interner.intern(seg);
 			node = node.children.entry(key).or_default();
 		}
-		let same = |s: &Subscription| {
-			s.client_id == client_id && s.share_group.as_deref() == opts.share_group
-		};
+		let same = |s: &Subscription| s.client_id == client_id && s.share_group.as_deref() == opts.share_group;
 		let is_new = !node.subscribers.iter().any(same);
 		node.subscribers.retain(|s| !same(s));
 		node.subscribers.push(Subscription {
@@ -166,12 +164,7 @@ impl TopicTrie {
 		out
 	}
 
-	fn take_client_rec(
-		node: &mut Node,
-		client_id: &str,
-		segments: &mut Vec<String>,
-		out: &mut Vec<FlatSub>,
-	) {
+	fn take_client_rec(node: &mut Node, client_id: &str, segments: &mut Vec<String>, out: &mut Vec<FlatSub>) {
 		node.subscribers.retain(|s| {
 			if s.client_id == client_id {
 				out.push(FlatSub {
@@ -201,13 +194,7 @@ impl TopicTrie {
 		Self::match_rec(&self.root, &segments, 0, dollar_top, out);
 	}
 
-	fn match_rec<'a>(
-		node: &'a Node,
-		segments: &[&str],
-		idx: usize,
-		dollar_top: bool,
-		out: &mut Vec<&'a Subscription>,
-	) {
+	fn match_rec<'a>(node: &'a Node, segments: &[&str], idx: usize, dollar_top: bool, out: &mut Vec<&'a Subscription>) {
 		if idx == segments.len() {
 			out.extend(node.subscribers.iter());
 			// `sport/#` also matches the exact topic `sport`.
@@ -256,21 +243,23 @@ mod tests {
 		share_group: Option<&str>,
 		sub_id: Option<usize>,
 	) -> SubOptions<'_> {
-		SubOptions {
-			qos,
-			nolocal,
-			retain_as_published,
-			share_group,
-			sub_id,
-		}
+		SubOptions { qos, nolocal, retain_as_published, share_group, sub_id }
 	}
 
 	#[test]
 	fn insert_reports_new_then_existing() {
 		let mut trie = TopicTrie::default();
-		assert!(trie.insert("a/b", "c1", opts(QoS::AtLeastOnce, false, false, None, None)));
+		assert!(trie.insert(
+			"a/b",
+			"c1",
+			opts(QoS::AtLeastOnce, false, false, None, None)
+		));
 		// Re-subscribing the same client to the same filter is not new.
-		assert!(!trie.insert("a/b", "c1", opts(QoS::ExactlyOnce, false, false, None, None)));
+		assert!(!trie.insert(
+			"a/b",
+			"c1",
+			opts(QoS::ExactlyOnce, false, false, None, None)
+		));
 		// A different client on the same filter is new.
 		assert!(trie.insert("a/b", "c2", opts(QoS::AtMostOnce, false, false, None, None)));
 	}
@@ -278,7 +267,11 @@ mod tests {
 	#[test]
 	fn options_are_stored_and_matched() {
 		let mut trie = TopicTrie::default();
-		trie.insert("sensors/#", "c1", opts(QoS::AtLeastOnce, true, true, None, Some(7)));
+		trie.insert(
+			"sensors/#",
+			"c1",
+			opts(QoS::AtLeastOnce, true, true, None, Some(7)),
+		);
 		let mut out = Vec::new();
 		trie.matching("sensors/kitchen/temp", &mut out);
 		assert_eq!(out.len(), 1);
@@ -292,8 +285,16 @@ mod tests {
 		let mut trie = TopicTrie::default();
 		// A regular sub and a shared sub from the same client on the same filter are
 		// distinct entries (keyed by share group), so both match.
-		assert!(trie.insert("a/b", "c1", opts(QoS::AtLeastOnce, false, false, None, None)));
-		assert!(trie.insert("a/b", "c1", opts(QoS::AtLeastOnce, false, false, Some("g"), None)));
+		assert!(trie.insert(
+			"a/b",
+			"c1",
+			opts(QoS::AtLeastOnce, false, false, None, None)
+		));
+		assert!(trie.insert(
+			"a/b",
+			"c1",
+			opts(QoS::AtLeastOnce, false, false, Some("g"), None)
+		));
 		let mut out = Vec::new();
 		trie.matching("a/b", &mut out);
 		assert_eq!(out.len(), 2);
@@ -321,8 +322,16 @@ mod tests {
 	#[test]
 	fn take_client_removes_and_returns_filters() {
 		let mut trie = TopicTrie::default();
-		trie.insert("a/b", "c1", opts(QoS::AtLeastOnce, true, false, None, Some(5)));
-		trie.insert("x/+/z", "c1", opts(QoS::ExactlyOnce, false, true, Some("g"), None));
+		trie.insert(
+			"a/b",
+			"c1",
+			opts(QoS::AtLeastOnce, true, false, None, Some(5)),
+		);
+		trie.insert(
+			"x/+/z",
+			"c1",
+			opts(QoS::ExactlyOnce, false, true, Some("g"), None),
+		);
 		trie.insert("a/b", "c2", opts(QoS::AtMostOnce, false, false, None, None));
 
 		let mut taken = trie.take_client("c1");
@@ -335,7 +344,10 @@ mod tests {
 		assert_eq!(taken[1].share_group, Some("g".to_string()));
 
 		// c1 is gone from both filters; c2 remains on a/b.
-		assert_eq!(matches(&trie, "a/b"), vec![("c2".to_string(), false, false)]);
+		assert_eq!(
+			matches(&trie, "a/b"),
+			vec![("c2".to_string(), false, false)]
+		);
 		assert!(matches(&trie, "x/y/z").is_empty());
 		// Taking a client with no subscriptions yields nothing.
 		assert!(trie.take_client("c1").is_empty());

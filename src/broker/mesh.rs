@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use mqttbytes::{v5::Publish, QoS};
+use mqttbytes::{QoS, v5::Publish};
 
 use crate::broker::session::InflightMessage;
 

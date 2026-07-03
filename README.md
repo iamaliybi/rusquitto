@@ -4,13 +4,16 @@ A high-performance **MQTT 5.0 broker** written in Rust on a strict **thread-per-
 powered by [`glommio`](https://github.com/DataDog/glommio) and Linux `io_uring`. Every CPU core runs an
 isolated, shard-local executor — no `Mutex`, no `RwLock`, no work-stealing.
 
-> **Status:** functional pub/sub broker. Connect, subscribe (with wildcards), publish at QoS 0/1/2,
-> retained messages, and cross-shard routing all work. Not yet production-hardened — see
-> [Limitations](#limitations).
+> **Status: 1.0.** A production MQTT 5 broker over TCP and WebSocket, with a full
+> QoS 0/1/2 pipeline, persistent and cross-shard sessions, authentication/ACL, and a
+> hardened connection state machine. See [Limitations](#limitations) for the edges
+> that remain out of scope.
 
 ## Features
 
-- **MQTT 5.0** over TCP: CONNECT/CONNACK, PUBLISH, SUBSCRIBE/SUBACK, UNSUBSCRIBE/UNSUBACK, PINGREQ/PINGRESP, DISCONNECT.
+- **MQTT 5.0** over **TCP (`:1883`) and WebSocket (`:1884`)**: CONNECT/CONNACK, PUBLISH, SUBSCRIBE/SUBACK,
+  UNSUBSCRIBE/UNSUBACK, PINGREQ/PINGRESP, DISCONNECT. The WebSocket transport (RFC 6455, `mqtt` subprotocol,
+  binary frames) lets browser clients connect without a TCP bridge.
 - **QoS 0/1/2**, both inbound (receiver-side) and outbound (sender-side) — full PUBACK and PUBREC→PUBREL→PUBCOMP
   handshakes, with exactly-once delivery for QoS 2.
 - **Topic wildcards** `+` (single level) and `#` (multi level) via a topic trie; `$`-topics are excluded from wildcard
@@ -62,6 +65,15 @@ isolated, shard-local executor — no `Mutex`, no `RwLock`, no work-stealing.
 - **Graceful shutdown** on `SIGTERM` / `SIGINT`: shards stop accepting, connected clients are sent a
   `ServerShuttingDown` DISCONNECT and their sessions suspended cleanly, the process exits with code 0, and
   buffered logs are flushed instead of being lost to an abrupt kill.
+- **Hardened connection handling** — the first packet on a connection must be CONNECT (and only one is
+  allowed), so nothing is published or subscribed before authentication; a socket that never sends CONNECT is
+  dropped after `connect_timeout`; an idle connection is dropped at 1.5× the negotiated keep-alive. Client
+  PUBLISHes to `$`-prefixed topics (e.g. spoofing `$SYS`) and to wildcard/empty/NUL topics are rejected, as
+  are malformed SUBSCRIBE filters. Credential checks are constant-time and run a throwaway hash for unknown
+  users so timing doesn't reveal which usernames exist; server-assigned client ids are unguessable. Resource
+  caps bound session expiry, per-client subscriptions, per-shard retained topics, and per-connection buffering.
+- **Memory-conscious topic index** — trie levels are keyed by interned `Rc<str>` segments, so a name that
+  recurs across many filters (e.g. `a` in `a/b`, `a/c`, `x/a`) is stored once.
 - **TOML configuration** with a typed, validated schema and a CLI.
 
 ## Requirements
@@ -111,16 +123,26 @@ to a documented default; unknown keys are rejected to catch typos.
 - [`rusquitto.config.toml`](rusquitto.config.toml) — the full reference: every property, its default, and a
   one-line description. Copy it and edit what you need.
 
-The schema has four sections:
+The schema has five sections:
 
-| Section     | Controls                                                                    |
-|-------------|-----------------------------------------------------------------------------|
-| `[server]`  | `bind`, `port`, `listen_backlog`                                            |
-| `[runtime]` | `cores` (CPU cores / shard count), CPU `placement`, `mesh_capacity`          |
-| `[logging]` | `level`, `dir`, log/error file names, `enable_terminal`, `format`           |
-| `[limits]`  | `max_connections_per_shard`, `max_payload_size`, `max_qos`, `keep_alive`, … |
+| Section     | Controls                                                                                     |
+|-------------|----------------------------------------------------------------------------------------------|
+| `[server]`  | `bind`, `port`, `websocket` / `websocket_port`, `listen_backlog`                             |
+| `[runtime]` | `cores` (CPU cores / shard count), CPU `placement`, `mesh_capacity`                           |
+| `[logging]` | `level`, `dir`, log/error file names, `enable_terminal`, `format`                            |
+| `[limits]`  | connection/packet sizing, QoS, keep-alive, plus the security caps (`connect_timeout`, `max_session_expiry`, `max_subscriptions_per_client`, `max_retained_messages`) |
+| `[auth]`    | `allow_anonymous` and `[[auth.users]]` (credentials + `publish`/`subscribe` ACLs)            |
 
 `RUST_LOG` overrides `logging.level` at startup.
+
+### Connecting over WebSocket
+
+With `[server] websocket = true` (the default), browser and Node clients can connect on `:1884`:
+
+```js
+// mqtt.js
+const client = mqtt.connect("ws://127.0.0.1:1884/mqtt");
+```
 
 ## Architecture
 
@@ -142,12 +164,14 @@ for the protocol details.
 
 ## Limitations
 
-Deliberately out of scope for now (tracked in `.agents/progress.md`):
+Known edges, deliberately out of scope for 1.0 (tracked in `.agents/progress.md`):
 
 - **Under heavy connection bursts** you may hit a `glommio` io_uring `ENOMEM` from a low `RLIMIT_MEMLOCK`; raise it
-  (`ulimit -l unlimited` or `LimitMEMLOCK=infinity`). *(Cross-shard QoS 1/2 publishes and Wills are now reliable —
+  (`ulimit -l unlimited` or `LimitMEMLOCK=infinity`). *(Cross-shard QoS 1/2 publishes and Wills are reliable —
   the mesh forward applies backpressure instead of dropping. Only broker-internal `$SYS` metric publishes still use
   best-effort sends, which is fine since they are QoS 0 and retained.)*
+- **WebSocket is plaintext (`ws://`), not `wss://`.** Neither transport terminates TLS; run behind a TLS-terminating
+  reverse proxy (nginx/Caddy/HAProxy) for `mqtts://` / `wss://` in production.
 - **Cross-shard session migration is best-effort under mesh overload.** A reconnecting client that lands on a
   different shard triggers a session `Claim` over the channel mesh; the owning shard hands the session back. The
   mesh uses non-blocking sends (drop-on-full), so under a saturated mesh a claim or hand-off could be dropped and
@@ -157,7 +181,7 @@ Deliberately out of scope for now (tracked in `.agents/progress.md`):
   state.
 - **Shared-subscription load balancing is per-shard.** Each shard picks one of *its* local group members for a
   matching message, so if a group's members are spread across shards (via `SO_REUSEPORT`), the message reaches
-  one member per shard rather than exactly one across the cluster. Fully single-delivery for `runtime.shards = 1`
+  one member per shard rather than exactly one across the cluster. Fully single-delivery for `runtime.cores = 1`
   or when a group's members share a shard; globally-coordinated shared delivery is future work (overlaps the
   cross-shard items above).
 - **No outbound topic aliases.** The broker accepts *inbound* topic aliases but never assigns aliases on the
@@ -170,8 +194,9 @@ Deliberately out of scope for now (tracked in `.agents/progress.md`):
 ## Releases
 
 Version history is in [CHANGELOG.md](CHANGELOG.md); each release is tagged and published on
-[GitHub Releases](https://github.com/iamaliybi/rusquitto/releases). The project follows semantic
-versioning (pre-1.0: minor for features, patch for fixes).
+[GitHub Releases](https://github.com/iamaliybi/rusquitto/releases). The project follows
+[semantic versioning](https://semver.org): from 1.0 on, the major version bumps for breaking changes, the
+minor for features, and the patch for fixes.
 
 ## License
 

@@ -64,7 +64,8 @@ impl Metrics {
 	/// Records a PUBLISH sent to a client, with its payload size.
 	pub fn message_sent(&self, payload_len: usize) {
 		self.messages_sent.fetch_add(1, Ordering::Relaxed);
-		self.bytes_sent.fetch_add(payload_len as u64, Ordering::Relaxed);
+		self.bytes_sent
+			.fetch_add(payload_len as u64, Ordering::Relaxed);
 	}
 
 	/// Snapshots the counters for publishing to `$SYS`.
@@ -96,13 +97,28 @@ impl MetricsSnapshot {
 	/// The `$SYS/broker/...` topic/value pairs to publish for this snapshot.
 	pub fn topics(&self) -> Vec<(&'static str, String)> {
 		vec![
-			("$SYS/broker/version", concat!("rusquitto ", env!("CARGO_PKG_VERSION")).to_string()),
-			("$SYS/broker/uptime", format!("{} seconds", self.uptime_secs)),
-			("$SYS/broker/clients/connected", self.clients_connected.to_string()),
+			(
+				"$SYS/broker/version",
+				concat!("rusquitto ", env!("CARGO_PKG_VERSION")).to_string(),
+			),
+			(
+				"$SYS/broker/uptime",
+				format!("{} seconds", self.uptime_secs),
+			),
+			(
+				"$SYS/broker/clients/connected",
+				self.clients_connected.to_string(),
+			),
 			("$SYS/broker/clients/total", self.clients_total.to_string()),
-			("$SYS/broker/messages/received", self.messages_received.to_string()),
+			(
+				"$SYS/broker/messages/received",
+				self.messages_received.to_string(),
+			),
 			("$SYS/broker/messages/sent", self.messages_sent.to_string()),
-			("$SYS/broker/bytes/received", self.bytes_received.to_string()),
+			(
+				"$SYS/broker/bytes/received",
+				self.bytes_received.to_string(),
+			),
 			("$SYS/broker/bytes/sent", self.bytes_sent.to_string()),
 		]
 	}

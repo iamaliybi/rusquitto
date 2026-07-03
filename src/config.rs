@@ -19,11 +19,7 @@ use serde::Deserialize;
 
 /// rusquitto command-line interface.
 #[derive(Debug, Parser)]
-#[command(
-	name = "rusquitto",
-	version,
-	about = "A thread-per-core MQTT 5 broker built on glommio"
-)]
+#[command(name = "rusquitto", version, about = "A thread-per-core MQTT 5 broker built on glommio")]
 pub struct Cli {
 	/// Path to the TOML configuration file.
 	#[arg(value_name = "CONFIG")]
@@ -232,22 +228,15 @@ impl LimitsConfig {
 // Defaults
 // ===========================================================================
 
-
 impl Default for SysConfig {
 	fn default() -> Self {
-		Self {
-			enabled: true,
-			interval: 10,
-		}
+		Self { enabled: true, interval: 10 }
 	}
 }
 
 impl Default for AuthConfig {
 	fn default() -> Self {
-		Self {
-			allow_anonymous: true,
-			users: Vec::new(),
-		}
+		Self { allow_anonymous: true, users: Vec::new() }
 	}
 }
 
