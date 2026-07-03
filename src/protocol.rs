@@ -7,6 +7,17 @@
 
 use mqttbytes::{QoS, v5 as mqtt_v5};
 
+/// Maximum number of levels (`/`-separated segments) allowed in a topic or filter.
+///
+/// A hard depth bound is a safety limit, not just a style rule: the subscription
+/// trie is walked recursively (one stack frame per level in
+/// [`TopicTrie::matching`](crate::broker::topics::TopicTrie)), and each SUBSCRIBE
+/// level allocates a trie node. Without this cap a single ~64 KiB filter of the
+/// form `a/a/a/…` yields ~32 000 levels — enough to overflow the executor stack on
+/// a matching PUBLISH (an uncatchable abort) and to balloon trie memory. 128 is far
+/// beyond any real topic hierarchy.
+pub const MAX_TOPIC_LEVELS: usize = 128;
+
 /// The lower of two QoS levels — used both for the granted QoS
 /// (`min(requested, server max)`) and per-subscriber delivery
 /// (`min(publish, granted)`).
@@ -54,6 +65,7 @@ pub fn parse_shared_filter(filter: &str) -> Result<(&str, Option<&str>), ()> {
 pub fn valid_publish_topic(topic: &str) -> bool {
 	!topic.is_empty()
 		&& topic.len() <= u16::MAX as usize
+		&& topic.split('/').count() <= MAX_TOPIC_LEVELS
 		&& !topic.starts_with('$')
 		&& !topic.contains(['+', '#', '\0'])
 }
@@ -61,7 +73,11 @@ pub fn valid_publish_topic(topic: &str) -> bool {
 /// Whether a subscription `filter` is syntactically valid per MQTT: non-empty, no
 /// NUL, each `+` occupies a whole level, and `#` is the final level only.
 pub fn valid_subscribe_filter(filter: &str) -> bool {
-	if filter.is_empty() || filter.len() > u16::MAX as usize || filter.contains('\0') {
+	if filter.is_empty()
+		|| filter.len() > u16::MAX as usize
+		|| filter.contains('\0')
+		|| filter.split('/').count() > MAX_TOPIC_LEVELS
+	{
 		return false;
 	}
 	let mut levels = filter.split('/').peekable();
@@ -116,5 +132,17 @@ mod tests {
 		assert!(!valid_subscribe_filter("a/#/c"));
 		assert!(!valid_subscribe_filter("a/b+/c"));
 		assert!(!valid_subscribe_filter(""));
+	}
+
+	#[test]
+	fn rejects_excessive_topic_depth() {
+		// A filter/topic at the cap is fine; one level deeper is rejected — this is
+		// what bounds trie recursion depth and node growth.
+		let ok = vec!["a"; MAX_TOPIC_LEVELS].join("/");
+		let deep = vec!["a"; MAX_TOPIC_LEVELS + 1].join("/");
+		assert!(valid_subscribe_filter(&ok));
+		assert!(valid_publish_topic(&ok));
+		assert!(!valid_subscribe_filter(&deep));
+		assert!(!valid_publish_topic(&deep));
 	}
 }

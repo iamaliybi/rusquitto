@@ -31,6 +31,11 @@ and a memory optimization, on top of a restructured, SOLID-leaning codebase.
   bounded**, so a subscriber that stops reading its socket can't force unbounded broker
   memory growth (excess deliveries to that stuck consumer are dropped). WebSocket
   control frames are validated (≤125 bytes, unfragmented) per RFC 6455.
+- **Topic/filter depth cap** (128 levels). The subscription trie is walked recursively,
+  so an unbounded-depth topic could overflow the executor stack (an uncatchable abort)
+  and a deep SUBSCRIBE could balloon trie memory; both are now rejected up front.
+- **Panic-safe connection accounting.** The live-connection count is released through
+  an RAII guard, so a task that panics can't leak a slot and eventually wedge the shard.
 
 ### Changed
 

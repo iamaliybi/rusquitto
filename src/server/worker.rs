@@ -40,6 +40,24 @@ enum AcceptTurn {
 	Tick,
 }
 
+/// RAII counter for a live connection slot. Incremented on [`acquire`](Self::acquire)
+/// and decremented on drop, so the shard-local live-connection count is always
+/// balanced even if the connection task panics and unwinds.
+struct ConnSlot(Rc<Cell<usize>>);
+
+impl ConnSlot {
+	fn acquire(count: Rc<Cell<usize>>) -> Self {
+		count.set(count.get() + 1);
+		Self(count)
+	}
+}
+
+impl Drop for ConnSlot {
+	fn drop(&mut self) {
+		self.0.set(self.0.get().saturating_sub(1));
+	}
+}
+
 pub async fn init(
 	mesh: MeshBuilder<MeshMsg, Full>,
 	config: Arc<Config>,
@@ -217,10 +235,14 @@ pub async fn init(
 			drop(stream); // closes the socket
 			continue;
 		}
-		conn_count.set(conn_count.get() + 1);
+		// Acquire the slot via an RAII guard: it decrements the live-connection count
+		// on drop, so the slot is reclaimed on *every* task exit — including a panic
+		// unwind. A manual decrement after `.await` would be skipped on panic, slowly
+		// leaking slots until the shard hits `max_connections_per_shard` and stops
+		// accepting (a connection-slot exhaustion DoS).
+		let slot = ConnSlot::acquire(conn_count.clone());
 
 		let state = state.clone();
-		let counter = conn_count.clone();
 		let auth = auth.clone();
 		let metrics = metrics.clone();
 		let shutdown = shutdown.clone();
@@ -232,6 +254,7 @@ pub async fn init(
 		);
 		glommio::spawn_local(
 			async move {
+				let _slot = slot;
 				serve(
 					stream,
 					is_websocket,
@@ -243,7 +266,6 @@ pub async fn init(
 					shutdown,
 				)
 				.await;
-				counter.set(counter.get() - 1);
 			}
 			.instrument(span),
 		)
