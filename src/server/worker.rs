@@ -10,8 +10,9 @@ use futures_lite::FutureExt;
 use glommio::channels::channel_mesh::{Full, MeshBuilder};
 use glommio::net::{TcpListener, TcpStream};
 use mqttbytes::{QoS, v5::Publish};
-use std::cell::Cell;
-use std::net::SocketAddr;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,21 +41,46 @@ enum AcceptTurn {
 	Tick,
 }
 
+/// Per-shard live-connection accounting: the total count plus a per-IP tally.
+/// Single-threaded (shard-local), so plain `Cell`/`RefCell` suffice — no locks.
+#[derive(Default)]
+struct ConnCounts {
+	total: Cell<usize>,
+	per_ip: RefCell<HashMap<IpAddr, usize>>,
+}
+
 /// RAII counter for a live connection slot. Incremented on [`acquire`](Self::acquire)
-/// and decremented on drop, so the shard-local live-connection count is always
-/// balanced even if the connection task panics and unwinds.
-struct ConnSlot(Rc<Cell<usize>>);
+/// and decremented on drop, so both the total and per-IP counts stay balanced even
+/// if the connection task panics and unwinds.
+struct ConnSlot {
+	counts: Rc<ConnCounts>,
+	ip: Option<IpAddr>,
+}
 
 impl ConnSlot {
-	fn acquire(count: Rc<Cell<usize>>) -> Self {
-		count.set(count.get() + 1);
-		Self(count)
+	fn acquire(counts: Rc<ConnCounts>, ip: Option<IpAddr>) -> Self {
+		counts.total.set(counts.total.get() + 1);
+		if let Some(ip) = ip {
+			*counts.per_ip.borrow_mut().entry(ip).or_insert(0) += 1;
+		}
+		Self { counts, ip }
 	}
 }
 
 impl Drop for ConnSlot {
 	fn drop(&mut self) {
-		self.0.set(self.0.get().saturating_sub(1));
+		self.counts
+			.total
+			.set(self.counts.total.get().saturating_sub(1));
+		if let Some(ip) = self.ip {
+			let mut map = self.counts.per_ip.borrow_mut();
+			if let Some(n) = map.get_mut(&ip) {
+				*n -= 1;
+				if *n == 0 {
+					map.remove(&ip); // keep the map bounded by live IPs only
+				}
+			}
+		}
 	}
 }
 
@@ -173,6 +199,7 @@ pub async fn init(
 
 	let limits = config.limits;
 	let max_conns = limits.max_connections_per_shard;
+	let max_conns_per_ip = limits.max_connections_per_ip;
 	// Shard-local credential store, shared by every connection on this shard.
 	let auth = Rc::new(Authenticator::from_config(&config.auth));
 	if mesh_peer_id == 0 {
@@ -182,8 +209,17 @@ pub async fn init(
 			allow_anonymous = config.auth.allow_anonymous,
 			"authentication configured"
 		);
+		// Warn if idle-connection protection is off: with no server keep-alive and a
+		// client that also sends keep-alive 0, an idle/stalled connection is never reaped.
+		if limits.keep_alive == 0 {
+			tracing::warn!(
+				"limits.keep_alive = 0 disables the server keep-alive override; idle \
+				 connections are only reaped when the client sets its own keep-alive. \
+				 Set keep_alive > 0 to guarantee idle/slow connections are dropped."
+			);
+		}
 	}
-	let conn_count = Rc::new(Cell::new(0usize));
+	let counts = Rc::new(ConnCounts::default());
 
 	while !shutdown.load(Ordering::Relaxed) {
 		// Race the accept(s) against a periodic tick so a shutdown signal is noticed
@@ -226,7 +262,9 @@ pub async fn init(
 			AcceptTurn::Failed | AcceptTurn::Tick => continue,
 		};
 
-		if conn_count.get() >= max_conns {
+		let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
+
+		if counts.total.get() >= max_conns {
 			tracing::warn!(
 				shard = shard_id,
 				max = max_conns,
@@ -235,12 +273,31 @@ pub async fn init(
 			drop(stream); // closes the socket
 			continue;
 		}
-		// Acquire the slot via an RAII guard: it decrements the live-connection count
-		// on drop, so the slot is reclaimed on *every* task exit — including a panic
+
+		// Per-source connection cap: bound how many concurrent connections one client
+		// IP may hold on this shard, so a single host can't monopolise the slots. Off
+		// when 0. Note it is per-shard (SO_REUSEPORT spreads a source across shards) and
+		// only meaningful when clients connect directly — behind a reverse proxy every
+		// connection shares the proxy's IP, so rely on the proxy/network layer there.
+		if max_conns_per_ip > 0
+			&& let Some(ip) = peer_ip
+			&& counts.per_ip.borrow().get(&ip).copied().unwrap_or(0) >= max_conns_per_ip
+		{
+			tracing::warn!(
+				shard = shard_id,
+				%ip,
+				max = max_conns_per_ip,
+				"per-IP connection limit reached, rejecting"
+			);
+			drop(stream);
+			continue;
+		}
+
+		// Acquire the slot via an RAII guard: it decrements the total and per-IP counts
+		// on drop, so slots are reclaimed on *every* task exit — including a panic
 		// unwind. A manual decrement after `.await` would be skipped on panic, slowly
-		// leaking slots until the shard hits `max_connections_per_shard` and stops
-		// accepting (a connection-slot exhaustion DoS).
-		let slot = ConnSlot::acquire(conn_count.clone());
+		// leaking slots until the shard stops accepting (a slot-exhaustion DoS).
+		let slot = ConnSlot::acquire(counts.clone(), peer_ip);
 
 		let state = state.clone();
 		let auth = auth.clone();
@@ -274,7 +331,7 @@ pub async fn init(
 
 	// Drain: wake every live connection so it sends DISCONNECT and cleans up, then
 	// wait (bounded) for them to finish before returning.
-	let live = conn_count.get();
+	let live = counts.total.get();
 	tracing::info!(
 		shard = shard_id,
 		connections = live,
@@ -283,12 +340,12 @@ pub async fn init(
 	state.borrow_mut().shutdown_connections();
 
 	let deadline = Instant::now() + SHUTDOWN_GRACE;
-	while conn_count.get() > 0 && Instant::now() < deadline {
+	while counts.total.get() > 0 && Instant::now() < deadline {
 		glommio::timer::sleep(SHUTDOWN_DRAIN_POLL).await;
 	}
 	tracing::info!(
 		shard = shard_id,
-		remaining = conn_count.get(),
+		remaining = counts.total.get(),
 		"shard stopped"
 	);
 }

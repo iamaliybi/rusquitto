@@ -138,6 +138,11 @@ pub enum LogFormat {
 pub struct LimitsConfig {
 	/// Maximum concurrent connections accepted on a single shard.
 	pub max_connections_per_shard: usize,
+	/// Maximum concurrent connections one client IP may hold on a single shard
+	/// (`0` = unlimited). Bounds single-source connection floods; per-shard, and
+	/// only meaningful when clients connect directly (behind a proxy all
+	/// connections share the proxy IP).
+	pub max_connections_per_ip: usize,
 	/// Maximum accepted MQTT packet size, in bytes.
 	pub max_payload_size: usize,
 	/// Initial per-connection assembly buffer capacity, in bytes.
@@ -279,6 +284,7 @@ impl Default for LimitsConfig {
 	fn default() -> Self {
 		Self {
 			max_connections_per_shard: 16_384,
+			max_connections_per_ip: 0,
 			max_payload_size: 64 * 1024,
 			initial_read_buffer: 4 * 1024,
 			max_inflight: 128,

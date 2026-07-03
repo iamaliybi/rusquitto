@@ -36,6 +36,12 @@ and a memory optimization, on top of a restructured, SOLID-leaning codebase.
   and a deep SUBSCRIBE could balloon trie memory; both are now rejected up front.
 - **Panic-safe connection accounting.** The live-connection count is released through
   an RAII guard, so a task that panics can't leak a slot and eventually wedge the shard.
+- **Per-IP connection cap** (`limits.max_connections_per_ip`, `0` = unlimited). Bounds
+  how many concurrent connections one client IP may hold on a shard, limiting a
+  single-source connection flood. Per-shard, and most useful for direct clients — behind
+  a reverse proxy every connection shares the proxy IP, so rely on the proxy/network
+  layer there. The broker also warns at startup when `keep_alive = 0`, since that
+  disables idle-connection reaping.
 
 ### Changed
 

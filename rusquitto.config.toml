@@ -24,6 +24,7 @@ format = "pretty"                   # stdout format when enabled: pretty | json
 
 [limits]
 max_connections_per_shard = 16384   # further connections on a shard are refused
+max_connections_per_ip = 0          # max concurrent connections per client IP per shard (0 = unlimited; see note)
 max_payload_size = 65536            # largest accepted packet, bytes (> 0); also caps WebSocket frames
 initial_read_buffer = 4096          # per-connection read buffer, bytes (> 0)
 max_inflight = 128                  # outbound QoS 1/2 window; also the advertised inbound Receive Maximum
