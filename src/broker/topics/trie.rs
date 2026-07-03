@@ -1,6 +1,9 @@
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use mqttbytes::QoS;
+
+use crate::broker::topics::interner::SegmentInterner;
 
 /// One client's subscription, with the QoS the broker granted and its options.
 pub struct Subscription {
@@ -71,11 +74,11 @@ pub fn filter_matches(filter: &str, topic: &str) -> bool {
 	}
 }
 
-/// A node in the topic tree. Each level of a filter (split on `/`) is an edge;
-/// the wildcards `+` and `#` are stored as ordinary segment keys.
+/// A node in the topic tree. Each level of a filter (split on `/`) is an edge
+/// keyed by an interned segment; the wildcards `+` and `#` are ordinary keys.
 #[derive(Default)]
 struct Node {
-	children: HashMap<String, Node>,
+	children: HashMap<Rc<str>, Node>,
 	/// Subscribers whose filter terminates at this node.
 	subscribers: Vec<Subscription>,
 }
@@ -87,10 +90,12 @@ struct Node {
 /// - `#` — matches the remaining levels (must be the final segment of a filter);
 ///   per spec it also matches the parent level (`sport/#` matches `sport`).
 ///
-/// Wildcards never match a topic whose first level begins with `$`.
+/// Wildcards never match a topic whose first level begins with `$`. Segment keys
+/// are interned, so repeated names across the tree share one allocation.
 #[derive(Default)]
 pub struct TopicTrie {
 	root: Node,
+	interner: SegmentInterner,
 }
 
 impl TopicTrie {
@@ -100,9 +105,11 @@ impl TopicTrie {
 	/// the same filter — they are distinct entries. Returns `true` if this was a
 	/// new subscription — used for Retain Handling.
 	pub fn insert(&mut self, filter: &str, client_id: &str, opts: SubOptions) -> bool {
-		let mut node = &mut self.root;
+		let Self { root, interner } = self;
+		let mut node = root;
 		for seg in filter.split('/') {
-			node = node.children.entry(seg.to_string()).or_default();
+			let key = interner.intern(seg);
+			node = node.children.entry(key).or_default();
 		}
 		let same = |s: &Subscription| {
 			s.client_id == client_id && s.share_group.as_deref() == opts.share_group
@@ -178,7 +185,7 @@ impl TopicTrie {
 			}
 		});
 		for (seg, child) in node.children.iter_mut() {
-			segments.push(seg.clone());
+			segments.push(seg.to_string());
 			Self::take_client_rec(child, client_id, segments, out);
 			segments.pop();
 		}

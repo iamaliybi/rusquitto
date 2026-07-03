@@ -7,72 +7,15 @@ use glommio::channels::channel_mesh::Senders;
 use glommio::channels::local_channel::LocalSender;
 use mqttbytes::{v5::Publish, QoS};
 
-use crate::broker::topic_trie::{filter_matches, SubOptions, TopicTrie};
+use crate::broker::mesh::{MeshMsg, MigratedSession, MigratedSub, SessionControl};
+use crate::broker::session::{
+	Delivery, Mailbox, SessionHandle, SessionSnapshot, OFFLINE_QUEUE_LIMIT,
+};
+use crate::broker::topics::{filter_matches, SubOptions, TopicTrie};
+use crate::protocol::min_qos;
 
 /// MQTT 5 Session Expiry Interval sentinel meaning "the session never expires".
 const SESSION_NEVER_EXPIRES: u32 = u32::MAX;
-
-/// Upper bound on QoS > 0 messages buffered for a suspended (offline) session.
-/// Prevents an unbounded backlog for a client that never returns; the oldest
-/// messages are dropped once the queue is full.
-const OFFLINE_QUEUE_LIMIT: usize = 1024;
-
-/// Stage of an outbound QoS 1/2 message awaiting acknowledgement. Held per
-/// in-flight packet id so the exchange can be resumed and retransmitted after a
-/// reconnect.
-pub enum InflightState {
-	/// QoS 1 PUBLISH sent, awaiting PUBACK.
-	Qos1,
-	/// QoS 2 PUBLISH sent, awaiting PUBREC.
-	Qos2Pending,
-	/// QoS 2 PUBREL sent, awaiting PUBCOMP.
-	Qos2Released,
-}
-
-/// An outbound QoS 1/2 message in flight: its stage plus the PUBLISH itself, so
-/// it can be retransmitted (with the DUP flag) when a session resumes.
-pub struct InflightMessage {
-	pub publish: Publish,
-	pub state: InflightState,
-}
-
-/// The durable QoS state a connection hands to its session when it disconnects,
-/// and receives back when the session is resumed. While the client is connected
-/// this state lives in the [`Connection`](crate::server::connection::Connection)
-/// (hot path, no shared-state borrow); it only rests here between connections.
-#[derive(Default)]
-pub struct SessionSnapshot {
-	/// Outbound QoS 1/2 messages we sent but the client has not fully acked.
-	pub inflight: HashMap<u16, InflightMessage>,
-	/// Inbound QoS 2 messages received (PUBLISH) but not yet released (PUBREL).
-	pub incoming_qos2: HashMap<u16, Publish>,
-	/// Where the outbound packet-id allocator left off.
-	pub next_pkid: u16,
-}
-
-/// Returns the lower of two QoS levels (e.g. the granted QoS is
-/// `min(requested, server max)`, and delivery is `min(publish, granted)`).
-pub(crate) fn min_qos(a: QoS, b: QoS) -> QoS {
-	if (a as u8) <= (b as u8) { a } else { b }
-}
-
-/// A message routed toward a connection for delivery to its client.
-///
-/// The `publish` is shared via `Rc` so one message fans out to many subscribers
-/// on the same shard without re-allocating; `qos` is the effective QoS for this
-/// particular subscriber (`min(publish QoS, granted QoS)`). The receiving
-/// connection assigns its own packet id when `qos > 0`.
-pub struct Delivery {
-	pub publish: Rc<Publish>,
-	pub qos: QoS,
-	/// The retain flag to set on the delivered PUBLISH. Cleared on ordinary live
-	/// fan-out, but kept for a Retain-As-Published subscriber, and set for a
-	/// retained-message replay.
-	pub retain: bool,
-	/// Subscription Identifiers to echo on the delivered PUBLISH (MQTT 5), gathered
-	/// from every matching subscription of this client. Usually empty or one.
-	pub sub_ids: Vec<usize>,
-}
 
 /// The chosen subscription for a client during routing: the options of its
 /// highest-QoS matching filter, plus the identifiers of *all* its matching
@@ -82,82 +25,6 @@ struct Match {
 	nolocal: bool,
 	retain_as_published: bool,
 	sub_ids: Vec<usize>,
-}
-
-/// Sender half of a connection's mailbox.
-///
-/// `LocalSender` is single-owner (not `Clone`), so each connection's sender is
-/// stored exactly once — in its [`Session`] — and subscriptions refer to the
-/// client by `client_id` rather than holding their own sender.
-pub type Mailbox = LocalSender<Delivery>;
-
-/// A message crossing the inter-shard channel mesh. Most carry a `Publish` to be
-/// re-routed on the receiving shard; a smaller number carry a [`SessionControl`]
-/// message for cross-shard session migration. The control variant is boxed so the
-/// common publish path keeps the enum (and thus the mesh ring buffers) small.
-pub enum MeshMsg {
-	Publish(Publish),
-	Control(Box<SessionControl>),
-}
-
-/// Cross-shard session-migration protocol, exchanged over the mesh.
-///
-/// A reconnecting client can land — via the `SO_REUSEPORT` 4-tuple hash on its new
-/// ephemeral port — on a different shard than the one holding its suspended
-/// session. Since every shard shares one listening address there is nothing to
-/// redirect the client to, so the *session* moves instead: the shard the client
-/// reached broadcasts a [`Claim`], and whichever peer owns the session replies
-/// with a [`Handoff`] carrying it.
-///
-/// [`Claim`]: SessionControl::Claim
-/// [`Handoff`]: SessionControl::Handoff
-pub enum SessionControl {
-	/// "Client `client_id` just (re)connected to me (`requester`); if you hold its
-	/// session, hand it over." `resume = false` — a Clean Start connect — instead
-	/// asks peers to *discard* any session they hold for this client id.
-	Claim {
-		client_id: String,
-		/// Mesh peer id of the shard to send the [`Handoff`](SessionControl::Handoff)
-		/// reply back to.
-		requester: usize,
-		resume: bool,
-	},
-	/// Reply to a [`Claim`](SessionControl::Claim): the owning peer's session for
-	/// `client_id`, or `None` if it held none (or the claim was a discard).
-	Handoff {
-		client_id: String,
-		session: Option<MigratedSession>,
-	},
-}
-
-/// A whole session serialized for migration to another shard.
-///
-/// Carries owned data only — the mesh moves values between executors, so the
-/// offline queue's `Rc<Publish>` is unwrapped to an owned `Publish` here and
-/// re-wrapped on arrival. Subscriptions travel as flat tuples rather than trie
-/// nodes.
-pub struct MigratedSession {
-	/// The client's subscriptions (filter, granted QoS, and options).
-	pub subscriptions: Vec<MigratedSub>,
-	/// Outbound QoS 1/2 messages awaiting acknowledgement.
-	pub inflight: HashMap<u16, InflightMessage>,
-	/// Inbound QoS 2 messages received but not yet released.
-	pub incoming_qos2: HashMap<u16, Publish>,
-	/// Where the outbound packet-id allocator left off.
-	pub next_pkid: u16,
-	/// QoS > 0 messages buffered while offline, as owned
-	/// `(publish, qos, retain, sub_ids)`.
-	pub offline: Vec<(Publish, QoS, bool, Vec<usize>)>,
-}
-
-/// One migrated subscription (a flattened [`TopicTrie`] entry).
-pub struct MigratedSub {
-	pub filter: String,
-	pub qos: QoS,
-	pub nolocal: bool,
-	pub retain_as_published: bool,
-	pub share_group: Option<String>,
-	pub sub_id: Option<usize>,
 }
 
 /// Durable per-client session state, keyed by `client_id` in [`ShardState`].
@@ -192,21 +59,6 @@ struct Session {
 	/// Published by [`sweep_expired`](ShardState::sweep_expired) once the deadline
 	/// passes (or the session ends first), and cancelled if the client reconnects.
 	pending_will: Option<(Publish, Instant)>,
-}
-
-/// Outcome of opening a session at CONNECT, returned to the connection so it can
-/// set CONNACK `session_present`, remember which generation it owns, and restore
-/// any durable state carried over from a previous connection.
-pub struct SessionHandle {
-	/// Whether an existing session was resumed (drives CONNACK `session_present`).
-	pub resumed: bool,
-	/// The generation this connection now owns; passed back to `close_session`.
-	pub generation: u64,
-	/// Durable QoS state to restore into the connection (empty when fresh).
-	pub snapshot: SessionSnapshot,
-	/// Messages buffered while the session was offline, to flush after CONNACK
-	/// (empty when fresh).
-	pub offline_queue: VecDeque<Delivery>,
 }
 
 /// Per-shard broker state.

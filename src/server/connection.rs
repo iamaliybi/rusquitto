@@ -1,7 +1,6 @@
 use bytes::BytesMut;
-use futures_lite::{AsyncReadExt, AsyncWriteExt, FutureExt};
+use futures_lite::FutureExt;
 use glommio::channels::local_channel::{self, LocalReceiver};
-use glommio::net::TcpStream;
 use mqttbytes::{
 	v5::{self as mqtt_v5, Packet},
 	Error as MqttError, QoS,
@@ -17,14 +16,17 @@ use tracing::{debug, info, warn};
 use std::sync::Arc;
 
 use crate::auth::{AuthResult, Authenticator};
-use crate::broker::engine::{
-	Delivery, InflightMessage, InflightState, Mailbox, MeshMsg, MigratedSession, SessionSnapshot,
-	ShardState, min_qos,
+use crate::broker::mesh::{MeshMsg, MigratedSession};
+use crate::broker::session::{
+	Delivery, InflightMessage, InflightState, Mailbox, SessionSnapshot,
 };
-use crate::broker::topic_trie::SubOptions;
+use crate::broker::shard::ShardState;
+use crate::broker::topics::SubOptions;
 use crate::config::LimitsConfig;
-use crate::logger::redact;
-use crate::metrics::Metrics;
+use crate::protocol::{min_qos, parse_shared_filter, sub_reason_code, valid_publish_topic};
+use crate::telemetry::logging::redact;
+use crate::telemetry::metrics::Metrics;
+use crate::transport::ByteStream;
 
 use std::time::Duration;
 
@@ -52,8 +54,8 @@ enum Event {
 	Outgoing(Option<Delivery>),
 }
 
-pub struct Connection {
-	stream: TcpStream,
+pub struct Connection<S: ByteStream> {
+	stream: S,
 	buffer: BytesMut,
 	shard_id: usize,
 	client_id: String,
@@ -120,13 +122,13 @@ pub struct Connection {
 	inbound_aliases: HashMap<u16, String>,
 }
 
-impl Connection {
-	/// Stack scratch buffer for each socket read. The growable assembly buffer is
-	/// `buffer` (sized from config); a fixed size keeps this one on the stack.
-	const READ_BUFFER_SIZE: usize = 2048;
+/// Stack scratch buffer for each socket read. The growable assembly buffer is
+/// `buffer` (sized from config); a fixed size keeps this one on the stack.
+const READ_BUFFER_SIZE: usize = 2048;
 
+impl<S: ByteStream> Connection<S> {
 	pub fn new(
-		stream: TcpStream,
+		stream: S,
 		shard_id: usize,
 		state: Rc<RefCell<ShardState>>,
 		limits: LimitsConfig,
@@ -360,11 +362,11 @@ impl Connection {
 	/// framed. Takes the fields directly (not `&mut self`) so it can race against
 	/// the mailbox receiver, which borrows a different field.
 	async fn read_packet(
-		stream: &mut TcpStream,
+		stream: &mut S,
 		buffer: &mut BytesMut,
 		max_packet: usize,
 	) -> Result<Option<Packet>> {
-		let mut temp_buf = [0u8; Self::READ_BUFFER_SIZE];
+		let mut temp_buf = [0u8; READ_BUFFER_SIZE];
 
 		// One read may carry several MQTT packets; frame as many as are complete.
 		loop {
@@ -538,7 +540,7 @@ impl Connection {
 	}
 }
 
-impl Connection {
+impl<S: ByteStream> Connection<S> {
 	/// Replies to a rejected CONNECT with a failure CONNACK (session present is
 	/// always false) and returns an error to unwind and close the connection.
 	async fn reject_connect(&mut self, code: mqtt_v5::ConnectReturnCode) -> Result<()> {
@@ -896,6 +898,16 @@ impl Connection {
 			}
 		}
 
+		// A PUBLISH topic must be a concrete name: non-empty, no wildcards, no NUL,
+		// and never `$`-prefixed (those are broker-reserved, so a client can't spoof
+		// `$SYS`). Anything else is a protocol violation — disconnect.
+		if !valid_publish_topic(&publish.topic) {
+			warn!(topic = %publish.topic, "invalid publish topic, disconnecting");
+			self.send_disconnect(mqtt_v5::DisconnectReasonCode::TopicNameInvalid)
+				.await?;
+			return Err(Error::new(ErrorKind::InvalidData, "invalid publish topic"));
+		}
+
 		// Payload contents are never logged — only topic, QoS, and byte length.
 		debug!(
 			topic = %publish.topic,
@@ -1025,6 +1037,13 @@ impl Connection {
 				continue;
 			}
 
+			// Reject syntactically invalid filters before touching the trie.
+			if !crate::protocol::valid_subscribe_filter(effective) {
+				warn!(filter = %effective, "invalid subscribe filter, rejecting");
+				return_codes.push(mqtt_v5::SubscribeReasonCode::TopicFilterInvalid);
+				continue;
+			}
+
 			let granted = min_qos(filter.qos, self.limits.max_qos());
 
 			{
@@ -1057,7 +1076,7 @@ impl Connection {
 
 			debug!(filter = %effective, group = ?share_group, granted = ?granted, "subscribed");
 
-			return_codes.push(reason_code(granted));
+			return_codes.push(sub_reason_code(granted));
 		}
 
 		let sub_ack = mqtt_v5::SubAck::new(subscribe.pkid, return_codes);
@@ -1161,35 +1180,3 @@ impl Connection {
 	}
 }
 
-/// Splits a subscription filter into `(effective_filter, share_group)`.
-///
-/// A Shared Subscription filter is `$share/{ShareName}/{topic-filter}`: the group
-/// is `ShareName` and the effective filter is `{topic-filter}`. An ordinary filter
-/// returns itself with `None`. A malformed `$share/…` (missing/empty ShareName or
-/// topic, or a wildcard in the ShareName) returns `Err(())` so the caller can
-/// answer the SUBSCRIBE with `TopicFilterInvalid`.
-fn parse_shared_filter(filter: &str) -> std::result::Result<(&str, Option<&str>), ()> {
-	let Some(rest) = filter.strip_prefix("$share/") else {
-		return Ok((filter, None));
-	};
-	match rest.split_once('/') {
-		Some((group, topic))
-			if !group.is_empty()
-				&& !topic.is_empty()
-				&& !group.contains('+')
-				&& !group.contains('#') =>
-		{
-			Ok((topic, Some(group)))
-		}
-		_ => Err(()),
-	}
-}
-
-/// Maps a granted QoS to its SubAck success reason code.
-fn reason_code(qos: QoS) -> mqtt_v5::SubscribeReasonCode {
-	match qos {
-		QoS::AtMostOnce => mqtt_v5::SubscribeReasonCode::QoS0,
-		QoS::AtLeastOnce => mqtt_v5::SubscribeReasonCode::QoS1,
-		QoS::ExactlyOnce => mqtt_v5::SubscribeReasonCode::QoS2,
-	}
-}

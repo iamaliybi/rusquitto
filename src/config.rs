@@ -61,10 +61,21 @@ pub struct ServerConfig {
 	/// Address to bind every shard's listener to (all shards share it via
 	/// `SO_REUSEPORT`). IPv4 or IPv6.
 	pub bind: IpAddr,
-	/// TCP port to listen on.
+	/// TCP port for native MQTT.
 	pub port: u16,
+	/// Whether to also accept MQTT-over-WebSocket connections (for browser clients).
+	pub websocket: bool,
+	/// Port for the WebSocket listener (used only when `websocket` is true).
+	pub websocket_port: u16,
 	/// `listen(2)` backlog passed to each shard's socket.
 	pub listen_backlog: i32,
+}
+
+impl ServerConfig {
+	/// The WebSocket port when the listener is enabled, else `None`.
+	pub fn websocket_port(&self) -> Option<u16> {
+		self.websocket.then_some(self.websocket_port)
+	}
 }
 
 /// `[runtime]` — thread-per-core / glommio settings.
@@ -144,6 +155,16 @@ pub struct LimitsConfig {
 	pub keep_alive: u16,
 	/// Whether retained messages are accepted/served.
 	pub retain_available: bool,
+	/// Seconds a new socket has to send a valid CONNECT before it is dropped, so a
+	/// connection that opens but never authenticates can't tie up a slot.
+	pub connect_timeout: u16,
+	/// Upper bound on a client's negotiated Session Expiry Interval, in seconds
+	/// (`0` = no cap). Stops a client from pinning a session forever.
+	pub max_session_expiry: u32,
+	/// Maximum active subscriptions a single client may hold (`0` = unlimited).
+	pub max_subscriptions_per_client: usize,
+	/// Maximum distinct retained messages stored per shard (`0` = unlimited).
+	pub max_retained_messages: usize,
 }
 
 /// `[auth]` — connection authentication. When `allow_anonymous` is true and no
@@ -235,6 +256,8 @@ impl Default for ServerConfig {
 		Self {
 			bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
 			port: 1883,
+			websocket: true,
+			websocket_port: 1884,
 			listen_backlog: 1024,
 		}
 	}
@@ -273,6 +296,10 @@ impl Default for LimitsConfig {
 			max_qos: 2,
 			keep_alive: 60,
 			retain_available: true,
+			connect_timeout: 10,
+			max_session_expiry: 86_400,
+			max_subscriptions_per_client: 1024,
+			max_retained_messages: 100_000,
 		}
 	}
 }
@@ -307,6 +334,14 @@ impl Config {
 
 		if self.server.port == 0 {
 			return invalid("server.port must be non-zero");
+		}
+		if self.server.websocket {
+			if self.server.websocket_port == 0 {
+				return invalid("server.websocket_port must be non-zero when websocket is enabled");
+			}
+			if self.server.websocket_port == self.server.port {
+				return invalid("server.websocket_port must differ from server.port");
+			}
 		}
 		if self.server.listen_backlog <= 0 {
 			return invalid("server.listen_backlog must be positive");

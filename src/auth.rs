@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use sha2::{Digest, Sha256};
 
-use crate::broker::topic_trie::filter_matches;
+use crate::broker::topics::filter_matches;
 use crate::config::AuthConfig;
 
 /// A configured user's credential: either a plaintext password or a SHA-256 hash

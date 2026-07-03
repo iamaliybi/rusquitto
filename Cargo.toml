@@ -1,6 +1,6 @@
 [package]
 name = "rusquitto"
-version = "0.6.1"
+version = "1.0.0"
 edition = "2024"
 default-run = "rusquitto"
 
@@ -27,6 +27,6 @@ signal-hook = "0.4"
 # Password hashing (SHA-256 for `[[auth.users]]` password_hash)
 sha2 = "0.11"
 
-[[bin]]
-name = "mosquitto"
-path = "src/bin/mosquitto.rs"
+# WebSocket transport: RFC 6455 handshake (SHA-1 + base64 of Sec-WebSocket-Key)
+sha1 = "0.10"
+base64 = "0.22"

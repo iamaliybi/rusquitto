@@ -1,13 +1,14 @@
 use crate::auth::Authenticator;
-use crate::broker::engine::{MeshMsg, ShardState};
+use crate::broker::mesh::MeshMsg;
+use crate::broker::shard::ShardState;
 use crate::config::Config;
-use crate::metrics::Metrics;
-use crate::net::socket::create_socket;
-use crate::net::tcp_listener::create_tcp_listener;
 use crate::server::connection::Connection;
+use crate::telemetry::metrics::Metrics;
+use crate::transport::tcp::bind_listener;
+use crate::transport::websocket::WsStream;
 use futures_lite::FutureExt;
 use glommio::channels::channel_mesh::{Full, MeshBuilder};
-use glommio::net::TcpStream;
+use glommio::net::{TcpListener, TcpStream};
 use mqttbytes::{QoS, v5::Publish};
 use std::cell::Cell;
 use std::net::SocketAddr;
@@ -20,21 +21,21 @@ use tracing::Instrument;
 /// How often each shard reclaims suspended sessions past their expiry deadline.
 const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
-/// How often the accept loop wakes to check the shutdown flag. Bounds the
-/// shutdown latency; kept coarse so it barely touches the steady-state hot path.
+/// How often the accept loop wakes to check the shutdown flag while `accept()` is
+/// otherwise blocked. Bounds shutdown latency; coarse so it barely touches the hot path.
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Longest a shard waits for its connections to drain during shutdown before
-/// giving up and letting the executor tear down whatever remains.
+/// Longest a shard waits for its connections to drain during shutdown.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// How often the drain loop re-checks the live-connection count.
 const SHUTDOWN_DRAIN_POLL: Duration = Duration::from_millis(25);
 
-/// One turn of the accept loop: either a connection outcome, or a periodic tick
-/// that lets the loop re-check the shutdown flag while `accept()` is blocked.
+/// One turn of the accept loop: a connection on one of the listeners, or a
+/// periodic tick that lets the loop re-check the shutdown flag.
 enum AcceptTurn {
-	Accepted(TcpStream),
+	Tcp(TcpStream),
+	WebSocket(TcpStream),
 	Failed,
 	Tick,
 }
@@ -46,7 +47,6 @@ pub async fn init(
 	metrics: Arc<Metrics>,
 ) {
 	let shard_id: usize = glommio::executor().id();
-	let socket_addr = SocketAddr::new(config.server.bind, config.server.port);
 
 	// Join the full mesh. This rendezvous blocks until every shard has joined.
 	let (senders, mut receivers) = match mesh.join().await {
@@ -57,36 +57,44 @@ pub async fn init(
 		}
 	};
 
-	let socket = match create_socket(socket_addr, config.server.listen_backlog) {
+	let tcp_addr = SocketAddr::new(config.server.bind, config.server.port);
+	let tcp_listener = match bind_listener(tcp_addr, config.server.listen_backlog) {
 		Ok(l) => l,
 		Err(e) => {
-			tracing::error!(shard = shard_id, error = %e, "failed to bind listener");
+			tracing::error!(shard = shard_id, error = %e, "failed to bind TCP listener");
 			return;
 		}
 	};
 
-	let tcp_listener = create_tcp_listener(socket);
+	// Optional WebSocket listener for browser clients.
+	let ws_listener: Option<TcpListener> = match config.server.websocket_port() {
+		Some(port) => {
+			let addr = SocketAddr::new(config.server.bind, port);
+			match bind_listener(addr, config.server.listen_backlog) {
+				Ok(l) => Some(l),
+				Err(e) => {
+					tracing::error!(shard = shard_id, error = %e, "failed to bind WebSocket listener");
+					return;
+				}
+			}
+		}
+		None => None,
+	};
 
 	// Mesh peer id is 0-based and unique per shard (glommio executor ids are
-	// 1-based, so they can't be used to pick a single shard). Peer 0 is elected
-	// to publish the broker-wide `$SYS` metrics.
+	// 1-based). Peer 0 publishes broker-wide `$SYS` metrics.
 	let mesh_peer_id = senders.peer_id();
 
-	// Shard-local broker state. Shared by Rc between every connection on this
-	// shard; never crosses the core boundary, so no locking is required.
+	// Shard-local broker state, shared by Rc between every connection on this shard.
 	let state = ShardState::new();
 	state.borrow_mut().set_mesh(senders);
 
-	// Drain inbound cross-shard messages. A forwarded publish is re-wrapped in Rc
-	// and fanned out to this shard's local subscribers, exactly as a local publish
-	// would be; a control message drives cross-shard session migration.
+	// Drain inbound cross-shard messages into local fan-out / migration handling.
 	for (_producer, receiver) in receivers.streams() {
 		let state = state.clone();
 		glommio::spawn_local(async move {
 			while let Some(msg) = receiver.recv().await {
 				match msg {
-					// Mesh-forwarded: the publisher is on another shard, so No Local
-					// never applies here.
 					MeshMsg::Publish(publish) => state.borrow_mut().deliver_local(publish, None),
 					MeshMsg::Control(control) => state.borrow_mut().on_control(*control),
 				}
@@ -95,14 +103,13 @@ pub async fn init(
 		.detach();
 	}
 
-	// Periodically reclaim suspended sessions whose expiry has lapsed.
+	// Periodically reclaim suspended sessions whose expiry has lapsed and publish any
+	// delayed wills that have now come due (best-effort mesh forward, like `$SYS`).
 	{
 		let state = state.clone();
 		glommio::spawn_local(async move {
 			loop {
 				glommio::timer::sleep(SESSION_SWEEP_INTERVAL).await;
-				// Reclaim lapsed sessions and publish any Will Messages whose delay
-				// interval has now elapsed (best-effort mesh forward, like `$SYS`).
 				let wills = state.borrow_mut().sweep_expired();
 				for will in wills {
 					let mut shard_state = state.borrow_mut();
@@ -114,9 +121,8 @@ pub async fn init(
 		.detach();
 	}
 
-	// One shard owns publishing `$SYS` metrics (they are broker-wide totals, so a
-	// single publisher avoids duplicates). Messages are retained and broadcast to
-	// every shard, so any `$SYS/#` subscriber — on any shard — sees them.
+	// One shard owns publishing `$SYS` metrics (broker-wide totals). Messages are
+	// retained and broadcast to every shard, so any `$SYS/#` subscriber sees them.
 	if mesh_peer_id == 0 && config.sys.enabled {
 		let state = state.clone();
 		let metrics = metrics.clone();
@@ -137,7 +143,11 @@ pub async fn init(
 		.detach();
 	}
 
-	tracing::info!(shard = shard_id, "shard ready, accepting connections");
+	tracing::info!(
+		shard = shard_id,
+		websocket = config.server.websocket,
+		"shard ready, accepting connections"
+	);
 
 	let limits = config.limits;
 	let max_conns = limits.max_connections_per_shard;
@@ -151,19 +161,18 @@ pub async fn init(
 			"authentication configured"
 		);
 	}
-	// Shard-local live-connection counter (single-threaded, so a plain Cell).
 	let conn_count = Rc::new(Cell::new(0usize));
 
 	while !shutdown.load(Ordering::Relaxed) {
-		// Race the (otherwise unbounded) accept against a periodic tick so a
-		// shutdown signal is noticed even while no client is connecting. `.or`
-		// polls the accept first, so a ready connection is never lost to the tick.
+		// Race the accept(s) against a periodic tick so a shutdown signal is noticed
+		// even while no client is connecting. `.or` polls in order, so a ready
+		// connection is never lost to the tick.
 		let turn = {
-			let accept = async {
+			let accept_tcp = async {
 				match tcp_listener.accept().await {
-					Ok(stream) => AcceptTurn::Accepted(stream),
+					Ok(stream) => AcceptTurn::Tcp(stream),
 					Err(e) => {
-						tracing::warn!(shard = shard_id, error = %e, "accept failed");
+						tracing::warn!(shard = shard_id, error = %e, "TCP accept failed");
 						AcceptTurn::Failed
 					}
 				}
@@ -172,11 +181,26 @@ pub async fn init(
 				glommio::timer::sleep(SHUTDOWN_POLL_INTERVAL).await;
 				AcceptTurn::Tick
 			};
-			accept.or(tick).await
+			match &ws_listener {
+				Some(ws) => {
+					let accept_ws = async {
+						match ws.accept().await {
+							Ok(stream) => AcceptTurn::WebSocket(stream),
+							Err(e) => {
+								tracing::warn!(shard = shard_id, error = %e, "WebSocket accept failed");
+								AcceptTurn::Failed
+							}
+						}
+					};
+					accept_tcp.or(accept_ws).or(tick).await
+				}
+				None => accept_tcp.or(tick).await,
+			}
 		};
 
-		let stream = match turn {
-			AcceptTurn::Accepted(stream) => stream,
+		let (stream, is_websocket) = match turn {
+			AcceptTurn::Tcp(stream) => (stream, false),
+			AcceptTurn::WebSocket(stream) => (stream, true),
 			AcceptTurn::Failed | AcceptTurn::Tick => continue,
 		};
 
@@ -196,19 +220,15 @@ pub async fn init(
 		let auth = auth.clone();
 		let metrics = metrics.clone();
 		let shutdown = shutdown.clone();
-		// One span per connection. `client_id` is recorded later, once the
-		// client sends CONNECT, so every log line for this connection — on
-		// either side of an `.await` — automatically carries it.
 		let span = tracing::info_span!(
 			"connection",
 			shard = shard_id,
+			websocket = is_websocket,
 			client_id = tracing::field::Empty,
 		);
 		glommio::spawn_local(
 			async move {
-				let mut connection =
-					Connection::new(stream, shard_id, state, limits, auth, metrics, shutdown);
-				let _ = connection.run().await;
+				serve(stream, is_websocket, shard_id, state, limits, auth, metrics, shutdown).await;
 				counter.set(counter.get() - 1);
 			}
 			.instrument(span),
@@ -216,9 +236,8 @@ pub async fn init(
 		.detach();
 	}
 
-	// Drain: wake every live connection (closing its mailbox → `Outgoing(None)`)
-	// so it sends DISCONNECT and runs its own cleanup, then wait for them to
-	// finish (bounded) before returning and letting the executor tear down.
+	// Drain: wake every live connection so it sends DISCONNECT and cleans up, then
+	// wait (bounded) for them to finish before returning.
 	let live = conn_count.get();
 	tracing::info!(
 		shard = shard_id,
@@ -231,9 +250,34 @@ pub async fn init(
 	while conn_count.get() > 0 && Instant::now() < deadline {
 		glommio::timer::sleep(SHUTDOWN_DRAIN_POLL).await;
 	}
-	tracing::info!(
-		shard = shard_id,
-		remaining = conn_count.get(),
-		"shard stopped"
-	);
+	tracing::info!(shard = shard_id, remaining = conn_count.get(), "shard stopped");
+}
+
+/// Serves one accepted socket. A WebSocket socket first completes the RFC 6455
+/// handshake (yielding a framed `ByteStream`); either way the same `Connection`
+/// state machine drives the MQTT session over the resulting stream.
+#[allow(clippy::too_many_arguments)]
+async fn serve(
+	stream: TcpStream,
+	is_websocket: bool,
+	shard_id: usize,
+	state: Rc<std::cell::RefCell<ShardState>>,
+	limits: crate::config::LimitsConfig,
+	auth: Rc<Authenticator>,
+	metrics: Arc<Metrics>,
+	shutdown: Arc<AtomicBool>,
+) {
+	if is_websocket {
+		match WsStream::accept(stream, limits.max_payload_size).await {
+			Ok(ws) => {
+				let mut conn =
+					Connection::new(ws, shard_id, state, limits, auth, metrics, shutdown);
+				let _ = conn.run().await;
+			}
+			Err(e) => tracing::warn!(error = %e, "WebSocket handshake failed"),
+		}
+	} else {
+		let mut conn = Connection::new(stream, shard_id, state, limits, auth, metrics, shutdown);
+		let _ = conn.run().await;
+	}
 }
