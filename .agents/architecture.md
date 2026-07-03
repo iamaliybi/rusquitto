@@ -81,7 +81,7 @@ DISCONNECT/EOF ──▶ close_session(gen, expiry)
 ```
 
 **Caveat:** sessions are shard-local; `SO_REUSEPORT` may rehash a reconnecting client to another shard.
-Exact resume within a shard; always exact for `runtime.shards = 1`. See [next-steps.md](next-steps.md).
+Exact resume within a shard; always exact for `runtime.cores = 1`. See [next-steps.md](next-steps.md).
 
 ### Packet Buffer Strategy
 

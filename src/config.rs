@@ -71,11 +71,10 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfig {
-	/// Explicit number of shards (executors) to spawn. When omitted, it is
-	/// derived from the online core count and [`cpu_fraction`](Self::cpu_fraction).
-	pub shards: Option<usize>,
-	/// Fraction of online cores to use when `shards` is not set (e.g. `0.75`).
-	pub cpu_fraction: f64,
+	/// Number of CPU cores to run on — the broker pins one shard (executor) per
+	/// core, so this is also the shard count. When omitted, every online core is
+	/// used; a value larger than the online core count is clamped down to it.
+	pub cores: Option<usize>,
 	/// CPU placement / affinity strategy for the executor pool.
 	pub placement: Placement,
 	/// Per-link capacity of the inter-shard channel mesh.
@@ -256,8 +255,7 @@ impl Default for ServerConfig {
 impl Default for RuntimeConfig {
 	fn default() -> Self {
 		Self {
-			shards: None,
-			cpu_fraction: 0.75,
+			cores: None,
 			placement: Placement::MaxSpread,
 			mesh_capacity: 1024,
 		}
@@ -325,11 +323,8 @@ impl Config {
 		if self.server.listen_backlog <= 0 {
 			return invalid("server.listen_backlog must be positive");
 		}
-		if let Some(0) = self.runtime.shards {
-			return invalid("runtime.shards must be at least 1 when set");
-		}
-		if !(self.runtime.cpu_fraction > 0.0 && self.runtime.cpu_fraction <= 1.0) {
-			return invalid("runtime.cpu_fraction must be in the range (0.0, 1.0]");
+		if let Some(0) = self.runtime.cores {
+			return invalid("runtime.cores must be at least 1 when set");
 		}
 		if self.runtime.mesh_capacity == 0 {
 			return invalid("runtime.mesh_capacity must be non-zero");
@@ -376,14 +371,12 @@ impl Config {
 		Ok(())
 	}
 
-	/// Number of shards to spawn given the count of online cores: the explicit
-	/// `runtime.shards`, otherwise `online * cpu_fraction` (at least 1).
+	/// Number of shards to spawn (one per core) given the count of online cores:
+	/// `runtime.cores` when set, otherwise every online core. A requested count
+	/// above the online cores is clamped down to them, and the result is at least 1.
 	pub fn resolved_shards(&self, online_cores: usize) -> usize {
-		let n = match self.runtime.shards {
-			Some(s) => s,
-			None => ((online_cores as f64) * self.runtime.cpu_fraction).round() as usize,
-		};
-		n.max(1)
+		let online = online_cores.max(1);
+		self.runtime.cores.unwrap_or(online).clamp(1, online)
 	}
 }
 

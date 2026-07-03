@@ -116,7 +116,7 @@ The schema has four sections:
 | Section     | Controls                                                                    |
 |-------------|-----------------------------------------------------------------------------|
 | `[server]`  | `bind`, `port`, `listen_backlog`                                            |
-| `[runtime]` | shard count (`shards` / `cpu_fraction`), CPU `placement`, `mesh_capacity`   |
+| `[runtime]` | `cores` (CPU cores / shard count), CPU `placement`, `mesh_capacity`          |
 | `[logging]` | `level`, `dir`, log/error file names, `enable_terminal`, `format`           |
 | `[limits]`  | `max_connections_per_shard`, `max_payload_size`, `max_qos`, `keep_alive`, … |
 

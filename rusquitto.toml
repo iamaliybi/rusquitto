@@ -9,8 +9,7 @@
 
 # -----------------------------------------------------------------------------
 # [server] — network ingress
-# All shards bind this same address/port using SO_REUSEPORT; the kernel load-
-# balances incoming connections across them.
+# All shards bind this same address/port using SO_REUSEPORT; the kernel load-balances incoming connections across them.
 # -----------------------------------------------------------------------------
 [server]
 bind = "0.0.0.0"        # IP to bind (IPv4 or IPv6). Default: "127.0.0.1"
@@ -21,10 +20,9 @@ listen_backlog = 1024   # listen(2) backlog per shard. Default: 1024
 # [runtime] — thread-per-core / glommio settings
 # -----------------------------------------------------------------------------
 [runtime]
-# Number of shards (pinned executors). Omit to derive it from the online core
-# count times `cpu_fraction`. Uncomment to pin an exact count:
-# shards = 4
-cpu_fraction = 0.75     # Fraction of cores to use when `shards` is unset. Default: 0.75
+# Number of CPU cores to run on (one shard/executor per core). Omit to use every
+# online core; a value above the online count is clamped down. Uncomment to pin:
+# cores = 8
 placement = "max-spread"  # "max-spread" | "max-pack" | "unbound". Default: "max-spread"
 mesh_capacity = 1024    # Per-link buffer of the inter-shard channel mesh. Default: 1024
 

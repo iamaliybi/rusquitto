@@ -41,14 +41,11 @@ listen_backlog = 1024
 # -----------------------------------------------------------------------------
 [runtime]
 
-# Explicit number of shards (pinned executors) to spawn.
-# When unset, the count is derived as round(online_cores * cpu_fraction).
-# Type: integer (>= 1) or unset   Default: unset (auto)
-# shards = 4
-
-# Fraction of online cores to use when `shards` is unset.
-# Type: float (0.0 < x <= 1.0)    Default: 0.75
-cpu_fraction = 0.75
+# Number of CPU cores to run on. The broker pins one shard (executor) per core,
+# so this is also the shard count. When unset, every online core is used; a value
+# larger than the online core count is clamped down to it.
+# Type: integer (>= 1) or unset   Default: unset (all online cores)
+# cores = 8
 
 # CPU placement / affinity strategy, mapped onto glommio's PoolPlacement:
 #   "max-spread" — spread shards across cores / NUMA nodes (best latency)
