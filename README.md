@@ -191,6 +191,26 @@ Known edges, deliberately out of scope for 1.0 (tracked in `.agents/progress.md`
   salting or a slow KDF (Argon2/bcrypt) yet, and no enhanced (SASL-style) authentication. Anonymous clients
   bypass ACL (they are unrestricted). Protect the config file with restrictive permissions regardless.
 
+## Development
+
+```sh
+cargo build            # debug build
+cargo test             # unit tests (broker routing, connection state machine, config, auth, topics…)
+cargo clippy --all-targets -- -D warnings
+cargo fmt --all        # format to the repo's rustfmt.toml
+```
+
+The connection state machine is unit-tested over an in-memory `ByteStream` mock, so the full MQTT handshake
+and packet handling run without sockets (see `src/server/connection/tests.rs`).
+
+Enable the shared git hook so formatting, lint, and the test suite run before every commit:
+
+```sh
+./.githooks/install.sh     # sets core.hooksPath to .githooks
+```
+
+The hook only runs when Rust sources are staged; bypass it in an emergency with `git commit --no-verify`.
+
 ## Releases
 
 Version history is in [CHANGELOG.md](CHANGELOG.md); each release is tagged and published on

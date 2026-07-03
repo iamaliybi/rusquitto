@@ -1,0 +1,25 @@
+#!/bin/sh
+#
+# rusquitto pre-commit hook: format, lint, and test before every commit.
+#
+# Enable it once per clone with:
+#     git config core.hooksPath .githooks
+# (or run ./.githooks/install.sh). To bypass in an emergency: git commit --no-verify.
+
+set -e
+
+# Run from the repository root so cargo finds the manifest regardless of the
+# subdirectory the commit was invoked from.
+cd "$(git rev-parse --show-toplevel)"
+
+# Nothing to check if no Rust sources are staged.
+if git diff --cached --name-only --diff-filter=ACM | grep -q '\.rs$'; then
+	echo "pre-commit: cargo fmt --check"
+	cargo fmt --all -- --check
+
+	echo "pre-commit: cargo clippy (warnings are errors)"
+	cargo clippy --all-targets -- -D warnings
+
+	echo "pre-commit: cargo test"
+	cargo test --quiet
+fi

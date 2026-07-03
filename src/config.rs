@@ -100,7 +100,8 @@ pub enum Placement {
 	Unbound,
 }
 
-/// `[logging]` — integrates with the non-blocking `tracing` setup in `logger.rs`.
+/// `[logging]` — integrates with the non-blocking `tracing` setup in
+/// `telemetry/logging.rs`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LoggingConfig {
@@ -420,3 +421,93 @@ impl fmt::Display for ConfigError {
 }
 
 impl std::error::Error for ConfigError {}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// A user with a single plaintext credential (the common valid case).
+	fn user(name: &str) -> UserConfig {
+		UserConfig {
+			username: name.to_string(),
+			password: Some("pw".to_string()),
+			password_hash: None,
+			publish: None,
+			subscribe: None,
+		}
+	}
+
+	#[test]
+	fn default_config_passes_validation() {
+		assert!(Config::default().validate().is_ok());
+	}
+
+	#[test]
+	fn websocket_port_must_differ_from_tcp_port() {
+		let mut c = Config::default();
+		c.server.websocket = true;
+		c.server.websocket_port = c.server.port;
+		assert!(c.validate().is_err());
+	}
+
+	#[test]
+	fn websocket_port_clash_ignored_when_websocket_disabled() {
+		let mut c = Config::default();
+		c.server.websocket = false;
+		c.server.websocket_port = c.server.port;
+		assert!(c.validate().is_ok());
+	}
+
+	#[test]
+	fn max_qos_above_two_is_rejected() {
+		let mut c = Config::default();
+		c.limits.max_qos = 3;
+		assert!(c.validate().is_err());
+	}
+
+	#[test]
+	fn duplicate_usernames_are_rejected() {
+		let mut c = Config::default();
+		c.auth.users = vec![user("alice"), user("alice")];
+		assert!(c.validate().is_err());
+	}
+
+	#[test]
+	fn user_must_set_exactly_one_credential() {
+		let mut c = Config::default();
+		let mut both = user("bob");
+		both.password_hash = Some("a".repeat(64));
+		c.auth.users = vec![both];
+		assert!(c.validate().is_err(), "both credentials set");
+
+		let mut neither = user("bob");
+		neither.password = None;
+		c.auth.users = vec![neither];
+		assert!(c.validate().is_err(), "no credential set");
+	}
+
+	#[test]
+	fn password_hash_must_be_64_hex_chars() {
+		let mut c = Config::default();
+		let mut u = user("carol");
+		u.password = None;
+		u.password_hash = Some("not-hex".to_string());
+		c.auth.users = vec![u];
+		assert!(c.validate().is_err());
+	}
+
+	#[test]
+	fn resolved_shards_clamps_to_online_cores() {
+		let mut c = Config::default();
+		c.runtime.cores = Some(8);
+		assert_eq!(c.resolved_shards(4), 4, "requested above online is clamped");
+		c.runtime.cores = Some(2);
+		assert_eq!(
+			c.resolved_shards(4),
+			2,
+			"requested below online is honoured"
+		);
+		c.runtime.cores = None;
+		assert_eq!(c.resolved_shards(4), 4, "unset uses all online cores");
+	}
+}
