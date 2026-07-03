@@ -49,6 +49,9 @@ isolated, shard-local executor — no `Mutex`, no `RwLock`, no work-stealing.
   spans tagged with `client_id`, and redaction of passwords and payloads.
 - **Subscription options** — MQTT 5 **No Local**, **Retain As Published**, and **Retain Handling**
   (`OnEverySubscribe` / `OnNewSubscribe` / `Never`) are all honored on the SUBSCRIBE path.
+- **Subscription identifiers** — a SUBSCRIBE's Subscription Identifier is stored and echoed on every matching
+  PUBLISH so the client can tell which subscription produced a message; all matching identifiers are delivered
+  when several of a client's subscriptions match.
 - **Shared subscriptions** — `$share/{group}/{filter}` groups load-balance: each matching message goes to just
   one member of the group (round-robin, preferring connected members), while ordinary subscribers still each get
   a copy. Retained messages are not replayed to shared subscriptions. *(Load balancing is per-shard — see
@@ -157,10 +160,9 @@ Deliberately out of scope for now (tracked in `.agents/progress.md`):
   one member per shard rather than exactly one across the cluster. Fully single-delivery for `runtime.shards = 1`
   or when a group's members share a shard; globally-coordinated shared delivery is future work (overlaps the
   cross-shard items above).
-- **No outbound topic aliases or subscription identifiers.** The broker accepts *inbound* topic aliases but never
-  assigns aliases on the publishes it sends, and it doesn't support subscription identifiers (CONNACK advertises
-  both as unavailable). Delayed wills are forwarded to peer shards best-effort (the sweep timer uses a
-  non-blocking mesh send).
+- **No outbound topic aliases.** The broker accepts *inbound* topic aliases but never assigns aliases on the
+  publishes it sends (CONNACK advertises none outbound). Delayed wills are forwarded to peer shards best-effort
+  (the sweep timer uses a non-blocking mesh send).
 - **Passwords: plaintext or SHA-256.** A `password_hash` avoids storing the secret in the clear, but there is no
   salting or a slow KDF (Argon2/bcrypt) yet, and no enhanced (SASL-style) authentication. Anonymous clients
   bypass ACL (they are unrestricted). Protect the config file with restrictive permissions regardless.

@@ -5,6 +5,21 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (pre-1.0: the minor
 version is bumped for new features, the patch version for fixes).
 
+## [0.5.0] - 2026-07-03
+
+### Added
+
+- **Subscription identifiers** — a client may attach a Subscription Identifier to a
+  SUBSCRIBE; the broker stores it and echoes it on every matching PUBLISH, so the
+  client can tell which subscription produced a message. When several of a client's
+  subscriptions match one publish, all their identifiers are delivered. CONNACK now
+  advertises subscription-identifier support.
+
+### Fixed
+
+- A delivered PUBLISH no longer carries the publisher's Topic Alias (that property
+  is scoped to the publisher's connection); it is stripped on the way out.
+
 ## [0.4.0] - 2026-07-03
 
 ### Added
@@ -85,6 +100,8 @@ All changes are additive; there are no breaking changes to existing behavior.
   SUBSCRIBE/UNSUBSCRIBE, PINGREQ/PINGRESP, DISCONNECT; topic-trie wildcard
   matching (`+` / `#`); retained messages; cross-shard routing over a glommio
   channel mesh; structured `tracing` logging; and TOML configuration with a CLI.
+
+[0.5.0]: https://github.com/iamaliybi/rusquitto/releases/tag/v0.5.0
 
 [0.4.0]: https://github.com/iamaliybi/rusquitto/releases/tag/v0.4.0
 

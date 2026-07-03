@@ -68,14 +68,19 @@ pub struct Delivery {
 	/// fan-out, but kept for a Retain-As-Published subscriber, and set for a
 	/// retained-message replay.
 	pub retain: bool,
+	/// Subscription Identifiers to echo on the delivered PUBLISH (MQTT 5), gathered
+	/// from every matching subscription of this client. Usually empty or one.
+	pub sub_ids: Vec<usize>,
 }
 
 /// The chosen subscription for a client during routing: the options of its
-/// highest-QoS matching filter.
+/// highest-QoS matching filter, plus the identifiers of *all* its matching
+/// subscriptions (MQTT 5 delivers every matching Subscription Identifier).
 struct Match {
 	qos: QoS,
 	nolocal: bool,
 	retain_as_published: bool,
+	sub_ids: Vec<usize>,
 }
 
 /// Sender half of a connection's mailbox.
@@ -139,8 +144,9 @@ pub struct MigratedSession {
 	pub incoming_qos2: HashMap<u16, Publish>,
 	/// Where the outbound packet-id allocator left off.
 	pub next_pkid: u16,
-	/// QoS > 0 messages buffered while offline, as owned `(publish, qos, retain)`.
-	pub offline: Vec<(Publish, QoS, bool)>,
+	/// QoS > 0 messages buffered while offline, as owned
+	/// `(publish, qos, retain, sub_ids)`.
+	pub offline: Vec<(Publish, QoS, bool, Vec<usize>)>,
 }
 
 /// One migrated subscription (a flattened [`TopicTrie`] entry).
@@ -150,6 +156,7 @@ pub struct MigratedSub {
 	pub nolocal: bool,
 	pub retain_as_published: bool,
 	pub share_group: Option<String>,
+	pub sub_id: Option<usize>,
 }
 
 /// Durable per-client session state, keyed by `client_id` in [`ShardState`].
@@ -376,15 +383,14 @@ impl ShardState {
 			.trie
 			.take_client(client_id)
 			.into_iter()
-			.map(
-				|(filter, qos, nolocal, retain_as_published, share_group)| MigratedSub {
-					filter,
-					qos,
-					nolocal,
-					retain_as_published,
-					share_group,
-				},
-			)
+			.map(|f| MigratedSub {
+				filter: f.filter,
+				qos: f.qos,
+				nolocal: f.nolocal,
+				retain_as_published: f.retain_as_published,
+				share_group: f.share_group,
+				sub_id: f.sub_id,
+			})
 			.collect();
 
 		let session = self
@@ -394,7 +400,7 @@ impl ShardState {
 		let offline = session
 			.offline_queue
 			.into_iter()
-			.map(|d| ((*d.publish).clone(), d.qos, d.retain))
+			.map(|d| ((*d.publish).clone(), d.qos, d.retain, d.sub_ids))
 			.collect();
 
 		MigratedSession {
@@ -426,16 +432,18 @@ impl ShardState {
 				sub.nolocal,
 				sub.retain_as_published,
 				sub.share_group.as_deref(),
+				sub.sub_id,
 			);
 		}
 
 		let offline = migrated
 			.offline
 			.into_iter()
-			.map(|(publish, qos, retain)| Delivery {
+			.map(|(publish, qos, retain, sub_ids)| Delivery {
 				publish: Rc::new(publish),
 				qos,
 				retain,
+				sub_ids,
 			})
 			.collect();
 
@@ -511,6 +519,7 @@ impl ShardState {
 	/// The filter may contain the `+` and `#` wildcards. Re-subscribing replaces
 	/// the prior entry. Returns `true` if the subscription is new (for Retain
 	/// Handling).
+	#[allow(clippy::too_many_arguments)]
 	pub fn subscribe(
 		&mut self,
 		filter: &str,
@@ -519,9 +528,17 @@ impl ShardState {
 		nolocal: bool,
 		retain_as_published: bool,
 		share_group: Option<&str>,
+		sub_id: Option<usize>,
 	) -> bool {
-		self.trie
-			.insert(filter, client_id, qos, nolocal, retain_as_published, share_group)
+		self.trie.insert(
+			filter,
+			client_id,
+			qos,
+			nolocal,
+			retain_as_published,
+			share_group,
+			sub_id,
+		)
 	}
 
 	/// Removes a single subscription (used by UNSUBSCRIBE). `share_group` selects
@@ -605,11 +622,19 @@ impl ShardState {
 				qos: sub.qos,
 				nolocal: sub.nolocal,
 				retain_as_published: sub.retain_as_published,
+				sub_ids: Vec::new(),
 			});
 			if (sub.qos as u8) > (entry.qos as u8) {
 				entry.qos = sub.qos;
 				entry.nolocal = sub.nolocal;
 				entry.retain_as_published = sub.retain_as_published;
+			}
+			// Every matching subscription's identifier is delivered (MQTT 5),
+			// regardless of which one won the QoS tie-break.
+			if let Some(id) = sub.sub_id
+				&& !entry.sub_ids.contains(&id)
+			{
+				entry.sub_ids.push(id);
 			}
 		}
 
@@ -621,7 +646,7 @@ impl ShardState {
 			}
 			let qos = min_qos(publish.qos, m.qos);
 			let retain = was_retained && m.retain_as_published;
-			self.deliver_to(&client_id, &publish, qos, retain);
+			self.deliver_to(&client_id, &publish, qos, retain, m.sub_ids);
 		}
 
 		// Shared groups: one member each, round-robin (preferring connected members
@@ -650,14 +675,22 @@ impl ShardState {
 			let m = &members[&client_id];
 			let qos = min_qos(publish.qos, m.qos);
 			let retain = was_retained && m.retain_as_published;
-			self.deliver_to(&client_id, &publish, qos, retain);
+			self.deliver_to(&client_id, &publish, qos, retain, m.sub_ids.clone());
 		}
 	}
 
 	/// Delivers one message to a single client's session: straight to its live
 	/// mailbox if connected, otherwise buffered in its offline queue (QoS > 0 only;
-	/// QoS 0 is dropped for a suspended session).
-	fn deliver_to(&mut self, client_id: &str, publish: &Rc<Publish>, qos: QoS, retain: bool) {
+	/// QoS 0 is dropped for a suspended session). `sub_ids` are the Subscription
+	/// Identifiers to echo on the delivered PUBLISH.
+	fn deliver_to(
+		&mut self,
+		client_id: &str,
+		publish: &Rc<Publish>,
+		qos: QoS,
+		retain: bool,
+		sub_ids: Vec<usize>,
+	) {
 		let Some(session) = self.sessions.get_mut(client_id) else {
 			return;
 		};
@@ -667,6 +700,7 @@ impl ShardState {
 					publish: publish.clone(),
 					qos,
 					retain,
+					sub_ids,
 				});
 			}
 			None if qos != QoS::AtMostOnce => {
@@ -677,6 +711,7 @@ impl ShardState {
 					publish: publish.clone(),
 					qos,
 					retain,
+					sub_ids,
 				});
 			}
 			None => {}

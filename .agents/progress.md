@@ -285,6 +285,24 @@ A bundle of remaining MQTT 5 / ops items, shipped together.
 Inbound Receive Maximum is a guard on the QoS 2 receive path (a conforming client can't exceed the quota it was
 told), so it's covered by construction plus the unchanged QoS 2 flow.
 
+## Phase 3n — Subscription identifiers (2026-07-03)
+
+MQTT 5 Subscription Identifiers: a client tags a SUBSCRIBE with an id and the broker echoes it on matching
+deliveries. Post-v0.4.0; bumps to 0.5.0.
+
+| Item | Description | Status |
+|------|-------------|--------|
+| Trie | `Subscription` gains `sub_id: Option<usize>`; `insert` takes it. `take_client` now returns `FlatSub` structs (replacing the growing tuple), carrying `sub_id` for migration | ✅ |
+| Route | `Match` and `Delivery` gain `sub_ids: Vec<usize>`; `route` accumulates the identifiers of *every* matching subscription per client (not just the QoS winner) and `deliver_to` threads them onto the `Delivery` | ✅ |
+| Send | `send_publish` takes `sub_ids` and sets `PublishProperties.subscription_identifiers`; also **strips the publisher's `topic_alias`** on delivery (it's connection-scoped — a latent bug from the inbound-alias work) while passing other v5 properties through | ✅ |
+| Subscribe | `handle_subscribe` reads `SubscribeProperties.id` (one per SUBSCRIBE, applies to all its filters) and passes it through; retained replays carry it too | ✅ |
+| CONNACK | `subscription_identifiers_available` flipped `0 → 1` | ✅ |
+| Migration | `MigratedSub` + the offline-queue tuple carry `sub_id` / `sub_ids`, so identifiers survive cross-shard resume | ✅ |
+
+**Verification (paho-mqtt v5, `runtime.shards = 1`):** all PASS — a subscription with id 42 → delivery carries
+`[42]`; two overlapping subscriptions (ids 1 and 2, distinct SUBSCRIBEs) → a single delivery carrying **both**
+`[1, 2]`; a subscription with no id → delivery carries none. 14/14 unit tests pass.
+
 ## Architecture decisions locked in
 
 - **Mailbox payload:** `Rc<Publish>` for local fan-out; the mesh carries owned `Publish`, re-wrapped in `Rc` on the
