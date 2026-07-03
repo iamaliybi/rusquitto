@@ -22,7 +22,7 @@ use tracing::level_filters::LevelFilter;
 use tracing_appender::non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard};
 use tracing_appender::rolling;
 use tracing_subscriber::{
-	filter::EnvFilter, fmt, layer::SubscriberExt, reload, util::SubscriberInitExt, Layer, Registry,
+	Layer, Registry, filter::EnvFilter, fmt, layer::SubscriberExt, reload, util::SubscriberInitExt,
 };
 
 /// Handle to the global verbosity filter. Call [`ReloadHandle::set`] to change log
@@ -86,8 +86,7 @@ pub fn init(config: Config<'_>) -> std::io::Result<Guards> {
 	std::fs::create_dir_all(config.dir)?;
 
 	// Dynamic, per-module verbosity. RUST_LOG wins; otherwise the configured default.
-	let env_filter = EnvFilter::try_from_default_env()
-		.unwrap_or_else(|_| EnvFilter::new(config.default_filter));
+	let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(config.default_filter));
 	let (env_filter, reload) = reload::Layer::new(env_filter);
 
 	// --- Main rotating JSON log (all levels permitted by the filter) ---
@@ -129,11 +128,7 @@ pub fn init(config: Config<'_>) -> std::io::Result<Guards> {
 		.with(error_layer)
 		.init();
 
-	Ok(Guards {
-		_app: app_guard,
-		_err: err_guard,
-		reload,
-	})
+	Ok(Guards { _app: app_guard, _err: err_guard, reload })
 }
 
 /// Wraps a rolling appender in a lossy, non-blocking writer.

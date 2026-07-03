@@ -1,0 +1,6 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Compiled Rust hammer (build with: rustc -O stresser.rs -o stresser)
+/stresser

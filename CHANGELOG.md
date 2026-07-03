@@ -2,8 +2,57 @@
 
 All notable changes to rusquitto are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html) (pre-1.0: the minor
-version is bumped for new features, the patch version for fixes).
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html): from 1.0 on, the major
+version bumps for breaking changes, the minor for features, and the patch for fixes.
+
+## [1.0.0] - 2026-07-03
+
+First production release. Adds a WebSocket transport, a production security pass,
+and a memory optimization, on top of a restructured, SOLID-leaning codebase.
+
+### Added
+
+- **WebSocket transport (`:1884`).** Browser and Node clients can speak MQTT over
+  WebSocket (RFC 6455 server handshake, `mqtt` subprotocol, binary frames) without
+  a TCP bridge. Enabled by default; `[server] websocket` / `websocket_port` control
+  it. Introduces a `ByteStream` transport abstraction so the MQTT state machine is
+  written once and runs over both TCP and WebSocket.
+- **Connection hardening.** The first packet must be CONNECT and only one is allowed
+  (closing a pre-auth PUBLISH/SUBSCRIBE bypass); a socket that never sends CONNECT is
+  dropped after `limits.connect_timeout` — including a stalled **WebSocket handshake**,
+  which is bounded by the same timeout; an idle connection is dropped at 1.5× the
+  negotiated keep-alive.
+- **Topic reservation and validation.** Client PUBLISHes to `$`-prefixed topics
+  (e.g. spoofing `$SYS`) or to wildcard/empty/NUL topics are rejected, and malformed
+  SUBSCRIBE filters are refused per-filter.
+- **Resource caps** (`[limits]`): `max_session_expiry`, `max_subscriptions_per_client`,
+  `max_retained_messages` (per shard), a bounded per-connection outbound queue, and
+  client-id length/charset validation. The per-connection outbound **mailbox is
+  bounded**, so a subscriber that stops reading its socket can't force unbounded broker
+  memory growth (excess deliveries to that stuck consumer are dropped). WebSocket
+  control frames are validated (≤125 bytes, unfragmented) per RFC 6455.
+- **Topic/filter depth cap** (128 levels). The subscription trie is walked recursively,
+  so an unbounded-depth topic could overflow the executor stack (an uncatchable abort)
+  and a deep SUBSCRIBE could balloon trie memory; both are now rejected up front.
+- **Panic-safe connection accounting.** The live-connection count is released through
+  an RAII guard, so a task that panics can't leak a slot and eventually wedge the shard.
+- **Per-IP connection cap** (`limits.max_connections_per_ip`, `0` = unlimited). Bounds
+  how many concurrent connections one client IP may hold on a shard, limiting a
+  single-source connection flood. Per-shard, and most useful for direct clients — behind
+  a reverse proxy every connection shares the proxy IP, so rely on the proxy/network
+  layer there. The broker also warns at startup when `keep_alive = 0`, since that
+  disables idle-connection reaping.
+
+### Changed
+
+- **Constant-time credential comparison**, plus a throwaway hash for unknown users so
+  authentication timing doesn't reveal whether a username exists. Server-assigned
+  client ids are now unguessable (per-process random + counter) rather than sequential.
+- **Topic-trie memory:** trie levels are keyed by interned `Rc<str>` segments, so a
+  segment that recurs across many filters is stored once.
+- **Project layout:** split into cohesive layers — `lib.rs` + thin `main.rs`,
+  `telemetry/`, `transport/`, `broker/{mesh,session,shard,topics}`, and a pure
+  `protocol` module — with the dev-only `mosquitto` bin removed.
 
 ## [0.6.1] - 2026-07-03
 
@@ -129,6 +178,8 @@ All changes are additive; there are no breaking changes to existing behavior.
   SUBSCRIBE/UNSUBSCRIBE, PINGREQ/PINGRESP, DISCONNECT; topic-trie wildcard
   matching (`+` / `#`); retained messages; cross-shard routing over a glommio
   channel mesh; structured `tracing` logging; and TOML configuration with a CLI.
+
+[1.0.0]: https://github.com/iamaliybi/rusquitto/releases/tag/v1.0.0
 
 [0.6.1]: https://github.com/iamaliybi/rusquitto/releases/tag/v0.6.1
 

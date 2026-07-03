@@ -1,6 +1,13 @@
 # Rusquitto — Implementation Progress
 
-Tracks completion of the Phase 2 plan (pub/sub). Updated 2026-06-29.
+Tracks the build from the Phase 2 pub/sub plan through the 1.0.0 release. Updated 2026-07-03.
+
+> **Layout note (1.0):** the crate was restructured. Historical entries below name the
+> old paths — the current map is: `broker/engine.rs` → `broker/shard.rs` (+ `session.rs`,
+> `mesh.rs`); `broker/topic_trie.rs` → `broker/topics/trie.rs` (+ `interner.rs`);
+> `logger.rs` → `telemetry/logging.rs`; `metrics.rs` → `telemetry/metrics.rs`;
+> `net/` → `transport/` (`tcp.rs`, `websocket.rs`, `ByteStream`); pure helpers in
+> `protocol.rs`; orchestration in `lib.rs` with a thin `main.rs`.
 
 ## Done & verified end-to-end
 
@@ -302,6 +309,30 @@ deliveries. Post-v0.4.0; bumps to 0.5.0.
 **Verification (paho-mqtt v5, `runtime.shards = 1`):** all PASS — a subscription with id 42 → delivery carries
 `[42]`; two overlapping subscriptions (ids 1 and 2, distinct SUBSCRIBEs) → a single delivery carrying **both**
 `[1, 2]`; a subscription with no id → delivery carries none. 14/14 unit tests pass.
+
+## Phase 4 — 1.0.0 production release (2026-07-03)
+
+Restructure, WebSocket transport, a memory optimization, and a security-hardening pass.
+
+| Item | Description | Status |
+|------|-------------|--------|
+| Restructure | lib+bin split; `telemetry/`, `transport/`, `broker/{mesh,session,shard,topics}`, pure `protocol` module; dev-only `mosquitto` bin removed | ✅ |
+| Transport abstraction (DIP) | `Connection<S: ByteStream>`; TCP implements `ByteStream` directly, `WsStream` wraps TCP in an RFC 6455 codec that also implements it | ✅ |
+| WebSocket `:1884` | server handshake (SHA-1/base64 accept, `mqtt` subprotocol), masked-frame decode / binary-frame encode, ping/pong/close; size-capped handshake + frames; unmasked client frames rejected | ✅ |
+| Topic interning | trie levels keyed by interned `Rc<str>` segments (`topics/interner.rs`); repeated names across the tree share one allocation | ✅ |
+| Auth ordering | first packet must be CONNECT, only one allowed → closes pre-auth PUBLISH/SUBSCRIBE bypass | ✅ |
+| Handshake + keep-alive timeouts | `connect_timeout` for the CONNECT wait; idle drop at 1.5× negotiated keep-alive | ✅ |
+| Topic validation | client PUBLISH to `$`-prefixed/wildcard/empty/NUL topics rejected; malformed SUBSCRIBE filters refused per-filter | ✅ |
+| Credential timing | constant-time compare + throwaway hash for unknown users; unguessable server-assigned client ids; client-id length/charset checks | ✅ |
+| Resource caps | `max_session_expiry`, `max_subscriptions_per_client`, `max_retained_messages` (per shard), bounded per-connection pending-outbound queue | ✅ |
+| Config | `[server] websocket`/`websocket_port`; `[limits]` security caps; single `rusquitto.config.toml` updated | ✅ |
+| Deploy | hardened `deploy/rusquitto.service` systemd unit | ✅ |
+| Tests | 32 unit tests (protocol, interner, websocket handshake/frame + existing shard/trie); clippy clean `--all-targets` | ✅ |
+
+**Verification (release build, `runtime.cores = 2`):** paho-mqtt v5 pub/sub over **both** TCP `:1883`
+and WebSocket `:1884` — QoS 0/1/2 delivered on each ✅. Security probes: a PUBLISH sent as the first packet
+is dropped ✅; a socket that sends no CONNECT is closed within the handshake timeout ✅; a client PUBLISH to
+`$SYS/broker/fake` triggers a `TopicNameInvalid` DISCONNECT ✅.
 
 ## Architecture decisions locked in
 

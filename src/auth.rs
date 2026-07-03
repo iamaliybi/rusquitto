@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use sha2::{Digest, Sha256};
 
-use crate::broker::topic_trie::filter_matches;
+use crate::broker::topics::filter_matches;
 use crate::config::AuthConfig;
 
 /// A configured user's credential: either a plaintext password or a SHA-256 hash
@@ -21,13 +21,28 @@ enum Credential {
 }
 
 impl Credential {
-	/// Whether `provided` (the client's password) matches this credential.
+	/// Whether `provided` (the client's password) matches this credential. The
+	/// comparison is constant-time in the byte contents so a network attacker can't
+	/// recover the secret from response timing.
 	fn verify(&self, provided: &str) -> bool {
 		match self {
-			Credential::Plain(expected) => expected == provided,
-			Credential::Sha256(hash) => &sha256_hex(provided) == hash,
+			Credential::Plain(expected) => ct_eq(expected.as_bytes(), provided.as_bytes()),
+			Credential::Sha256(hash) => ct_eq(sha256_hex(provided).as_bytes(), hash.as_bytes()),
 		}
 	}
+}
+
+/// Constant-time byte-string equality: folds every byte difference so the running
+/// time depends only on the input length, not on where (or whether) they differ.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+	if a.len() != b.len() {
+		return false;
+	}
+	let mut diff = 0u8;
+	for (x, y) in a.iter().zip(b) {
+		diff |= x ^ y;
+	}
+	diff == 0
 }
 
 /// Lowercase-hex SHA-256 of a string.
@@ -101,10 +116,7 @@ impl Authenticator {
 				)
 			})
 			.collect();
-		Self {
-			allow_anonymous: config.allow_anonymous,
-			users,
-		}
+		Self { allow_anonymous: config.allow_anonymous, users }
 	}
 
 	/// Whether authentication is effectively a no-op: anonymous access is allowed
@@ -122,10 +134,14 @@ impl Authenticator {
 	pub fn check(&self, username: Option<&str>, password: Option<&str>) -> AuthResult {
 		match username {
 			Some(name) => match self.users.get(name) {
-				Some(entry) if entry.credential.verify(password.unwrap_or("")) => {
-					AuthResult::Granted
+				Some(entry) if entry.credential.verify(password.unwrap_or("")) => AuthResult::Granted,
+				Some(_) => AuthResult::BadUserNamePassword,
+				// Unknown user: run a throwaway hash so the response time doesn't
+				// reveal whether the username exists (user-enumeration timing oracle).
+				None => {
+					let _ = sha256_hex(password.unwrap_or(""));
+					AuthResult::BadUserNamePassword
 				}
-				_ => AuthResult::BadUserNamePassword,
 			},
 			None if self.allow_anonymous => AuthResult::Granted,
 			None => AuthResult::NotAuthorized,
@@ -188,7 +204,10 @@ mod tests {
 	#[test]
 	fn known_user_good_and_bad_password() {
 		let auth = Authenticator::from_config(&cfg(false, &[("alice", "s3cret")]));
-		assert_eq!(auth.check(Some("alice"), Some("s3cret")), AuthResult::Granted);
+		assert_eq!(
+			auth.check(Some("alice"), Some("s3cret")),
+			AuthResult::Granted
+		);
 		assert_eq!(
 			auth.check(Some("alice"), Some("wrong")),
 			AuthResult::BadUserNamePassword
@@ -261,7 +280,10 @@ mod tests {
 				subscribe: None,
 			}],
 		});
-		assert_eq!(auth.check(Some("alice"), Some("s3cret")), AuthResult::Granted);
+		assert_eq!(
+			auth.check(Some("alice"), Some("s3cret")),
+			AuthResult::Granted
+		);
 		assert_eq!(
 			auth.check(Some("alice"), Some("wrong")),
 			AuthResult::BadUserNamePassword

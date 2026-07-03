@@ -1,2 +1,7 @@
-pub mod engine;
-pub mod topic_trie;
+//! The shard-local broker: subscription routing, session lifecycle, and the
+//! cross-shard migration protocol.
+
+pub mod mesh;
+pub mod session;
+pub mod shard;
+pub mod topics;

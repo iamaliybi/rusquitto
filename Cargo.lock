@@ -109,6 +109,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
 name = "bitflags"
 version = "2.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -773,14 +779,16 @@ dependencies = [
 
 [[package]]
 name = "rusquitto"
-version = "0.6.1"
+version = "1.0.0"
 dependencies = [
+ "base64",
  "bytes",
  "clap",
  "futures-lite 2.6.1",
  "glommio",
  "mqttbytes",
  "serde",
+ "sha1",
  "sha2",
  "signal-hook 0.4.4",
  "socket2 0.6.2",
@@ -864,6 +872,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "sha1"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
 ]
 
 [[package]]

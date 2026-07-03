@@ -1,13 +1,14 @@
 use bytes::BytesMut;
-use futures_lite::{AsyncReadExt, AsyncWriteExt, FutureExt};
+use futures_lite::FutureExt;
 use glommio::channels::local_channel::{self, LocalReceiver};
-use glommio::net::TcpStream;
 use mqttbytes::{
-	v5::{self as mqtt_v5, Packet},
 	Error as MqttError, QoS,
+	v5::{self as mqtt_v5, Packet},
 };
 use std::cell::RefCell;
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
+use std::hash::BuildHasher;
 use std::io::{Error, ErrorKind, Result};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -17,16 +18,17 @@ use tracing::{debug, info, warn};
 use std::sync::Arc;
 
 use crate::auth::{AuthResult, Authenticator};
-use crate::broker::engine::{
-	Delivery, InflightMessage, InflightState, Mailbox, MeshMsg, MigratedSession, SessionSnapshot,
-	ShardState, min_qos,
-};
-use crate::broker::topic_trie::SubOptions;
+use crate::broker::mesh::{MeshMsg, MigratedSession};
+use crate::broker::session::{Delivery, InflightMessage, InflightState, Mailbox, SessionSnapshot};
+use crate::broker::shard::ShardState;
+use crate::broker::topics::SubOptions;
 use crate::config::LimitsConfig;
-use crate::logger::redact;
-use crate::metrics::Metrics;
+use crate::protocol::{min_qos, parse_shared_filter, sub_reason_code, valid_publish_topic};
+use crate::telemetry::logging::redact;
+use crate::telemetry::metrics::Metrics;
+use crate::transport::ByteStream;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Monotonic counter for assigning identifiers to clients that connect without
 /// one (MQTT 5 allows an empty client id, leaving the server to assign it).
@@ -50,10 +52,12 @@ enum Event {
 	/// A message was routed into this connection's mailbox for delivery.
 	/// `None` means the channel closed (all senders dropped).
 	Outgoing(Option<Delivery>),
+	/// The idle deadline (handshake or keep-alive) lapsed.
+	Timeout,
 }
 
-pub struct Connection {
-	stream: TcpStream,
+pub struct Connection<S: ByteStream> {
+	stream: S,
 	buffer: BytesMut,
 	shard_id: usize,
 	client_id: String,
@@ -118,15 +122,43 @@ pub struct Connection {
 	/// (by sending a PUBLISH with both a topic and an alias) to its topic, so later
 	/// PUBLISHes may carry the alias with an empty topic.
 	inbound_aliases: HashMap<u16, String>,
+	/// Set once a valid CONNECT has been accepted. Every other packet type is a
+	/// protocol violation before this, and a second CONNECT is a violation after.
+	connected: bool,
+	/// Idle deadline: the CONNECT handshake deadline before connecting, then the
+	/// keep-alive deadline (1.5× the negotiated keep-alive) afterwards. `None`
+	/// disables the check. Reset on every inbound packet.
+	deadline: Option<Instant>,
+	/// The keep-alive window (1.5× the negotiated interval), used to refresh
+	/// `deadline` after each inbound packet. `None` when keep-alive is disabled.
+	keepalive: Option<Duration>,
+	/// Count of active subscriptions, enforced against `limits.max_subscriptions_per_client`.
+	subscription_count: usize,
 }
 
-impl Connection {
-	/// Stack scratch buffer for each socket read. The growable assembly buffer is
-	/// `buffer` (sized from config); a fixed size keeps this one on the stack.
-	const READ_BUFFER_SIZE: usize = 2048;
+/// Stack scratch buffer for each socket read. The growable assembly buffer is
+/// `buffer` (sized from config); a fixed size keeps this one on the stack.
+const READ_BUFFER_SIZE: usize = 2048;
 
+/// Longest client identifier the broker accepts (the spec only mandates support
+/// for 23; we allow generously more but bound it to reject abuse).
+const MAX_CLIENT_ID_LEN: usize = 256;
+
+/// Upper bound on QoS > 0 messages held for a connected client whose in-flight
+/// window is full. Beyond this the oldest held message is dropped, so a client
+/// that stops acknowledging can't force unbounded broker memory growth.
+const PENDING_OUTBOUND_LIMIT: usize = 4096;
+
+/// Capacity of a connection's outbound mailbox. Bounding it is a hard DoS guard:
+/// if a subscriber stops reading its socket, its connection task parks on the
+/// blocked write and stops draining the mailbox — an *unbounded* mailbox would
+/// then grow without limit as other clients keep publishing to it. A full mailbox
+/// drops further deliveries for that stuck consumer instead of exhausting memory.
+const MAILBOX_CAPACITY: usize = 8192;
+
+impl<S: ByteStream> Connection<S> {
 	pub fn new(
-		stream: TcpStream,
+		stream: S,
 		shard_id: usize,
 		state: Rc<RefCell<ShardState>>,
 		limits: LimitsConfig,
@@ -134,7 +166,7 @@ impl Connection {
 		metrics: Arc<Metrics>,
 		shutdown: Arc<AtomicBool>,
 	) -> Self {
-		let (mailbox_tx, mailbox_rx) = local_channel::new_unbounded();
+		let (mailbox_tx, mailbox_rx) = local_channel::new_bounded(MAILBOX_CAPACITY);
 		Self {
 			stream,
 			buffer: BytesMut::with_capacity(limits.initial_read_buffer),
@@ -160,6 +192,12 @@ impl Connection {
 			shutdown,
 			will_delay: 0,
 			inbound_aliases: HashMap::new(),
+			connected: false,
+			// Bound the pre-CONNECT handshake so an idle socket can't hold a slot.
+			deadline: (limits.connect_timeout > 0)
+				.then(|| Instant::now() + Duration::from_secs(u64::from(limits.connect_timeout))),
+			keepalive: None,
+			subscription_count: 0,
 		}
 	}
 
@@ -174,12 +212,22 @@ impl Connection {
 	}
 
 	/// Sends a delivery now if the in-flight window has room (QoS 0 always sends),
-	/// otherwise holds it in the pending queue for later draining.
+	/// otherwise holds it in the pending queue for later draining. The pending queue
+	/// is bounded: a client that stalls its acks drops its oldest held messages
+	/// rather than growing broker memory without limit.
 	async fn deliver(&mut self, delivery: Delivery) -> Result<()> {
 		if delivery.qos == QoS::AtMostOnce || self.inflight.len() < self.outbound_window() {
-			self.send_publish(&delivery.publish, delivery.qos, delivery.retain, &delivery.sub_ids)
-				.await
+			self.send_publish(
+				&delivery.publish,
+				delivery.qos,
+				delivery.retain,
+				&delivery.sub_ids,
+			)
+			.await
 		} else {
+			if self.pending_outbound.len() >= PENDING_OUTBOUND_LIMIT {
+				self.pending_outbound.pop_front();
+			}
 			self.pending_outbound.push_back(delivery);
 			Ok(())
 		}
@@ -192,8 +240,13 @@ impl Connection {
 			let Some(delivery) = self.pending_outbound.pop_front() else {
 				break;
 			};
-			self.send_publish(&delivery.publish, delivery.qos, delivery.retain, &delivery.sub_ids)
-				.await?;
+			self.send_publish(
+				&delivery.publish,
+				delivery.qos,
+				delivery.retain,
+				&delivery.sub_ids,
+			)
+			.await?;
 		}
 		Ok(())
 	}
@@ -222,7 +275,9 @@ impl Connection {
 				} else {
 					// Backpressure: wait for room so a QoS > 0 message is never dropped
 					// on a full mesh link. Err means the peer is gone — nothing to do.
-					let _ = senders.send_to(idx, MeshMsg::Publish(message.clone())).await;
+					let _ = senders
+						.send_to(idx, MeshMsg::Publish(message.clone()))
+						.await;
 				}
 			}
 		}
@@ -271,12 +326,9 @@ impl Connection {
 					self.fan_out(will, None).await;
 				} else {
 					debug!(topic = %will.topic, delay, "arming delayed will message");
-					self.state.borrow_mut().arm_will(
-						&self.client_id,
-						self.session_generation,
-						will,
-						delay,
-					);
+					self.state
+						.borrow_mut()
+						.arm_will(&self.client_id, self.session_generation, will, delay);
 				}
 			}
 		}
@@ -291,12 +343,13 @@ impl Connection {
 		result
 	}
 
-	/// Bidirectional event loop: race an inbound socket read against an
-	/// outbound mailbox delivery, handling whichever resolves first.
+	/// Bidirectional event loop: race an inbound socket read against an outbound
+	/// mailbox delivery and an idle-deadline timer, handling whichever fires first.
 	async fn event_loop(&mut self) -> Result<()> {
 		let max_packet = self.limits.max_payload_size;
 		loop {
-			// Borrow disjoint fields so the two futures don't both need `&mut self`.
+			// Borrow disjoint fields so the futures don't all need `&mut self`.
+			let deadline = self.deadline;
 			let event = {
 				let read = async {
 					Event::Incoming(
@@ -306,7 +359,17 @@ impl Connection {
 					)
 				};
 				let recv = async { Event::Outgoing(self.mailbox_rx.recv().await) };
-				read.or(recv).await
+				let idle = async {
+					match deadline {
+						Some(dl) => {
+							let now = Instant::now();
+							glommio::timer::sleep(dl.saturating_duration_since(now)).await;
+							Event::Timeout
+						}
+						None => std::future::pending().await,
+					}
+				};
+				read.or(recv).or(idle).await
 			};
 
 			match event {
@@ -314,6 +377,10 @@ impl Connection {
 					if let Err(e) = self.process_packet(*packet).await {
 						warn!(error = %e, "protocol/io error, closing connection");
 						return Ok(());
+					}
+					// Any inbound packet refreshes the keep-alive deadline.
+					if let Some(window) = self.keepalive {
+						self.deadline = Some(Instant::now() + window);
 					}
 				}
 				Event::Incoming(Ok(None)) => break, // Client closed (EOF)
@@ -339,6 +406,20 @@ impl Connection {
 					}
 					break;
 				}
+				// The idle deadline lapsed: no valid CONNECT in time, or no traffic
+				// within the keep-alive window. Either way, drop the connection (an
+				// abnormal close, so a keep-alive timeout still fires the will).
+				Event::Timeout => {
+					if self.connected {
+						warn!("keep-alive timeout, closing connection");
+						let _ = self
+							.send_disconnect(mqtt_v5::DisconnectReasonCode::KeepAliveTimeout)
+							.await;
+					} else {
+						warn!("CONNECT not received within handshake timeout, closing");
+					}
+					return Ok(());
+				}
 			}
 		}
 
@@ -359,12 +440,8 @@ impl Connection {
 	/// Reads from `stream` into `buffer` until a complete MQTT packet can be
 	/// framed. Takes the fields directly (not `&mut self`) so it can race against
 	/// the mailbox receiver, which borrows a different field.
-	async fn read_packet(
-		stream: &mut TcpStream,
-		buffer: &mut BytesMut,
-		max_packet: usize,
-	) -> Result<Option<Packet>> {
-		let mut temp_buf = [0u8; Self::READ_BUFFER_SIZE];
+	async fn read_packet(stream: &mut S, buffer: &mut BytesMut, max_packet: usize) -> Result<Option<Packet>> {
+		let mut temp_buf = [0u8; READ_BUFFER_SIZE];
 
 		// One read may carry several MQTT packets; frame as many as are complete.
 		loop {
@@ -490,13 +567,8 @@ impl Connection {
 	/// Records an outbound QoS 1/2 message in the in-flight window, keeping a copy
 	/// of the PUBLISH so it can be retransmitted with the DUP flag on resume.
 	fn track_inflight(&mut self, pkid: u16, message: &mqtt_v5::Publish, state: InflightState) {
-		self.inflight.insert(
-			pkid,
-			InflightMessage {
-				publish: message.clone(),
-				state,
-			},
-		);
+		self.inflight
+			.insert(pkid, InflightMessage { publish: message.clone(), state });
 	}
 
 	/// Allocates the next unused packet id (1..=65535) for an outbound message.
@@ -514,6 +586,21 @@ impl Connection {
 	}
 
 	async fn process_packet(&mut self, packet: Packet) -> Result<()> {
+		// Enforce the CONNECT handshake ordering: the first packet must be a CONNECT,
+		// and exactly one CONNECT is allowed. This closes the pre-auth bypass where a
+		// client could PUBLISH/SUBSCRIBE before (or without) authenticating.
+		let is_connect = matches!(packet, Packet::Connect(_));
+		if self.connected && is_connect {
+			warn!("second CONNECT received, closing connection");
+			self.send_disconnect(mqtt_v5::DisconnectReasonCode::ProtocolError)
+				.await?;
+			return Err(Error::new(ErrorKind::InvalidData, "duplicate CONNECT"));
+		}
+		if !self.connected && !is_connect {
+			warn!("first packet was not CONNECT, closing connection");
+			return Err(Error::new(ErrorKind::InvalidData, "expected CONNECT"));
+		}
+
 		match packet {
 			// Client -> Server Requests
 			Packet::Connect(connect) => self.handle_connect(connect).await,
@@ -538,7 +625,7 @@ impl Connection {
 	}
 }
 
-impl Connection {
+impl<S: ByteStream> Connection<S> {
 	/// Replies to a rejected CONNECT with a failure CONNACK (session present is
 	/// always false) and returns an error to unwind and close the connection.
 	async fn reject_connect(&mut self, code: mqtt_v5::ConnectReturnCode) -> Result<()> {
@@ -562,6 +649,10 @@ impl Connection {
 		let clean_start = connect.clean_session;
 		let props = connect.properties.as_ref();
 		self.session_expiry = props.and_then(|p| p.session_expiry_interval).unwrap_or(0);
+		// Cap the session lifetime so a client can't pin broker memory indefinitely.
+		if self.limits.max_session_expiry > 0 {
+			self.session_expiry = self.session_expiry.min(self.limits.max_session_expiry);
+		}
 
 		// Client flow-control limits we must honour on the outbound path. Receive
 		// Maximum bounds our unacked QoS 1/2 window (0 is invalid, so clamp to 1);
@@ -573,14 +664,27 @@ impl Connection {
 		self.peer_max_packet_size = props.and_then(|p| p.max_packet_size);
 
 		// An empty client id has the server assign one, which must then be echoed
-		// back in CONNACK so the client can reconnect to the same session.
+		// back in CONNACK so the client can reconnect to the same session. The
+		// assigned id mixes a per-process random value with a counter so it is
+		// unique and not guessable by other clients (which could otherwise force a
+		// session takeover).
 		let assigned = connect.client_id.is_empty();
-		self.client_id = if assigned {
+		if assigned {
 			let n = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
-			format!("auto-{}-{}", self.shard_id, n)
+			let rand = RandomState::new().hash_one(n);
+			self.client_id = format!("auto-{}-{}-{:016x}", self.shard_id, n, rand);
 		} else {
-			connect.client_id
-		};
+			// Reject a hostile client id: bound its length and forbid NUL / control
+			// characters (which could corrupt logs or downstream topic names).
+			let id = &connect.client_id;
+			if id.len() > MAX_CLIENT_ID_LEN || id.chars().any(|c| c.is_control()) {
+				warn!(len = id.len(), "invalid client id, rejecting");
+				return self
+					.reject_connect(mqtt_v5::ConnectReturnCode::ClientIdentifierNotValid)
+					.await;
+			}
+			self.client_id = connect.client_id;
+		}
 
 		// Stash the Will Message (if any) as a ready-to-route Publish, and capture its
 		// Will Delay Interval — the will is published this many seconds after an
@@ -604,9 +708,10 @@ impl Connection {
 		// Authenticate before logging a successful connection or opening any session
 		// state. On failure, reply with the matching CONNACK reason code and close.
 		let login = connect.login.as_ref();
-		let auth = self
-			.auth
-			.check(login.map(|l| l.username.as_str()), login.map(|l| l.password.as_str()));
+		let auth = self.auth.check(
+			login.map(|l| l.username.as_str()),
+			login.map(|l| l.password.as_str()),
+		);
 		if auth != AuthResult::Granted {
 			let code = match auth {
 				AuthResult::BadUserNamePassword => mqtt_v5::ConnectReturnCode::BadUserNamePassword,
@@ -658,10 +763,10 @@ impl Connection {
 		let mut session_present = false;
 		let mut offline_queue = VecDeque::new();
 		if let Some(mailbox) = self.mailbox_tx.take() {
-			let handle =
-				self.state
-					.borrow_mut()
-					.open_session(&self.client_id, mailbox, clean_start);
+			let handle = self
+				.state
+				.borrow_mut()
+				.open_session(&self.client_id, mailbox, clean_start);
 			self.session_generation = handle.generation;
 			session_present = handle.resumed;
 			self.inflight = handle.snapshot.inflight;
@@ -677,10 +782,9 @@ impl Connection {
 		// discard any session they may still hold from an earlier rehash.
 		if clean_start {
 			self.state.borrow().broadcast_claim(&self.client_id, false);
-		} else if !session_present
-			&& let Some(migrated) = self.claim_remote_session().await
-		{
+		} else if !session_present && let Some(migrated) = self.claim_remote_session().await {
 			info!("resumed session migrated from another shard");
+			self.subscription_count = migrated.subscriptions.len();
 			let (snapshot, offline) = self
 				.state
 				.borrow_mut()
@@ -702,8 +806,7 @@ impl Connection {
 		// length byte when `properties` is `None`, producing a malformed packet
 		// that clients reject. Attach an empty property set so the 0-length is
 		// emitted. (SubAck/Publish/PubAck handle the None case correctly.)
-		let mut conn_ack =
-			mqtt_v5::ConnAck::new(mqtt_v5::ConnectReturnCode::Success, session_present);
+		let mut conn_ack = mqtt_v5::ConnAck::new(mqtt_v5::ConnectReturnCode::Success, session_present);
 		let mut ack_props = mqtt_v5::ConnAckProperties::new();
 		// Advertise the server keep-alive so clients adopt our ceiling.
 		if self.limits.keep_alive > 0 {
@@ -742,6 +845,19 @@ impl Connection {
 			.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
 
 		self.stream.write_all(&buf).await?;
+
+		// The handshake is complete: further packets are now expected, and the idle
+		// deadline switches from the handshake timeout to keep-alive enforcement. The
+		// effective keep-alive is the server override if set, else the client's value;
+		// the broker drops the connection after 1.5× that with no traffic (MQTT §3.1.2.10).
+		self.connected = true;
+		let effective_ka = if self.limits.keep_alive > 0 {
+			self.limits.keep_alive
+		} else {
+			connect.keep_alive
+		};
+		self.keepalive = (effective_ka > 0).then(|| Duration::from_millis(1500 * u64::from(effective_ka)));
+		self.deadline = self.keepalive.map(|w| Instant::now() + w);
 
 		// After CONNACK, resurrect message flow for a resumed session.
 		if session_present {
@@ -859,7 +975,10 @@ impl Connection {
 		}
 		info!(reason = ?reason, "client sent disconnect");
 		// Returning an error unwinds the event loop and closes the connection.
-		Err(Error::new(ErrorKind::ConnectionAborted, "Client Disconnected"))
+		Err(Error::new(
+			ErrorKind::ConnectionAborted,
+			"Client Disconnected",
+		))
 	}
 
 	async fn handle_ping(&mut self) -> Result<()> {
@@ -894,6 +1013,16 @@ impl Connection {
 			} else {
 				self.inbound_aliases.insert(alias, publish.topic.clone());
 			}
+		}
+
+		// A PUBLISH topic must be a concrete name: non-empty, no wildcards, no NUL,
+		// and never `$`-prefixed (those are broker-reserved, so a client can't spoof
+		// `$SYS`). Anything else is a protocol violation — disconnect.
+		if !valid_publish_topic(&publish.topic) {
+			warn!(topic = %publish.topic, "invalid publish topic, disconnecting");
+			self.send_disconnect(mqtt_v5::DisconnectReasonCode::TopicNameInvalid)
+				.await?;
+			return Err(Error::new(ErrorKind::InvalidData, "invalid publish topic"));
 		}
 
 		// Payload contents are never logged — only topic, QoS, and byte length.
@@ -978,7 +1107,10 @@ impl Connection {
 					);
 					self.send_disconnect(mqtt_v5::DisconnectReasonCode::ReceiveMaximumExceeded)
 						.await?;
-					return Err(Error::new(ErrorKind::InvalidData, "receive maximum exceeded"));
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"receive maximum exceeded",
+					));
 				}
 				self.incoming_qos2.insert(publish.pkid, msg);
 				let mut buf = BytesMut::new();
@@ -1025,6 +1157,13 @@ impl Connection {
 				continue;
 			}
 
+			// Reject syntactically invalid filters before touching the trie.
+			if !crate::protocol::valid_subscribe_filter(effective) {
+				warn!(filter = %effective, "invalid subscribe filter, rejecting");
+				return_codes.push(mqtt_v5::SubscribeReasonCode::TopicFilterInvalid);
+				continue;
+			}
+
 			let granted = min_qos(filter.qos, self.limits.max_qos());
 
 			{
@@ -1040,6 +1179,19 @@ impl Connection {
 						sub_id,
 					},
 				);
+				// Enforce the per-client subscription cap. A brand-new subscription
+				// over quota is rolled back and refused; existing ones still update.
+				let max = self.limits.max_subscriptions_per_client;
+				if is_new && max > 0 && self.subscription_count >= max {
+					state.unsubscribe(effective, &self.client_id, share_group);
+					drop(state);
+					warn!(max, "subscription quota exceeded, rejecting filter");
+					return_codes.push(mqtt_v5::SubscribeReasonCode::QuotaExceeded);
+					continue;
+				}
+				if is_new {
+					self.subscription_count += 1;
+				}
 				// Retain Handling decides whether to replay retained messages now.
 				// Shared subscriptions never receive retained messages on subscribe.
 				let send_retained = share_group.is_none()
@@ -1057,7 +1209,7 @@ impl Connection {
 
 			debug!(filter = %effective, group = ?share_group, granted = ?granted, "subscribed");
 
-			return_codes.push(reason_code(granted));
+			return_codes.push(sub_reason_code(granted));
 		}
 
 		let sub_ack = mqtt_v5::SubAck::new(subscribe.pkid, return_codes);
@@ -1093,9 +1245,13 @@ impl Connection {
 			// Mirror the SUBSCRIBE parse so a `$share/{group}/{topic}` unsubscribe
 			// removes the matching shared entry rather than a phantom literal filter.
 			let (effective, share_group) = parse_shared_filter(filter).unwrap_or((filter, None));
-			self.state
+			let removed = self
+				.state
 				.borrow_mut()
 				.unsubscribe(effective, &self.client_id, share_group);
+			if removed {
+				self.subscription_count = self.subscription_count.saturating_sub(1);
+			}
 			debug!(filter = %effective, group = ?share_group, "unsubscribed");
 			reasons.push(mqtt_v5::UnsubAckReason::Success);
 		}
@@ -1158,38 +1314,5 @@ impl Connection {
 			self.drain_pending().await?;
 		}
 		Ok(())
-	}
-}
-
-/// Splits a subscription filter into `(effective_filter, share_group)`.
-///
-/// A Shared Subscription filter is `$share/{ShareName}/{topic-filter}`: the group
-/// is `ShareName` and the effective filter is `{topic-filter}`. An ordinary filter
-/// returns itself with `None`. A malformed `$share/…` (missing/empty ShareName or
-/// topic, or a wildcard in the ShareName) returns `Err(())` so the caller can
-/// answer the SUBSCRIBE with `TopicFilterInvalid`.
-fn parse_shared_filter(filter: &str) -> std::result::Result<(&str, Option<&str>), ()> {
-	let Some(rest) = filter.strip_prefix("$share/") else {
-		return Ok((filter, None));
-	};
-	match rest.split_once('/') {
-		Some((group, topic))
-			if !group.is_empty()
-				&& !topic.is_empty()
-				&& !group.contains('+')
-				&& !group.contains('#') =>
-		{
-			Ok((topic, Some(group)))
-		}
-		_ => Err(()),
-	}
-}
-
-/// Maps a granted QoS to its SubAck success reason code.
-fn reason_code(qos: QoS) -> mqtt_v5::SubscribeReasonCode {
-	match qos {
-		QoS::AtMostOnce => mqtt_v5::SubscribeReasonCode::QoS0,
-		QoS::AtLeastOnce => mqtt_v5::SubscribeReasonCode::QoS1,
-		QoS::ExactlyOnce => mqtt_v5::SubscribeReasonCode::QoS2,
 	}
 }
