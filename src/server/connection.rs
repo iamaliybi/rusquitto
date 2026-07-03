@@ -19,8 +19,9 @@ use std::sync::Arc;
 use crate::auth::{AuthResult, Authenticator};
 use crate::broker::engine::{
 	Delivery, InflightMessage, InflightState, Mailbox, MeshMsg, MigratedSession, SessionSnapshot,
-	ShardState,
+	ShardState, min_qos,
 };
+use crate::broker::topic_trie::SubOptions;
 use crate::config::LimitsConfig;
 use crate::logger::redact;
 use crate::metrics::Metrics;
@@ -43,8 +44,9 @@ const SESSION_CLAIM_TIMEOUT: Duration = Duration::from_millis(250);
 /// One iteration of the connection event loop resolves to exactly one of these:
 /// either the client sent us bytes, or the broker routed a message to us.
 enum Event {
-	/// A parsed packet (or EOF) arrived from the client socket.
-	Incoming(Result<Option<Packet>>),
+	/// A parsed packet (or EOF) arrived from the client socket. Boxed because a
+	/// `Packet` (its `Connect` variant especially) is much larger than a `Delivery`.
+	Incoming(Result<Option<Box<Packet>>>),
 	/// A message was routed into this connection's mailbox for delivery.
 	/// `None` means the channel closed (all senders dropped).
 	Outgoing(Option<Delivery>),
@@ -298,7 +300,9 @@ impl Connection {
 			let event = {
 				let read = async {
 					Event::Incoming(
-						Self::read_packet(&mut self.stream, &mut self.buffer, max_packet).await,
+						Self::read_packet(&mut self.stream, &mut self.buffer, max_packet)
+							.await
+							.map(|opt| opt.map(Box::new)),
 					)
 				};
 				let recv = async { Event::Outgoing(self.mailbox_rx.recv().await) };
@@ -307,7 +311,7 @@ impl Connection {
 
 			match event {
 				Event::Incoming(Ok(Some(packet))) => {
-					if let Err(e) = self.process_packet(packet).await {
+					if let Err(e) = self.process_packet(*packet).await {
 						warn!(error = %e, "protocol/io error, closing connection");
 						return Ok(());
 					}
@@ -1028,11 +1032,13 @@ impl Connection {
 				let is_new = state.subscribe(
 					effective,
 					&self.client_id,
-					granted,
-					filter.nolocal,
-					filter.preserve_retain,
-					share_group,
-					sub_id,
+					SubOptions {
+						qos: granted,
+						nolocal: filter.nolocal,
+						retain_as_published: filter.preserve_retain,
+						share_group,
+						sub_id,
+					},
 				);
 				// Retain Handling decides whether to replay retained messages now.
 				// Shared subscriptions never receive retained messages on subscribe.
@@ -1118,10 +1124,10 @@ impl Connection {
 	async fn handle_pubrec(&mut self, pubrec: mqtt_v5::PubRec) -> Result<()> {
 		// QoS 2, sender side (step 2): the client received our PUBLISH. Advance the
 		// transaction to "released" and send PUBREL.
-		if let Some(entry) = self.inflight.get_mut(&pubrec.pkid) {
-			if matches!(entry.state, InflightState::Qos2Pending) {
-				entry.state = InflightState::Qos2Released;
-			}
+		if let Some(entry) = self.inflight.get_mut(&pubrec.pkid)
+			&& matches!(entry.state, InflightState::Qos2Pending)
+		{
+			entry.state = InflightState::Qos2Released;
 		}
 
 		let mut buf = BytesMut::new();
@@ -1153,11 +1159,6 @@ impl Connection {
 		}
 		Ok(())
 	}
-}
-
-/// Returns the lower of two QoS levels (the granted QoS is `min(requested, max)`).
-fn min_qos(a: QoS, b: QoS) -> QoS {
-	if (a as u8) <= (b as u8) { a } else { b }
 }
 
 /// Splits a subscription filter into `(effective_filter, share_group)`.

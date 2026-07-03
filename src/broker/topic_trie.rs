@@ -32,6 +32,22 @@ pub struct FlatSub {
 	pub sub_id: Option<usize>,
 }
 
+/// The options a SUBSCRIBE carries for one filter. Bundled into a struct so
+/// callers name each field (the two adjacent `bool`s are easy to transpose
+/// positionally) and the signatures stay small.
+pub struct SubOptions<'a> {
+	/// The QoS the broker granted for this filter.
+	pub qos: QoS,
+	/// No Local.
+	pub nolocal: bool,
+	/// Retain As Published.
+	pub retain_as_published: bool,
+	/// Shared Subscription group name (`$share/{group}/…`), or `None`.
+	pub share_group: Option<&'a str>,
+	/// Subscription Identifier, if the SUBSCRIBE set one.
+	pub sub_id: Option<usize>,
+}
+
 /// Tests whether a subscription `filter` (possibly containing `+`/`#`) matches a
 /// concrete `topic`. Used to find retained messages for a new subscription — the
 /// reverse direction of [`TopicTrie::matching`].
@@ -83,33 +99,23 @@ impl TopicTrie {
 	/// entry. A client may hold both an ordinary subscription and a shared one on
 	/// the same filter — they are distinct entries. Returns `true` if this was a
 	/// new subscription — used for Retain Handling.
-	#[allow(clippy::too_many_arguments)]
-	pub fn insert(
-		&mut self,
-		filter: &str,
-		client_id: &str,
-		qos: QoS,
-		nolocal: bool,
-		retain_as_published: bool,
-		share_group: Option<&str>,
-		sub_id: Option<usize>,
-	) -> bool {
+	pub fn insert(&mut self, filter: &str, client_id: &str, opts: SubOptions) -> bool {
 		let mut node = &mut self.root;
 		for seg in filter.split('/') {
 			node = node.children.entry(seg.to_string()).or_default();
 		}
 		let same = |s: &Subscription| {
-			s.client_id == client_id && s.share_group.as_deref() == share_group
+			s.client_id == client_id && s.share_group.as_deref() == opts.share_group
 		};
 		let is_new = !node.subscribers.iter().any(same);
 		node.subscribers.retain(|s| !same(s));
 		node.subscribers.push(Subscription {
 			client_id: client_id.to_string(),
-			qos,
-			nolocal,
-			retain_as_published,
-			share_group: share_group.map(str::to_string),
-			sub_id,
+			qos: opts.qos,
+			nolocal: opts.nolocal,
+			retain_as_published: opts.retain_as_published,
+			share_group: opts.share_group.map(str::to_string),
+			sub_id: opts.sub_id,
 		});
 		is_new
 	}
@@ -232,25 +238,42 @@ mod tests {
 			.collect()
 	}
 
+	/// Builds a `SubOptions` for the tests.
+	fn opts(
+		qos: QoS,
+		nolocal: bool,
+		retain_as_published: bool,
+		share_group: Option<&str>,
+		sub_id: Option<usize>,
+	) -> SubOptions<'_> {
+		SubOptions {
+			qos,
+			nolocal,
+			retain_as_published,
+			share_group,
+			sub_id,
+		}
+	}
+
 	#[test]
 	fn insert_reports_new_then_existing() {
 		let mut trie = TopicTrie::default();
-		assert!(trie.insert("a/b", "c1", QoS::AtLeastOnce, false, false, None, None));
+		assert!(trie.insert("a/b", "c1", opts(QoS::AtLeastOnce, false, false, None, None)));
 		// Re-subscribing the same client to the same filter is not new.
-		assert!(!trie.insert("a/b", "c1", QoS::ExactlyOnce, false, false, None, None));
+		assert!(!trie.insert("a/b", "c1", opts(QoS::ExactlyOnce, false, false, None, None)));
 		// A different client on the same filter is new.
-		assert!(trie.insert("a/b", "c2", QoS::AtMostOnce, false, false, None, None));
+		assert!(trie.insert("a/b", "c2", opts(QoS::AtMostOnce, false, false, None, None)));
 	}
 
 	#[test]
 	fn options_are_stored_and_matched() {
 		let mut trie = TopicTrie::default();
-		trie.insert("sensors/#", "c1", QoS::AtLeastOnce, true, true, None, Some(7));
+		trie.insert("sensors/#", "c1", opts(QoS::AtLeastOnce, true, true, None, Some(7)));
 		let mut out = Vec::new();
 		trie.matching("sensors/kitchen/temp", &mut out);
 		assert_eq!(out.len(), 1);
-		assert_eq!(out[0].nolocal, true);
-		assert_eq!(out[0].retain_as_published, true);
+		assert!(out[0].nolocal);
+		assert!(out[0].retain_as_published);
 		assert_eq!(out[0].sub_id, Some(7));
 	}
 
@@ -259,8 +282,8 @@ mod tests {
 		let mut trie = TopicTrie::default();
 		// A regular sub and a shared sub from the same client on the same filter are
 		// distinct entries (keyed by share group), so both match.
-		assert!(trie.insert("a/b", "c1", QoS::AtLeastOnce, false, false, None, None));
-		assert!(trie.insert("a/b", "c1", QoS::AtLeastOnce, false, false, Some("g"), None));
+		assert!(trie.insert("a/b", "c1", opts(QoS::AtLeastOnce, false, false, None, None)));
+		assert!(trie.insert("a/b", "c1", opts(QoS::AtLeastOnce, false, false, Some("g"), None)));
 		let mut out = Vec::new();
 		trie.matching("a/b", &mut out);
 		assert_eq!(out.len(), 2);
@@ -279,8 +302,8 @@ mod tests {
 	#[test]
 	fn resubscribe_replaces_options() {
 		let mut trie = TopicTrie::default();
-		trie.insert("t", "c1", QoS::AtLeastOnce, true, true, None, None);
-		trie.insert("t", "c1", QoS::AtLeastOnce, false, false, None, None);
+		trie.insert("t", "c1", opts(QoS::AtLeastOnce, true, true, None, None));
+		trie.insert("t", "c1", opts(QoS::AtLeastOnce, false, false, None, None));
 		let got = matches(&trie, "t");
 		assert_eq!(got, vec![("c1".to_string(), false, false)]);
 	}
@@ -288,16 +311,16 @@ mod tests {
 	#[test]
 	fn take_client_removes_and_returns_filters() {
 		let mut trie = TopicTrie::default();
-		trie.insert("a/b", "c1", QoS::AtLeastOnce, true, false, None, Some(5));
-		trie.insert("x/+/z", "c1", QoS::ExactlyOnce, false, true, Some("g"), None);
-		trie.insert("a/b", "c2", QoS::AtMostOnce, false, false, None, None);
+		trie.insert("a/b", "c1", opts(QoS::AtLeastOnce, true, false, None, Some(5)));
+		trie.insert("x/+/z", "c1", opts(QoS::ExactlyOnce, false, true, Some("g"), None));
+		trie.insert("a/b", "c2", opts(QoS::AtMostOnce, false, false, None, None));
 
 		let mut taken = trie.take_client("c1");
 		taken.sort_by(|a, b| a.filter.cmp(&b.filter));
 		assert_eq!(taken.len(), 2);
 		assert_eq!(taken[0].filter, "a/b");
 		assert_eq!(taken[0].sub_id, Some(5));
-		assert_eq!(taken[0].nolocal, true);
+		assert!(taken[0].nolocal);
 		assert_eq!(taken[1].filter, "x/+/z");
 		assert_eq!(taken[1].share_group, Some("g".to_string()));
 

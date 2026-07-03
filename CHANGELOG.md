@@ -5,6 +5,22 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (pre-1.0: the minor
 version is bumped for new features, the patch version for fixes).
 
+## [0.6.1] - 2026-07-03
+
+Internal quality pass — no behavior or configuration change.
+
+### Changed
+
+- **Engine unit tests** — the routing and session core is now covered by unit
+  tests (fan-out and QoS downgrade, subscription-identifier accumulation, No Local,
+  Retain As Published, shared-group round-robin, retained store/clear, session
+  open/resume/destroy, generation guard, and the expiry/will sweep). 24 tests total.
+- **Clean `cargo clippy`** — boxed the large `Event::Incoming` variant, derived
+  `Config`'s `Default`, and collapsed a nested `if`.
+- **`SubOptions` struct** replaces the long positional argument lists on
+  `subscribe` / `TopicTrie::insert` (removing two `too_many_arguments` allows and
+  the transposable adjacent `bool`s); `min_qos` is no longer duplicated.
+
 ## [0.6.0] - 2026-07-03
 
 ### Changed
@@ -113,6 +129,8 @@ All changes are additive; there are no breaking changes to existing behavior.
   SUBSCRIBE/UNSUBSCRIBE, PINGREQ/PINGRESP, DISCONNECT; topic-trie wildcard
   matching (`+` / `#`); retained messages; cross-shard routing over a glommio
   channel mesh; structured `tracing` logging; and TOML configuration with a CLI.
+
+[0.6.1]: https://github.com/iamaliybi/rusquitto/releases/tag/v0.6.1
 
 [0.6.0]: https://github.com/iamaliybi/rusquitto/releases/tag/v0.6.0
 
