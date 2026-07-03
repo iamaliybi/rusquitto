@@ -149,6 +149,13 @@ const MAX_CLIENT_ID_LEN: usize = 256;
 /// that stops acknowledging can't force unbounded broker memory growth.
 const PENDING_OUTBOUND_LIMIT: usize = 4096;
 
+/// Capacity of a connection's outbound mailbox. Bounding it is a hard DoS guard:
+/// if a subscriber stops reading its socket, its connection task parks on the
+/// blocked write and stops draining the mailbox — an *unbounded* mailbox would
+/// then grow without limit as other clients keep publishing to it. A full mailbox
+/// drops further deliveries for that stuck consumer instead of exhausting memory.
+const MAILBOX_CAPACITY: usize = 8192;
+
 impl<S: ByteStream> Connection<S> {
 	pub fn new(
 		stream: S,
@@ -159,7 +166,7 @@ impl<S: ByteStream> Connection<S> {
 		metrics: Arc<Metrics>,
 		shutdown: Arc<AtomicBool>,
 	) -> Self {
-		let (mailbox_tx, mailbox_rx) = local_channel::new_unbounded();
+		let (mailbox_tx, mailbox_rx) = local_channel::new_bounded(MAILBOX_CAPACITY);
 		Self {
 			stream,
 			buffer: BytesMut::with_capacity(limits.initial_read_buffer),

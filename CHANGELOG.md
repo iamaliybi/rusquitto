@@ -19,14 +19,18 @@ and a memory optimization, on top of a restructured, SOLID-leaning codebase.
   written once and runs over both TCP and WebSocket.
 - **Connection hardening.** The first packet must be CONNECT and only one is allowed
   (closing a pre-auth PUBLISH/SUBSCRIBE bypass); a socket that never sends CONNECT is
-  dropped after `limits.connect_timeout`; an idle connection is dropped at 1.5× the
+  dropped after `limits.connect_timeout` — including a stalled **WebSocket handshake**,
+  which is bounded by the same timeout; an idle connection is dropped at 1.5× the
   negotiated keep-alive.
 - **Topic reservation and validation.** Client PUBLISHes to `$`-prefixed topics
   (e.g. spoofing `$SYS`) or to wildcard/empty/NUL topics are rejected, and malformed
   SUBSCRIBE filters are refused per-filter.
 - **Resource caps** (`[limits]`): `max_session_expiry`, `max_subscriptions_per_client`,
   `max_retained_messages` (per shard), a bounded per-connection outbound queue, and
-  client-id length/charset validation.
+  client-id length/charset validation. The per-connection outbound **mailbox is
+  bounded**, so a subscriber that stops reading its socket can't force unbounded broker
+  memory growth (excess deliveries to that stuck consumer are dropped). WebSocket
+  control frames are validated (≤125 bytes, unfragmented) per RFC 6455.
 
 ### Changed
 

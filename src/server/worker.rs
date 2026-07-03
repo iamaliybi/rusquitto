@@ -286,7 +286,10 @@ async fn serve(
 	shutdown: Arc<AtomicBool>,
 ) {
 	if is_websocket {
-		match WsStream::accept(stream, limits.max_payload_size).await {
+		// Bound the WebSocket handshake by the same connect timeout as the MQTT
+		// CONNECT, so a stalled upgrade can't hold the connection open.
+		let handshake_timeout = Duration::from_secs(u64::from(limits.connect_timeout));
+		match WsStream::accept(stream, limits.max_payload_size, handshake_timeout).await {
 			Ok(ws) => {
 				let mut conn = Connection::new(ws, shard_id, state, limits, auth, metrics, shutdown);
 				let _ = conn.run().await;

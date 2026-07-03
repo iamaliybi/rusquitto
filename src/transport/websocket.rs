@@ -14,9 +14,11 @@
 
 use std::io::{Error, ErrorKind, Result};
 
+use std::time::Duration;
+
 use base64::Engine;
 use bytes::BytesMut;
-use futures_lite::{AsyncReadExt, AsyncWriteExt};
+use futures_lite::{AsyncReadExt, AsyncWriteExt, FutureExt};
 use glommio::net::TcpStream;
 use sha1::{Digest, Sha1};
 
@@ -47,9 +49,25 @@ pub struct WsStream {
 
 impl WsStream {
 	/// Performs the server handshake on an accepted TCP connection and returns the
-	/// framed stream. Fails (closing the connection) on any malformed or non-MQTT
-	/// upgrade request.
-	pub async fn accept(mut inner: TcpStream, max_frame: usize) -> Result<Self> {
+	/// framed stream, bounding the whole handshake by `timeout` so a client that
+	/// opens the socket but stalls (slow-loris) can't hold the connection — the WS
+	/// handshake runs before the MQTT event loop, so it needs its own deadline.
+	/// Fails (closing the connection) on any malformed or non-MQTT upgrade request.
+	pub async fn accept(inner: TcpStream, max_frame: usize, timeout: Duration) -> Result<Self> {
+		let handshake = Self::handshake(inner, max_frame);
+		if timeout.is_zero() {
+			return handshake.await;
+		}
+		let deadline = async {
+			glommio::timer::sleep(timeout).await;
+			Err(protocol("websocket handshake timed out"))
+		};
+		handshake.or(deadline).await
+	}
+
+	/// The handshake proper: read the HTTP upgrade request, validate it, and reply
+	/// `101 Switching Protocols`. Bounded by [`accept`](Self::accept)'s timeout.
+	async fn handshake(mut inner: TcpStream, max_frame: usize) -> Result<Self> {
 		let mut raw = BytesMut::new();
 		let mut chunk = [0u8; READ_CHUNK];
 
@@ -228,6 +246,11 @@ impl Frame {
 		if len > max_frame {
 			return Err(protocol("websocket frame exceeds size limit"));
 		}
+		// Control frames (opcode >= 0x8) must be unfragmented and carry <= 125 bytes
+		// (RFC 6455 §5.5); reject oversized/fragmented ones rather than desyncing.
+		if opcode >= 0x8 && (buf[0] & 0x80 == 0 || len > 125) {
+			return Err(protocol("invalid websocket control frame"));
+		}
 		// Every client-to-server frame must be masked (RFC 6455 §5.1).
 		if !masked {
 			return Err(protocol("unmasked client websocket frame"));
@@ -337,5 +360,17 @@ mod tests {
 		// Same frame unmasked is rejected.
 		frame[1] = 0x01;
 		assert!(Frame::parse(&frame, 1024).is_err());
+	}
+
+	#[test]
+	fn rejects_oversized_and_fragmented_control_frames() {
+		// A masked PING (0x89) claiming a 126-byte payload violates the control-frame
+		// 125-byte cap and must be rejected before we try to buffer/echo it.
+		let big_ping = vec![0x89, 0x80 | 126, 0x00, 0x7E, 0x01, 0x02, 0x03, 0x04];
+		assert!(Frame::parse(&big_ping, 65536).is_err());
+
+		// A fragmented control frame (FIN clear on a PING) is also invalid.
+		let frag_ping = vec![0x09, 0x80, 0x01, 0x02, 0x03, 0x04];
+		assert!(Frame::parse(&frag_ping, 65536).is_err());
 	}
 }
