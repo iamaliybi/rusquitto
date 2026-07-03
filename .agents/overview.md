@@ -77,4 +77,4 @@ shard by hashing its TCP 4-tuple, so a reconnecting client — which uses a **ne
 on a *different* shard, where its suspended session does not exist (it is treated as a fresh session there).
 Resume is therefore reliable only when the client rehashes to the same shard. A robust fix needs a
 cross-shard session directory or a redirect (MQTT 5 Server Reference), tracked in
-[next-steps.md](next-steps.md). For single-shard deployments (`runtime.shards = 1`) resume is always exact.
+[next-steps.md](next-steps.md). For single-shard deployments (`runtime.cores = 1`) resume is always exact.

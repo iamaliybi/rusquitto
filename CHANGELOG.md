@@ -5,6 +5,16 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (pre-1.0: the minor
 version is bumped for new features, the patch version for fixes).
 
+## [0.6.0] - 2026-07-03
+
+### Changed
+
+- **`[runtime]` now takes a direct `cores` count instead of `shards` + `cpu_fraction`.**
+  Set `cores = N` to run on N CPU cores (the broker pins one shard per core, so
+  this is also the shard count); omit it to use every online core. A value above
+  the online core count is clamped down with a warning. The old `shards` and
+  `cpu_fraction` keys are removed — configs using them are now rejected.
+
 ## [0.5.0] - 2026-07-03
 
 ### Added
@@ -100,6 +110,8 @@ All changes are additive; there are no breaking changes to existing behavior.
   SUBSCRIBE/UNSUBSCRIBE, PINGREQ/PINGRESP, DISCONNECT; topic-trie wildcard
   matching (`+` / `#`); retained messages; cross-shard routing over a glommio
   channel mesh; structured `tracing` logging; and TOML configuration with a CLI.
+
+[0.6.0]: https://github.com/iamaliybi/rusquitto/releases/tag/v0.6.0
 
 [0.5.0]: https://github.com/iamaliybi/rusquitto/releases/tag/v0.5.0
 

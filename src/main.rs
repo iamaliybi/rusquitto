@@ -56,6 +56,18 @@ fn run(config: Config) -> std::io::Result<()> {
 	let total_cores = all_cpus.len();
 	let shards = config.resolved_shards(total_cores);
 
+	// A request for more cores than exist is honoured by clamping down to what is
+	// available; warn so the operator knows their config wasn't taken literally.
+	if let Some(requested) = config.runtime.cores
+		&& requested > total_cores
+	{
+		tracing::warn!(
+			requested,
+			total_cores,
+			"runtime.cores exceeds online cores; using all online cores"
+		);
+	}
+
 	let placement = match config.runtime.placement {
 		Placement::MaxSpread => PoolPlacement::MaxSpread(shards, Some(all_cpus)),
 		Placement::MaxPack => PoolPlacement::MaxPack(shards, Some(all_cpus)),
