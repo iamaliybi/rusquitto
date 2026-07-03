@@ -93,12 +93,20 @@ pub struct ShardState {
 	/// matched filter), advanced each time a message is load-balanced to a member so
 	/// deliveries rotate across the group.
 	shared_cursor: HashMap<String, usize>,
+	/// Cap on distinct retained topics stored on this shard (`0` = unlimited). Bounds
+	/// the memory a flood of retained publishes to unique topics can consume.
+	retained_limit: usize,
 }
 
 impl ShardState {
 	/// Creates a fresh, shareable handle to this shard's state.
 	pub fn new() -> Rc<RefCell<Self>> {
 		Rc::new(RefCell::new(Self::default()))
+	}
+
+	/// Sets the cap on distinct retained topics (`0` = unlimited).
+	pub fn set_retained_limit(&mut self, limit: usize) {
+		self.retained_limit = limit;
 	}
 
 	/// Stores this shard's mesh senders so publishes can be forwarded to peers.
@@ -379,9 +387,9 @@ impl ShardState {
 	}
 
 	/// Removes a single subscription (used by UNSUBSCRIBE). `share_group` selects
-	/// the ordinary (`None`) or shared entry.
-	pub fn unsubscribe(&mut self, filter: &str, client_id: &str, share_group: Option<&str>) {
-		self.trie.remove(filter, client_id, share_group);
+	/// the ordinary (`None`) or shared entry. Returns whether one was removed.
+	pub fn unsubscribe(&mut self, filter: &str, client_id: &str, share_group: Option<&str>) -> bool {
+		self.trie.remove(filter, client_id, share_group)
 	}
 
 	/// Routes one publish on this shard: updates the retain table if the retain
@@ -403,10 +411,16 @@ impl ShardState {
 	}
 
 	/// Inserts or clears a retained message. A retained publish with an empty
-	/// payload removes the stored message (MQTT spec).
+	/// payload removes the stored message (MQTT spec). A new topic is refused once
+	/// the shard's retained cap is reached (updates to existing topics still apply).
 	fn update_retain(&mut self, publish: &Publish) {
 		if publish.payload.is_empty() {
 			self.retained.remove(&publish.topic);
+		} else if self.retained_limit > 0
+			&& self.retained.len() >= self.retained_limit
+			&& !self.retained.contains_key(&publish.topic)
+		{
+			// At capacity and this is a new topic: drop it rather than grow unbounded.
 		} else {
 			self.retained.insert(publish.topic.clone(), publish.clone());
 		}

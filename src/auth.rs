@@ -21,13 +21,28 @@ enum Credential {
 }
 
 impl Credential {
-	/// Whether `provided` (the client's password) matches this credential.
+	/// Whether `provided` (the client's password) matches this credential. The
+	/// comparison is constant-time in the byte contents so a network attacker can't
+	/// recover the secret from response timing.
 	fn verify(&self, provided: &str) -> bool {
 		match self {
-			Credential::Plain(expected) => expected == provided,
-			Credential::Sha256(hash) => &sha256_hex(provided) == hash,
+			Credential::Plain(expected) => ct_eq(expected.as_bytes(), provided.as_bytes()),
+			Credential::Sha256(hash) => ct_eq(sha256_hex(provided).as_bytes(), hash.as_bytes()),
 		}
 	}
+}
+
+/// Constant-time byte-string equality: folds every byte difference so the running
+/// time depends only on the input length, not on where (or whether) they differ.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+	if a.len() != b.len() {
+		return false;
+	}
+	let mut diff = 0u8;
+	for (x, y) in a.iter().zip(b) {
+		diff |= x ^ y;
+	}
+	diff == 0
 }
 
 /// Lowercase-hex SHA-256 of a string.
@@ -125,7 +140,13 @@ impl Authenticator {
 				Some(entry) if entry.credential.verify(password.unwrap_or("")) => {
 					AuthResult::Granted
 				}
-				_ => AuthResult::BadUserNamePassword,
+				Some(_) => AuthResult::BadUserNamePassword,
+				// Unknown user: run a throwaway hash so the response time doesn't
+				// reveal whether the username exists (user-enumeration timing oracle).
+				None => {
+					let _ = sha256_hex(password.unwrap_or(""));
+					AuthResult::BadUserNamePassword
+				}
 			},
 			None if self.allow_anonymous => AuthResult::Granted,
 			None => AuthResult::NotAuthorized,

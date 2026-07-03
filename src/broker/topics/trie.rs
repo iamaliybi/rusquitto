@@ -128,17 +128,20 @@ impl TopicTrie {
 	}
 
 	/// Removes a single subscription (used by UNSUBSCRIBE). `share_group` selects
-	/// the ordinary (`None`) or shared entry to remove.
-	pub fn remove(&mut self, filter: &str, client_id: &str, share_group: Option<&str>) {
+	/// the ordinary (`None`) or shared entry to remove. Returns whether an entry was
+	/// actually removed.
+	pub fn remove(&mut self, filter: &str, client_id: &str, share_group: Option<&str>) -> bool {
 		let mut node = &mut self.root;
 		for seg in filter.split('/') {
 			match node.children.get_mut(seg) {
 				Some(child) => node = child,
-				None => return,
+				None => return false,
 			}
 		}
+		let before = node.subscribers.len();
 		node.subscribers
 			.retain(|s| !(s.client_id == client_id && s.share_group.as_deref() == share_group));
+		node.subscribers.len() != before
 	}
 
 	/// Removes every subscription belonging to a client (used on disconnect).

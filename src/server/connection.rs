@@ -6,7 +6,9 @@ use mqttbytes::{
 	Error as MqttError, QoS,
 };
 use std::cell::RefCell;
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
+use std::hash::BuildHasher;
 use std::io::{Error, ErrorKind, Result};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -28,7 +30,7 @@ use crate::telemetry::logging::redact;
 use crate::telemetry::metrics::Metrics;
 use crate::transport::ByteStream;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Monotonic counter for assigning identifiers to clients that connect without
 /// one (MQTT 5 allows an empty client id, leaving the server to assign it).
@@ -52,6 +54,8 @@ enum Event {
 	/// A message was routed into this connection's mailbox for delivery.
 	/// `None` means the channel closed (all senders dropped).
 	Outgoing(Option<Delivery>),
+	/// The idle deadline (handshake or keep-alive) lapsed.
+	Timeout,
 }
 
 pub struct Connection<S: ByteStream> {
@@ -120,11 +124,32 @@ pub struct Connection<S: ByteStream> {
 	/// (by sending a PUBLISH with both a topic and an alias) to its topic, so later
 	/// PUBLISHes may carry the alias with an empty topic.
 	inbound_aliases: HashMap<u16, String>,
+	/// Set once a valid CONNECT has been accepted. Every other packet type is a
+	/// protocol violation before this, and a second CONNECT is a violation after.
+	connected: bool,
+	/// Idle deadline: the CONNECT handshake deadline before connecting, then the
+	/// keep-alive deadline (1.5× the negotiated keep-alive) afterwards. `None`
+	/// disables the check. Reset on every inbound packet.
+	deadline: Option<Instant>,
+	/// The keep-alive window (1.5× the negotiated interval), used to refresh
+	/// `deadline` after each inbound packet. `None` when keep-alive is disabled.
+	keepalive: Option<Duration>,
+	/// Count of active subscriptions, enforced against `limits.max_subscriptions_per_client`.
+	subscription_count: usize,
 }
 
 /// Stack scratch buffer for each socket read. The growable assembly buffer is
 /// `buffer` (sized from config); a fixed size keeps this one on the stack.
 const READ_BUFFER_SIZE: usize = 2048;
+
+/// Longest client identifier the broker accepts (the spec only mandates support
+/// for 23; we allow generously more but bound it to reject abuse).
+const MAX_CLIENT_ID_LEN: usize = 256;
+
+/// Upper bound on QoS > 0 messages held for a connected client whose in-flight
+/// window is full. Beyond this the oldest held message is dropped, so a client
+/// that stops acknowledging can't force unbounded broker memory growth.
+const PENDING_OUTBOUND_LIMIT: usize = 4096;
 
 impl<S: ByteStream> Connection<S> {
 	pub fn new(
@@ -162,6 +187,12 @@ impl<S: ByteStream> Connection<S> {
 			shutdown,
 			will_delay: 0,
 			inbound_aliases: HashMap::new(),
+			connected: false,
+			// Bound the pre-CONNECT handshake so an idle socket can't hold a slot.
+			deadline: (limits.connect_timeout > 0)
+				.then(|| Instant::now() + Duration::from_secs(u64::from(limits.connect_timeout))),
+			keepalive: None,
+			subscription_count: 0,
 		}
 	}
 
@@ -176,12 +207,17 @@ impl<S: ByteStream> Connection<S> {
 	}
 
 	/// Sends a delivery now if the in-flight window has room (QoS 0 always sends),
-	/// otherwise holds it in the pending queue for later draining.
+	/// otherwise holds it in the pending queue for later draining. The pending queue
+	/// is bounded: a client that stalls its acks drops its oldest held messages
+	/// rather than growing broker memory without limit.
 	async fn deliver(&mut self, delivery: Delivery) -> Result<()> {
 		if delivery.qos == QoS::AtMostOnce || self.inflight.len() < self.outbound_window() {
 			self.send_publish(&delivery.publish, delivery.qos, delivery.retain, &delivery.sub_ids)
 				.await
 		} else {
+			if self.pending_outbound.len() >= PENDING_OUTBOUND_LIMIT {
+				self.pending_outbound.pop_front();
+			}
 			self.pending_outbound.push_back(delivery);
 			Ok(())
 		}
@@ -293,12 +329,13 @@ impl<S: ByteStream> Connection<S> {
 		result
 	}
 
-	/// Bidirectional event loop: race an inbound socket read against an
-	/// outbound mailbox delivery, handling whichever resolves first.
+	/// Bidirectional event loop: race an inbound socket read against an outbound
+	/// mailbox delivery and an idle-deadline timer, handling whichever fires first.
 	async fn event_loop(&mut self) -> Result<()> {
 		let max_packet = self.limits.max_payload_size;
 		loop {
-			// Borrow disjoint fields so the two futures don't both need `&mut self`.
+			// Borrow disjoint fields so the futures don't all need `&mut self`.
+			let deadline = self.deadline;
 			let event = {
 				let read = async {
 					Event::Incoming(
@@ -308,7 +345,17 @@ impl<S: ByteStream> Connection<S> {
 					)
 				};
 				let recv = async { Event::Outgoing(self.mailbox_rx.recv().await) };
-				read.or(recv).await
+				let idle = async {
+					match deadline {
+						Some(dl) => {
+							let now = Instant::now();
+							glommio::timer::sleep(dl.saturating_duration_since(now)).await;
+							Event::Timeout
+						}
+						None => std::future::pending().await,
+					}
+				};
+				read.or(recv).or(idle).await
 			};
 
 			match event {
@@ -316,6 +363,10 @@ impl<S: ByteStream> Connection<S> {
 					if let Err(e) = self.process_packet(*packet).await {
 						warn!(error = %e, "protocol/io error, closing connection");
 						return Ok(());
+					}
+					// Any inbound packet refreshes the keep-alive deadline.
+					if let Some(window) = self.keepalive {
+						self.deadline = Some(Instant::now() + window);
 					}
 				}
 				Event::Incoming(Ok(None)) => break, // Client closed (EOF)
@@ -340,6 +391,20 @@ impl<S: ByteStream> Connection<S> {
 							.await;
 					}
 					break;
+				}
+				// The idle deadline lapsed: no valid CONNECT in time, or no traffic
+				// within the keep-alive window. Either way, drop the connection (an
+				// abnormal close, so a keep-alive timeout still fires the will).
+				Event::Timeout => {
+					if self.connected {
+						warn!("keep-alive timeout, closing connection");
+						let _ = self
+							.send_disconnect(mqtt_v5::DisconnectReasonCode::KeepAliveTimeout)
+							.await;
+					} else {
+						warn!("CONNECT not received within handshake timeout, closing");
+					}
+					return Ok(());
 				}
 			}
 		}
@@ -516,6 +581,21 @@ impl<S: ByteStream> Connection<S> {
 	}
 
 	async fn process_packet(&mut self, packet: Packet) -> Result<()> {
+		// Enforce the CONNECT handshake ordering: the first packet must be a CONNECT,
+		// and exactly one CONNECT is allowed. This closes the pre-auth bypass where a
+		// client could PUBLISH/SUBSCRIBE before (or without) authenticating.
+		let is_connect = matches!(packet, Packet::Connect(_));
+		if self.connected && is_connect {
+			warn!("second CONNECT received, closing connection");
+			self.send_disconnect(mqtt_v5::DisconnectReasonCode::ProtocolError)
+				.await?;
+			return Err(Error::new(ErrorKind::InvalidData, "duplicate CONNECT"));
+		}
+		if !self.connected && !is_connect {
+			warn!("first packet was not CONNECT, closing connection");
+			return Err(Error::new(ErrorKind::InvalidData, "expected CONNECT"));
+		}
+
 		match packet {
 			// Client -> Server Requests
 			Packet::Connect(connect) => self.handle_connect(connect).await,
@@ -564,6 +644,10 @@ impl<S: ByteStream> Connection<S> {
 		let clean_start = connect.clean_session;
 		let props = connect.properties.as_ref();
 		self.session_expiry = props.and_then(|p| p.session_expiry_interval).unwrap_or(0);
+		// Cap the session lifetime so a client can't pin broker memory indefinitely.
+		if self.limits.max_session_expiry > 0 {
+			self.session_expiry = self.session_expiry.min(self.limits.max_session_expiry);
+		}
 
 		// Client flow-control limits we must honour on the outbound path. Receive
 		// Maximum bounds our unacked QoS 1/2 window (0 is invalid, so clamp to 1);
@@ -575,14 +659,27 @@ impl<S: ByteStream> Connection<S> {
 		self.peer_max_packet_size = props.and_then(|p| p.max_packet_size);
 
 		// An empty client id has the server assign one, which must then be echoed
-		// back in CONNACK so the client can reconnect to the same session.
+		// back in CONNACK so the client can reconnect to the same session. The
+		// assigned id mixes a per-process random value with a counter so it is
+		// unique and not guessable by other clients (which could otherwise force a
+		// session takeover).
 		let assigned = connect.client_id.is_empty();
-		self.client_id = if assigned {
+		if assigned {
 			let n = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
-			format!("auto-{}-{}", self.shard_id, n)
+			let rand = RandomState::new().hash_one(n);
+			self.client_id = format!("auto-{}-{}-{:016x}", self.shard_id, n, rand);
 		} else {
-			connect.client_id
-		};
+			// Reject a hostile client id: bound its length and forbid NUL / control
+			// characters (which could corrupt logs or downstream topic names).
+			let id = &connect.client_id;
+			if id.len() > MAX_CLIENT_ID_LEN || id.chars().any(|c| c.is_control()) {
+				warn!(len = id.len(), "invalid client id, rejecting");
+				return self
+					.reject_connect(mqtt_v5::ConnectReturnCode::ClientIdentifierNotValid)
+					.await;
+			}
+			self.client_id = connect.client_id;
+		}
 
 		// Stash the Will Message (if any) as a ready-to-route Publish, and capture its
 		// Will Delay Interval — the will is published this many seconds after an
@@ -683,6 +780,7 @@ impl<S: ByteStream> Connection<S> {
 			&& let Some(migrated) = self.claim_remote_session().await
 		{
 			info!("resumed session migrated from another shard");
+			self.subscription_count = migrated.subscriptions.len();
 			let (snapshot, offline) = self
 				.state
 				.borrow_mut()
@@ -744,6 +842,17 @@ impl<S: ByteStream> Connection<S> {
 			.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
 
 		self.stream.write_all(&buf).await?;
+
+		// The handshake is complete: further packets are now expected, and the idle
+		// deadline switches from the handshake timeout to keep-alive enforcement. The
+		// effective keep-alive is the server override if set, else the client's value;
+		// the broker drops the connection after 1.5× that with no traffic (MQTT §3.1.2.10).
+		self.connected = true;
+		let effective_ka =
+			if self.limits.keep_alive > 0 { self.limits.keep_alive } else { connect.keep_alive };
+		self.keepalive =
+			(effective_ka > 0).then(|| Duration::from_millis(1500 * u64::from(effective_ka)));
+		self.deadline = self.keepalive.map(|w| Instant::now() + w);
 
 		// After CONNACK, resurrect message flow for a resumed session.
 		if session_present {
@@ -1059,6 +1168,19 @@ impl<S: ByteStream> Connection<S> {
 						sub_id,
 					},
 				);
+				// Enforce the per-client subscription cap. A brand-new subscription
+				// over quota is rolled back and refused; existing ones still update.
+				let max = self.limits.max_subscriptions_per_client;
+				if is_new && max > 0 && self.subscription_count >= max {
+					state.unsubscribe(effective, &self.client_id, share_group);
+					drop(state);
+					warn!(max, "subscription quota exceeded, rejecting filter");
+					return_codes.push(mqtt_v5::SubscribeReasonCode::QuotaExceeded);
+					continue;
+				}
+				if is_new {
+					self.subscription_count += 1;
+				}
 				// Retain Handling decides whether to replay retained messages now.
 				// Shared subscriptions never receive retained messages on subscribe.
 				let send_retained = share_group.is_none()
@@ -1112,9 +1234,13 @@ impl<S: ByteStream> Connection<S> {
 			// Mirror the SUBSCRIBE parse so a `$share/{group}/{topic}` unsubscribe
 			// removes the matching shared entry rather than a phantom literal filter.
 			let (effective, share_group) = parse_shared_filter(filter).unwrap_or((filter, None));
-			self.state
-				.borrow_mut()
-				.unsubscribe(effective, &self.client_id, share_group);
+			let removed =
+				self.state
+					.borrow_mut()
+					.unsubscribe(effective, &self.client_id, share_group);
+			if removed {
+				self.subscription_count = self.subscription_count.saturating_sub(1);
+			}
 			debug!(filter = %effective, group = ?share_group, "unsubscribed");
 			reasons.push(mqtt_v5::UnsubAckReason::Success);
 		}

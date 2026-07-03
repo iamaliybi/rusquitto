@@ -87,7 +87,11 @@ pub async fn init(
 
 	// Shard-local broker state, shared by Rc between every connection on this shard.
 	let state = ShardState::new();
-	state.borrow_mut().set_mesh(senders);
+	{
+		let mut s = state.borrow_mut();
+		s.set_mesh(senders);
+		s.set_retained_limit(config.limits.max_retained_messages);
+	}
 
 	// Drain inbound cross-shard messages into local fan-out / migration handling.
 	for (_producer, receiver) in receivers.streams() {
