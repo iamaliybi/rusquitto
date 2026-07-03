@@ -106,8 +106,13 @@ out-of-range or unknown alias → DISCONNECT `TopicAliasInvalid` (0x94). The QoS
 inbound Receive Maximum (`incoming_qos2.len() >= max_inflight` on a new pkid → DISCONNECT
 `ReceiveMaximumExceeded` 0x93). Topic-alias resolution verified end-to-end.
 
-**Remaining:** *outbound* topic aliases (the server assigning aliases on the publishes it sends) and
-subscription identifiers.
+**Subscription identifiers — done (Phase 3n).** `TopicTrie::Subscription` carries `sub_id`; `route` gathers the
+identifiers of *all* a client's matching subscriptions into `Match.sub_ids` → `Delivery.sub_ids`; `send_publish`
+sets `PublishProperties.subscription_identifiers` (and strips the publisher's hop-scoped topic alias on the way
+out). CONNACK advertises `subscription_identifiers_available = 1`. Verified end-to-end (single id echoed;
+overlapping subs deliver both ids on one message; no-id subscription delivers none).
+
+**Remaining:** *outbound* topic aliases (the server assigning aliases on the publishes it sends).
 
 ## 6. Subscription options & shared subscriptions ✅
 

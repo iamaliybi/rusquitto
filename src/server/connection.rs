@@ -175,7 +175,7 @@ impl Connection {
 	/// otherwise holds it in the pending queue for later draining.
 	async fn deliver(&mut self, delivery: Delivery) -> Result<()> {
 		if delivery.qos == QoS::AtMostOnce || self.inflight.len() < self.outbound_window() {
-			self.send_publish(&delivery.publish, delivery.qos, delivery.retain)
+			self.send_publish(&delivery.publish, delivery.qos, delivery.retain, &delivery.sub_ids)
 				.await
 		} else {
 			self.pending_outbound.push_back(delivery);
@@ -190,7 +190,7 @@ impl Connection {
 			let Some(delivery) = self.pending_outbound.pop_front() else {
 				break;
 			};
-			self.send_publish(&delivery.publish, delivery.qos, delivery.retain)
+			self.send_publish(&delivery.publish, delivery.qos, delivery.retain, &delivery.sub_ids)
 				.await?;
 		}
 		Ok(())
@@ -404,17 +404,40 @@ impl Connection {
 	/// in the in-flight window, and delivered with their QoS set; the rest of the
 	/// handshake (PUBACK / PUBREC+PUBREL+PUBCOMP) is driven by the ack handlers.
 	/// `retain` is decided by the caller (set for a retained replay or a
-	/// Retain-As-Published subscriber, cleared for ordinary live fan-out).
+	/// Retain-As-Published subscriber, cleared for ordinary live fan-out). `sub_ids`
+	/// are the Subscription Identifiers to echo to the client.
 	async fn send_publish(
 		&mut self,
 		publish: &mqtt_v5::Publish,
 		qos: QoS,
 		retain: bool,
+		sub_ids: &[usize],
 	) -> Result<()> {
 		let mut message = publish.clone();
 		message.qos = qos;
 		message.dup = false;
 		message.retain = retain;
+
+		// Property hygiene for delivery: attach this subscriber's Subscription
+		// Identifiers, and never forward the publisher's Topic Alias (it is scoped to
+		// the publisher's connection; we don't assign outbound aliases). Other v5
+		// properties (message expiry, content type, user properties, …) pass through.
+		if !sub_ids.is_empty() || message.properties.is_some() {
+			let props = message
+				.properties
+				.get_or_insert_with(|| mqtt_v5::PublishProperties {
+					payload_format_indicator: None,
+					message_expiry_interval: None,
+					topic_alias: None,
+					response_topic: None,
+					correlation_data: None,
+					user_properties: Vec::new(),
+					subscription_identifiers: Vec::new(),
+					content_type: None,
+				});
+			props.topic_alias = None;
+			props.subscription_identifiers = sub_ids.to_vec();
+		}
 
 		let pkid = match qos {
 			QoS::AtMostOnce => {
@@ -700,10 +723,10 @@ impl Connection {
 		if !self.limits.retain_available {
 			ack_props.retain_available = Some(0);
 		}
-		// We support wildcard and shared subscriptions and inbound topic aliases, but
-		// not subscription identifiers (yet).
+		// We support wildcard and shared subscriptions, subscription identifiers, and
+		// inbound topic aliases.
 		ack_props.wildcard_subscription_available = Some(1);
-		ack_props.subscription_identifiers_available = Some(0);
+		ack_props.subscription_identifiers_available = Some(1);
 		ack_props.shared_subscription_available = Some(1);
 		// We accept inbound topic aliases up to this maximum (we send none outbound).
 		ack_props.topic_alias_max = Some(Self::INBOUND_TOPIC_ALIAS_MAX);
@@ -970,6 +993,10 @@ impl Connection {
 		let mut return_codes = Vec::with_capacity(subscribe.filters.len());
 		let mut retained = Vec::new();
 
+		// A single Subscription Identifier (if any) applies to every filter in this
+		// SUBSCRIBE and is echoed on matching deliveries.
+		let sub_id = subscribe.properties.as_ref().and_then(|p| p.id);
+
 		for filter in &subscribe.filters {
 			// A Shared Subscription filter is `$share/{group}/{topic-filter}`; the
 			// effective filter used for matching, ACL, and retained replay is the
@@ -1005,6 +1032,7 @@ impl Connection {
 					filter.nolocal,
 					filter.preserve_retain,
 					share_group,
+					sub_id,
 				);
 				// Retain Handling decides whether to replay retained messages now.
 				// Shared subscriptions never receive retained messages on subscribe.
@@ -1035,13 +1063,16 @@ impl Connection {
 
 		// Replay matching retained messages, delivered with the retain flag set and
 		// downgraded to min(message QoS, granted QoS) for this subscription. Routed
-		// through `deliver` so the in-flight window is respected.
+		// through `deliver` so the in-flight window is respected. Each carries the
+		// SUBSCRIBE's Subscription Identifier (if any).
+		let sub_ids: Vec<usize> = sub_id.into_iter().collect();
 		for (message, granted) in retained {
 			let qos = min_qos(message.qos, granted);
 			self.deliver(Delivery {
 				publish: Rc::new(message),
 				qos,
 				retain: true,
+				sub_ids: sub_ids.clone(),
 			})
 			.await?;
 		}
