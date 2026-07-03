@@ -1,0 +1,47 @@
+# rusquitto configuration. Every value below is the built-in default, so this
+# file behaves exactly like running with no config. Unknown keys are rejected.
+# The path is positional:  rusquitto rusquitto.config.toml
+
+[server]
+bind = "127.0.0.1"        # IP to bind; all shards share it via SO_REUSEPORT
+port = 1883               # TCP port
+listen_backlog = 1024     # per-shard listen(2) backlog (> 0)
+
+[runtime]
+# cores = 8               # CPU cores to run on (one shard/executor per core). Default: all online; over-count is clamped.
+placement = "max-spread"  # max-spread (latency) | max-pack (locality) | unbound (no pinning)
+mesh_capacity = 1024      # per-link inter-shard mesh buffer (> 0)
+
+[logging]
+level = "info,rusquitto=debug"      # EnvFilter syntax; RUST_LOG overrides at startup
+dir = "logs"                        # log directory (created if missing)
+file = "rusquitto.log"              # main daily-rotating log
+error_file = "rusquitto.error.log"  # ERROR-only daily-rotating log
+enable_terminal = false             # also log to stdout (off = silent terminal; files always active)
+format = "pretty"                   # stdout format when enabled: pretty | json
+
+[limits]
+max_connections_per_shard = 16384   # further connections on a shard are refused
+max_payload_size = 65536            # largest accepted packet, bytes (> 0)
+initial_read_buffer = 4096          # per-connection read buffer, bytes (> 0)
+max_inflight = 128                  # outbound QoS 1/2 window; also the advertised inbound Receive Maximum
+max_qos = 2                         # max QoS granted to subscribers (0 | 1 | 2)
+keep_alive = 60                     # server keep-alive advertised in CONNACK; 0 disables the override
+retain_available = true             # accept and serve retained messages
+
+[auth]
+# Default (anonymous allowed, no users) makes auth a no-op.
+allow_anonymous = true              # allow clients that send no username
+
+# One table per user. Set exactly one of `password` / `password_hash`
+# (hex SHA-256:  printf %s 'pw' | sha256sum). Optional `publish` / `subscribe`
+# topic-filter allow-lists (+/# wildcards); omit a list = unrestricted.
+# [[auth.users]]
+# username = "alice"
+# password = "s3cret"
+# publish = ["sensors/#"]
+# subscribe = ["sensors/#", "cmd/alice"]
+
+[sys]
+enabled = true            # publish retained $SYS/broker/... metrics
+interval = 10             # seconds between $SYS updates (> 0)

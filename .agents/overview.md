@@ -59,10 +59,10 @@ The broker requires a config file path as a **positional** argument:
 
 ```bash
 cargo build --release
-cargo run --release rusquitto.default.toml   # NOT `--config` (Cargo intercepts that flag)
+cargo run --release rusquitto.config.toml   # NOT `--config` (Cargo intercepts that flag)
 ```
 
-- `rusquitto.toml` — practical example config; `rusquitto.default.toml` — full reference.
+- `rusquitto.config.toml` — the single reference config (every property + default, one-line comments).
 - Silent terminal by default (`logging.enable_terminal = false`); logs go to `logs/`.
 - The separate stress-test binary: `cargo run --bin mosquitto` → runs `scripts/mosquitto.sh` (needs mosquitto-clients).
 
