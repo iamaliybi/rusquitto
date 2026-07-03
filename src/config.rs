@@ -43,7 +43,7 @@ impl Cli {
 // ===========================================================================
 
 /// Top-level broker configuration. Maps 1:1 to the sections of `rusquitto.config.toml`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
 	pub server: ServerConfig,
@@ -211,18 +211,6 @@ impl LimitsConfig {
 // Defaults
 // ===========================================================================
 
-impl Default for Config {
-	fn default() -> Self {
-		Self {
-			server: ServerConfig::default(),
-			runtime: RuntimeConfig::default(),
-			logging: LoggingConfig::default(),
-			limits: LimitsConfig::default(),
-			auth: AuthConfig::default(),
-			sys: SysConfig::default(),
-		}
-	}
-}
 
 impl Default for SysConfig {
 	fn default() -> Self {
