@@ -80,12 +80,12 @@ isolated, shard-local executor — no `Mutex`, no `RwLock`, no work-stealing.
 cargo build --release
 
 # Run with a config file (the path is a positional argument)
-cargo run --release rusquitto.default.toml
+cargo run --release rusquitto.config.toml
 ```
 
-> **Note:** the config path is positional, so `cargo run rusquitto.default.toml` works directly.
+> **Note:** the config path is positional, so `cargo run rusquitto.config.toml` works directly.
 > Don't write `cargo run --config ...` — `--config` is a *Cargo* flag and Cargo will intercept it.
-> Run the built binary the same way: `./rusquitto rusquitto.default.toml`.
+> Run the built binary the same way: `./rusquitto rusquitto.config.toml`.
 
 By default the broker binds `127.0.0.1:1883` and is **silent in the terminal** (logs go to files under
 `logs/`). To watch logs live, set `enable_terminal = true` under `[logging]`, or `tail -f logs/rusquitto.log`.
@@ -108,8 +108,8 @@ mosquitto_pub -h 127.0.0.1 -p 1883 -V 5 -t 'home/kitchen/temp' -m '21.5' -q 1 -r
 The broker takes exactly one argument: the path to a `.toml` file. Every field is optional and falls back
 to a documented default; unknown keys are rejected to catch typos.
 
-- [`rusquitto.toml`](rusquitto.toml) — a practical example.
-- [`rusquitto.default.toml`](rusquitto.default.toml) — the full reference: every property with its type and default.
+- [`rusquitto.config.toml`](rusquitto.config.toml) — the full reference: every property, its default, and a
+  one-line description. Copy it and edit what you need.
 
 The schema has four sections:
 

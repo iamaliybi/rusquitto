@@ -14,6 +14,9 @@ version is bumped for new features, the patch version for fixes).
   this is also the shard count); omit it to use every online core. A value above
   the online core count is clamped down with a warning. The old `shards` and
   `cpu_fraction` keys are removed — configs using them are now rejected.
+- **Single reference config.** The `rusquitto.toml` and `rusquitto.default.toml`
+  examples are replaced by one `rusquitto.config.toml` that lists every property
+  with its default and a concise one-line comment.
 
 ## [0.5.0] - 2026-07-03
 

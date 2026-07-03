@@ -6,8 +6,8 @@
 //! [`Config`] tree, then validated.
 //!
 //! Every section and field has a sensible default (see the `Default` impls and
-//! `rusquitto.toml`), so a minimal config — or even an empty file — is valid.
-//! `deny_unknown_fields` is enabled throughout to catch typos in production.
+//! `rusquitto.config.toml`), so a minimal config — or even an empty file — is
+//! valid. `deny_unknown_fields` is enabled throughout to catch typos in production.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
@@ -42,7 +42,7 @@ impl Cli {
 // Configuration tree
 // ===========================================================================
 
-/// Top-level broker configuration. Maps 1:1 to the sections of `rusquitto.toml`.
+/// Top-level broker configuration. Maps 1:1 to the sections of `rusquitto.config.toml`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
