@@ -161,7 +161,7 @@ mod tests {
 		let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
 		(
 			key.cert.pem().into_bytes(),
-			key.key_pair.serialize_pem().into_bytes(),
+			key.signing_key.serialize_pem().into_bytes(),
 		)
 	}
 

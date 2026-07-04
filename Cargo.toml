@@ -40,4 +40,4 @@ rustls-pemfile = "2"
 
 [dev-dependencies]
 # Self-signed certificate generation for the TLS handshake tests.
-rcgen = "0.13"
+rcgen = "0.14.8"
