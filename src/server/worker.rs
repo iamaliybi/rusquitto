@@ -4,9 +4,13 @@ use crate::broker::shard::ShardState;
 use crate::config::Config;
 use crate::server::connection::Connection;
 use crate::telemetry::metrics::Metrics;
+use crate::transport::ByteStream;
 use crate::transport::tcp::bind_listener;
+use crate::transport::tls;
 use crate::transport::websocket::WsStream;
 use futures_lite::FutureExt;
+use futures_rustls::TlsAcceptor;
+use futures_rustls::rustls::ServerConfig;
 use glommio::channels::channel_mesh::{Full, MeshBuilder};
 use glommio::net::{TcpListener, TcpStream};
 use mqttbytes::{QoS, v5::Publish};
@@ -32,13 +36,54 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// How often the drain loop re-checks the live-connection count.
 const SHUTDOWN_DRAIN_POLL: Duration = Duration::from_millis(25);
 
+/// Which listener an accepted socket arrived on, deciding the transport stack the
+/// MQTT session runs over.
+#[derive(Clone, Copy)]
+enum Transport {
+	/// Plain MQTT over TCP (`mqtt://`).
+	Plain,
+	/// MQTT over WebSocket (`ws://`).
+	WebSocket,
+	/// MQTT over TLS (`mqtts://`).
+	Mqtts,
+	/// MQTT over WebSocket over TLS (`wss://`).
+	Wss,
+}
+
+impl Transport {
+	/// `(is_tls, is_websocket)` for connection-span fields.
+	fn flags(self) -> (bool, bool) {
+		match self {
+			Transport::Plain => (false, false),
+			Transport::WebSocket => (false, true),
+			Transport::Mqtts => (true, false),
+			Transport::Wss => (true, true),
+		}
+	}
+}
+
 /// One turn of the accept loop: a connection on one of the listeners, or a
 /// periodic tick that lets the loop re-check the shutdown flag.
 enum AcceptTurn {
-	Tcp(TcpStream),
-	WebSocket(TcpStream),
+	Conn(TcpStream, Transport),
 	Failed,
 	Tick,
+}
+
+/// Accepts one connection from an optional listener, tagged with its transport. An
+/// absent listener yields a future that never resolves, so it simply drops out of
+/// the `or` race between the listeners.
+async fn accept_on(listener: Option<&TcpListener>, transport: Transport, shard_id: usize) -> AcceptTurn {
+	match listener {
+		Some(l) => match l.accept().await {
+			Ok(stream) => AcceptTurn::Conn(stream, transport),
+			Err(e) => {
+				tracing::warn!(shard = shard_id, error = %e, "accept failed");
+				AcceptTurn::Failed
+			}
+		},
+		None => std::future::pending().await,
+	}
 }
 
 /// Per-shard live-connection accounting: the total count plus a per-IP tally.
@@ -89,6 +134,7 @@ pub async fn init(
 	config: Arc<Config>,
 	shutdown: Arc<AtomicBool>,
 	metrics: Arc<Metrics>,
+	tls_config: Option<Arc<ServerConfig>>,
 ) {
 	let shard_id: usize = glommio::executor().id();
 
@@ -110,20 +156,35 @@ pub async fn init(
 		}
 	};
 
-	// Optional WebSocket listener for browser clients.
-	let ws_listener: Option<TcpListener> = match config.server.websocket_port() {
-		Some(port) => {
-			let addr = SocketAddr::new(config.server.bind, port);
-			match bind_listener(addr, config.server.listen_backlog) {
-				Ok(l) => Some(l),
-				Err(e) => {
-					tracing::error!(shard = shard_id, error = %e, "failed to bind WebSocket listener");
-					return;
-				}
+	// Binds an optional listener on `config.server.bind:port`, aborting the shard on
+	// failure (a configured-but-unbindable port is a fatal misconfiguration).
+	let bind_optional = |port: Option<u16>, what: &str| -> std::result::Result<Option<TcpListener>, ()> {
+		let Some(port) = port else {
+			return Ok(None);
+		};
+		let addr = SocketAddr::new(config.server.bind, port);
+		match bind_listener(addr, config.server.listen_backlog) {
+			Ok(l) => Ok(Some(l)),
+			Err(e) => {
+				tracing::error!(shard = shard_id, error = %e, "failed to bind {what} listener");
+				Err(())
 			}
 		}
-		None => None,
 	};
+
+	// Optional WebSocket listener for browser clients, plus the TLS listeners
+	// (mqtts / wss). The acceptor wraps the shared, immutable rustls config; each
+	// shard still binds its own SO_REUSEPORT sockets, so nothing is shared but the
+	// read-only config.
+	let (ws_listener, mqtts_listener, wss_listener) = match (
+		bind_optional(config.server.websocket_port(), "WebSocket"),
+		bind_optional(config.tls.mqtts_port(), "mqtts"),
+		bind_optional(config.tls.wss_port(), "wss"),
+	) {
+		(Ok(ws), Ok(mqtts), Ok(wss)) => (ws, mqtts, wss),
+		_ => return,
+	};
+	let tls_acceptor = tls_config.map(TlsAcceptor::from);
 
 	// Mesh peer id is 0-based and unique per shard (glommio executor ids are
 	// 1-based). Peer 0 publishes broker-wide `$SYS` metrics.
@@ -194,6 +255,8 @@ pub async fn init(
 	tracing::info!(
 		shard = shard_id,
 		websocket = config.server.websocket,
+		mqtts = mqtts_listener.is_some(),
+		wss = wss_listener.is_some(),
 		"shard ready, accepting connections"
 	);
 
@@ -222,43 +285,30 @@ pub async fn init(
 	let counts = Rc::new(ConnCounts::default());
 
 	while !shutdown.load(Ordering::Relaxed) {
-		// Race the accept(s) against a periodic tick so a shutdown signal is noticed
+		// Race every listener against a periodic tick so a shutdown signal is noticed
 		// even while no client is connecting. `.or` polls in order, so a ready
-		// connection is never lost to the tick.
-		let turn = {
-			let accept_tcp = async {
-				match tcp_listener.accept().await {
-					Ok(stream) => AcceptTurn::Tcp(stream),
-					Err(e) => {
-						tracing::warn!(shard = shard_id, error = %e, "TCP accept failed");
-						AcceptTurn::Failed
-					}
-				}
-			};
-			let tick = async {
-				glommio::timer::sleep(SHUTDOWN_POLL_INTERVAL).await;
-				AcceptTurn::Tick
-			};
-			match &ws_listener {
-				Some(ws) => {
-					let accept_ws = async {
-						match ws.accept().await {
-							Ok(stream) => AcceptTurn::WebSocket(stream),
-							Err(e) => {
-								tracing::warn!(shard = shard_id, error = %e, "WebSocket accept failed");
-								AcceptTurn::Failed
-							}
-						}
-					};
-					accept_tcp.or(accept_ws).or(tick).await
-				}
-				None => accept_tcp.or(tick).await,
-			}
+		// connection is never lost to the tick; absent listeners never resolve.
+		let tick = async {
+			glommio::timer::sleep(SHUTDOWN_POLL_INTERVAL).await;
+			AcceptTurn::Tick
 		};
+		let turn = accept_on(Some(&tcp_listener), Transport::Plain, shard_id)
+			.or(accept_on(
+				ws_listener.as_ref(),
+				Transport::WebSocket,
+				shard_id,
+			))
+			.or(accept_on(
+				mqtts_listener.as_ref(),
+				Transport::Mqtts,
+				shard_id,
+			))
+			.or(accept_on(wss_listener.as_ref(), Transport::Wss, shard_id))
+			.or(tick)
+			.await;
 
-		let (stream, is_websocket) = match turn {
-			AcceptTurn::Tcp(stream) => (stream, false),
-			AcceptTurn::WebSocket(stream) => (stream, true),
+		let (stream, transport) = match turn {
+			AcceptTurn::Conn(stream, transport) => (stream, transport),
 			AcceptTurn::Failed | AcceptTurn::Tick => continue,
 		};
 
@@ -303,9 +353,12 @@ pub async fn init(
 		let auth = auth.clone();
 		let metrics = metrics.clone();
 		let shutdown = shutdown.clone();
+		let tls_acceptor = tls_acceptor.clone();
+		let (is_tls, is_websocket) = transport.flags();
 		let span = tracing::info_span!(
 			"connection",
 			shard = shard_id,
+			tls = is_tls,
 			websocket = is_websocket,
 			client_id = tracing::field::Empty,
 		);
@@ -314,7 +367,8 @@ pub async fn init(
 				let _slot = slot;
 				serve(
 					stream,
-					is_websocket,
+					transport,
+					tls_acceptor,
 					shard_id,
 					state,
 					limits,
@@ -350,13 +404,16 @@ pub async fn init(
 	);
 }
 
-/// Serves one accepted socket. A WebSocket socket first completes the RFC 6455
-/// handshake (yielding a framed `ByteStream`); either way the same `Connection`
-/// state machine drives the MQTT session over the resulting stream.
+/// Serves one accepted socket, building the transport stack it arrived on and then
+/// driving the MQTT session over the resulting [`ByteStream`]. TLS and WebSocket
+/// each run a handshake first, bounded by the connect timeout so a stalled
+/// handshake can't hold the connection open; `wss` stacks both (TLS, then the
+/// WebSocket upgrade over the encrypted channel).
 #[allow(clippy::too_many_arguments)]
 async fn serve(
 	stream: TcpStream,
-	is_websocket: bool,
+	transport: Transport,
+	tls_acceptor: Option<TlsAcceptor>,
 	shard_id: usize,
 	state: Rc<std::cell::RefCell<ShardState>>,
 	limits: crate::config::LimitsConfig,
@@ -364,19 +421,51 @@ async fn serve(
 	metrics: Arc<Metrics>,
 	shutdown: Arc<AtomicBool>,
 ) {
-	if is_websocket {
-		// Bound the WebSocket handshake by the same connect timeout as the MQTT
-		// CONNECT, so a stalled upgrade can't hold the connection open.
-		let handshake_timeout = Duration::from_secs(u64::from(limits.connect_timeout));
-		match WsStream::accept(stream, limits.max_payload_size, handshake_timeout).await {
-			Ok(ws) => {
-				let mut conn = Connection::new(ws, shard_id, state, limits, auth, metrics, shutdown);
-				let _ = conn.run().await;
-			}
+	let timeout = Duration::from_secs(u64::from(limits.connect_timeout));
+	let max_frame = limits.max_payload_size;
+
+	match transport {
+		Transport::Plain => run_stream(stream, shard_id, state, limits, auth, metrics, shutdown).await,
+		Transport::WebSocket => match WsStream::accept(stream, max_frame, timeout).await {
+			Ok(ws) => run_stream(ws, shard_id, state, limits, auth, metrics, shutdown).await,
 			Err(e) => tracing::warn!(error = %e, "WebSocket handshake failed"),
+		},
+		Transport::Mqtts => {
+			let Some(acceptor) = tls_acceptor else {
+				return; // Unreachable: an mqtts listener only exists with an acceptor.
+			};
+			match tls::accept(&acceptor, stream, timeout).await {
+				Ok(tls) => run_stream(tls, shard_id, state, limits, auth, metrics, shutdown).await,
+				Err(e) => tracing::warn!(error = %e, "TLS handshake failed"),
+			}
 		}
-	} else {
-		let mut conn = Connection::new(stream, shard_id, state, limits, auth, metrics, shutdown);
-		let _ = conn.run().await;
+		Transport::Wss => {
+			let Some(acceptor) = tls_acceptor else {
+				return;
+			};
+			match tls::accept(&acceptor, stream, timeout).await {
+				Ok(tls) => match WsStream::accept(tls, max_frame, timeout).await {
+					Ok(ws) => run_stream(ws, shard_id, state, limits, auth, metrics, shutdown).await,
+					Err(e) => tracing::warn!(error = %e, "WebSocket handshake over TLS failed"),
+				},
+				Err(e) => tracing::warn!(error = %e, "TLS handshake failed"),
+			}
+		}
 	}
+}
+
+/// Drives the MQTT state machine over an established stream to completion. Generic
+/// over the transport (the payoff of [`ByteStream`]): one implementation serves
+/// plain TCP, WebSocket, TLS, and WebSocket-over-TLS alike.
+async fn run_stream<S: ByteStream>(
+	stream: S,
+	shard_id: usize,
+	state: Rc<std::cell::RefCell<ShardState>>,
+	limits: crate::config::LimitsConfig,
+	auth: Rc<Authenticator>,
+	metrics: Arc<Metrics>,
+	shutdown: Arc<AtomicBool>,
+) {
+	let mut conn = Connection::new(stream, shard_id, state, limits, auth, metrics, shutdown);
+	let _ = conn.run().await;
 }

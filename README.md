@@ -14,6 +14,10 @@ isolated, shard-local executor — no `Mutex`, no `RwLock`, no work-stealing.
 - **MQTT 5.0** over **TCP (`:1883`) and WebSocket (`:1884`)**: CONNECT/CONNACK, PUBLISH, SUBSCRIBE/SUBACK,
   UNSUBSCRIBE/UNSUBACK, PINGREQ/PINGRESP, DISCONNECT. The WebSocket transport (RFC 6455, `mqtt` subprotocol,
   binary frames) lets browser clients connect without a TCP bridge.
+- **TLS termination** (rustls) for **`mqtts://` (`:8883`) and `wss://` (`:8884`)** — opt-in via `[tls]`. Only
+  **TLS 1.3 and 1.2** are offered, with strong **AEAD + ECDHE** cipher suites (forward secrecy; no CBC/RC4/3DES);
+  older protocols and weak ciphers are structurally impossible. Layered behind the same `ByteStream` seam, so the
+  MQTT engine is reused unchanged over any of TCP / WS / TLS / WS-over-TLS.
 - **QoS 0/1/2**, both inbound (receiver-side) and outbound (sender-side) — full PUBACK and PUBREC→PUBREL→PUBCOMP
   handshakes, with exactly-once delivery for QoS 2.
 - **Topic wildcards** `+` (single level) and `#` (multi level) via a topic trie; `$`-topics are excluded from wildcard
@@ -144,6 +148,30 @@ With `[server] websocket = true` (the default), browser and Node clients can con
 const client = mqtt.connect("ws://127.0.0.1:1884/mqtt");
 ```
 
+### TLS (`mqtts` / `wss`)
+
+Set `[tls] enabled = true` and point `cert_file` / `key_file` at a PEM certificate chain (leaf first) and its
+private key (PKCS#8, PKCS#1, or SEC1). A native TLS listener then runs on `:8883`, and — with `[tls] websocket =
+true` — a WebSocket-over-TLS listener on `:8884`:
+
+```toml
+[tls]
+enabled = true
+cert_file = "certs/server.pem"
+key_file  = "certs/server.key"
+```
+
+```sh
+# native MQTT over TLS
+mosquitto_pub -V mqttv5 -h host -p 8883 --cafile ca.pem -t demo -m hi
+# browser client
+mqtt.connect("wss://host:8884/mqtt")
+```
+
+Only TLS 1.3 and 1.2 are accepted, with AEAD + ECDHE cipher suites only. There is no client-certificate (mTLS)
+authentication — clients authenticate at the MQTT layer over the encrypted link. TLS terminates in-process, so a
+reverse proxy is optional rather than required.
+
 ## Architecture
 
 ```text
@@ -170,8 +198,10 @@ Known edges, deliberately out of scope for 1.0 (tracked in `.agents/progress.md`
   (`ulimit -l unlimited` or `LimitMEMLOCK=infinity`). *(Cross-shard QoS 1/2 publishes and Wills are reliable —
   the mesh forward applies backpressure instead of dropping. Only broker-internal `$SYS` metric publishes still use
   best-effort sends, which is fine since they are QoS 0 and retained.)*
-- **WebSocket is plaintext (`ws://`), not `wss://`.** Neither transport terminates TLS; run behind a TLS-terminating
-  reverse proxy (nginx/Caddy/HAProxy) for `mqtts://` / `wss://` in production.
+- **No client-certificate (mTLS) authentication.** TLS termination for `mqtts://` / `wss://` is built in (rustls,
+  TLS 1.3/1.2, strong AEAD suites), but the server does not request or verify client certificates — clients
+  authenticate at the MQTT layer (username/password) over the encrypted link. Certificate rotation requires a
+  restart (the cert is loaded once at startup).
 - **Cross-shard session migration is best-effort under mesh overload.** A reconnecting client that lands on a
   different shard triggers a session `Claim` over the channel mesh; the owning shard hands the session back. The
   mesh uses non-blocking sends (drop-on-full), so under a saturated mesh a claim or hand-off could be dropped and

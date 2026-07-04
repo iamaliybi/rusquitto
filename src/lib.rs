@@ -6,7 +6,7 @@
 //! - [`config`] — CLI parsing and the validated configuration tree.
 //! - [`protocol`] — pure MQTT helpers (QoS, topic/filter validation).
 //! - [`transport`] — the [`ByteStream`](transport::ByteStream) abstraction and its
-//!   TCP and WebSocket implementations.
+//!   TCP, WebSocket, and TLS implementations (stackable into `wss://`).
 //! - [`auth`] — authentication and per-topic authorization.
 //! - [`broker`] — subscription routing, session lifecycle, and cross-shard mesh.
 //! - [`server`] — the per-shard accept loop and the per-connection state machine.
@@ -79,8 +79,19 @@ pub fn run(config: Config) -> std::io::Result<()> {
 		bind = %config.server.bind,
 		port = config.server.port,
 		websocket = ?config.server.websocket_port(),
+		mqtts = ?config.tls.mqtts_port(),
+		wss = ?config.tls.wss_port(),
 		"starting rusquitto broker"
 	);
+
+	// Build the shared TLS config once, before spawning shards, so a bad
+	// certificate/key fails startup immediately with a clear error rather than
+	// per-shard. rustls `ServerConfig` is immutable and `Send + Sync`, so a single
+	// `Arc` is shared read-only across every core (it holds no per-shard state).
+	let tls_config = match (&config.tls.cert_file, &config.tls.key_file) {
+		(Some(cert), Some(key)) if config.tls.enabled => Some(transport::tls::load_server_config(cert, key)?),
+		_ => None,
+	};
 
 	// Full mesh connecting all shards, carrying forwarded publishes and cross-shard
 	// session-control messages. Cloned into each shard, which then joins.
@@ -105,7 +116,8 @@ pub fn run(config: Config) -> std::io::Result<()> {
 			let config = Arc::clone(&config);
 			let shutdown = Arc::clone(&shutdown);
 			let metrics = Arc::clone(&metrics);
-			async move { server::worker::init(mesh, config, shutdown, metrics).await }
+			let tls_config = tls_config.clone();
+			async move { server::worker::init(mesh, config, shutdown, metrics, tls_config).await }
 		})
 		.expect("failed to spawn local executor")
 		.join_all();
