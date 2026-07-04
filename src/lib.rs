@@ -107,8 +107,9 @@ pub fn run(config: Config) -> std::io::Result<()> {
 		signal_hook::flag::register(signal, Arc::clone(&shutdown))?;
 	}
 
-	// Cross-shard broker counters, published to `$SYS` by one shard.
-	let metrics = Arc::new(telemetry::metrics::Metrics::default());
+	// Cross-shard broker counters, published to `$SYS` by one shard. Sized to the
+	// shard count so each shard has a slot for its per-shard load gauge.
+	let metrics = Arc::new(telemetry::metrics::Metrics::with_shards(shards));
 
 	LocalExecutorPoolBuilder::new(placement)
 		.on_all_shards(move || {

@@ -207,6 +207,37 @@ fn close_session_generation_mismatch_is_noop() {
 }
 
 #[test]
+fn shed_connections_drops_live_mailboxes_only() {
+	let mut s = ShardState::default();
+	let (tx1, _rx1) = local_channel::new_unbounded::<Delivery>();
+	let (tx2, _rx2) = local_channel::new_unbounded::<Delivery>();
+	s.open_session("live1", tx1, false);
+	s.open_session("live2", tx2, false);
+	arm(&mut s, "suspended"); // no live mailbox
+
+	// Only the two live connections are shed; the suspended one is untouched.
+	assert_eq!(s.shed_connections(5), 2);
+	assert!(s.sessions["live1"].mailbox.is_none());
+	assert!(s.sessions["live2"].mailbox.is_none());
+	// Sessions stay (the connections' own cleanup handles them); nothing left to shed.
+	assert_eq!(s.shed_connections(5), 0);
+}
+
+#[test]
+fn shed_connections_respects_the_batch_size() {
+	let mut s = ShardState::default();
+	let mut keep = Vec::new();
+	for i in 0..5 {
+		let (tx, rx) = local_channel::new_unbounded::<Delivery>();
+		s.open_session(&format!("c{i}"), tx, false);
+		keep.push(rx);
+	}
+	assert_eq!(s.shed_connections(2), 2);
+	let still_live = s.sessions.values().filter(|x| x.mailbox.is_some()).count();
+	assert_eq!(still_live, 3);
+}
+
+#[test]
 fn sweep_fires_due_delayed_will_and_reaps_expired_session() {
 	let mut s = ShardState::default();
 	arm(&mut s, "willed");

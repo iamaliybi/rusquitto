@@ -50,6 +50,15 @@ max_subscriptions_per_client = 1024 # cap on active subscriptions per client (0 
 max_retained_messages = 100000      # cap on distinct retained topics per shard (0 = unlimited)
 max_message_rate = 0                # max inbound PUBLISH/sec per connection (0 = unlimited); over-rate clients are throttled, not dropped
 
+[overload]
+# Per-shard overload handling. A probe tracks each shard's scheduling delay
+# (reactor saturation); the thresholds below act on it. Detection is always on;
+# the mitigations are opt-in. Exposed as $SYS/broker/load/max-scheduling-delay-ms.
+stall_warn_ms = 100        # log a WARN while a shard's scheduling delay exceeds this (0 = never)
+admission_delay_ms = 0     # reject NEW connections above this delay (0 = off); client retry may hash to a cooler core
+shed_delay_ms = 0          # shed EXISTING connections above this sustained delay (0 = off); they reconnect and SO_REUSEPORT rehashes them
+shed_batch = 8             # max connections shed per second per shard while shedding
+
 [auth]
 # Default (anonymous allowed, no users) makes auth a no-op.
 allow_anonymous = true              # allow clients that send no username

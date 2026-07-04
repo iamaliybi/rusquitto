@@ -3,6 +3,7 @@ use crate::broker::mesh::MeshMsg;
 use crate::broker::shard::ShardState;
 use crate::config::Config;
 use crate::server::connection::Connection;
+use crate::server::overload::LoadMonitor;
 use crate::telemetry::metrics::Metrics;
 use crate::transport::ByteStream;
 use crate::transport::tcp::bind_listener;
@@ -13,6 +14,7 @@ use futures_rustls::TlsAcceptor;
 use futures_rustls::rustls::ServerConfig;
 use glommio::channels::channel_mesh::{Full, MeshBuilder};
 use glommio::net::{TcpListener, TcpStream};
+use glommio::{Latency, Shares};
 use mqttbytes::{QoS, v5::Publish};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -35,6 +37,19 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// How often the drain loop re-checks the live-connection count.
 const SHUTDOWN_DRAIN_POLL: Duration = Duration::from_millis(25);
+
+/// How often the load probe samples the reactor's scheduling delay. Short enough
+/// to react within a second, long enough to be negligible overhead.
+const LOAD_PROBE_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How often the load-shedding task re-evaluates whether to shed connections.
+const SHED_INTERVAL: Duration = Duration::from_secs(1);
+
+/// CPU shares for the background maintenance task queue (sweep, `$SYS`, shedding),
+/// relative to the default queue's 1000. Low, so housekeeping yields to
+/// client-serving work when a shard is busy — the scheduling-group idea from
+/// Seastar/ScyllaDB, where background work is starved to protect foreground latency.
+const MAINTENANCE_SHARES: usize = 200;
 
 /// Which listener an accepted socket arrived on, deciding the transport stack the
 /// MQTT session runs over.
@@ -190,6 +205,20 @@ pub async fn init(
 	// 1-based). Peer 0 publishes broker-wide `$SYS` metrics.
 	let mesh_peer_id = senders.peer_id();
 
+	// A low-share, latency-insensitive task queue for background housekeeping
+	// (session sweep, `$SYS`, shedding). Under load the scheduler starves it in
+	// favour of the default queue that serves clients — the scheduling-group
+	// pattern from Seastar/ScyllaDB.
+	let tq_maintenance = glommio::executor().create_task_queue(
+		Shares::Static(MAINTENANCE_SHARES),
+		Latency::NotImportant,
+		"maintenance",
+	);
+
+	// Per-shard load signal (reactor scheduling delay), driving the stall WARN,
+	// admission control, and shedding.
+	let load = LoadMonitor::new();
+
 	// Shard-local broker state, shared by Rc between every connection on this shard.
 	let state = ShardState::new();
 	{
@@ -216,17 +245,89 @@ pub async fn init(
 	// delayed wills that have now come due (best-effort mesh forward, like `$SYS`).
 	{
 		let state = state.clone();
+		glommio::spawn_local_into(
+			async move {
+				loop {
+					glommio::timer::sleep(SESSION_SWEEP_INTERVAL).await;
+					let wills = state.borrow_mut().sweep_expired();
+					for will in wills {
+						let mut shard_state = state.borrow_mut();
+						shard_state.broadcast(&will);
+						shard_state.deliver_local(will, None);
+					}
+				}
+			},
+			tq_maintenance,
+		)
+		.expect("spawn session-sweep task")
+		.detach();
+	}
+
+	// Load probe: measure how far the reactor's scheduling of a normal-priority task
+	// slips past its due time — near zero when idle, growing under saturation — and
+	// feed it into the shard's load monitor and the `$SYS` gauge. Runs on the default
+	// (foreground) queue so it observes the delay client-serving work actually sees.
+	{
+		let load = load.clone();
+		let metrics = metrics.clone();
+		let stall_warn = Duration::from_millis(u64::from(config.overload.stall_warn_ms));
 		glommio::spawn_local(async move {
+			let mut warning = false;
 			loop {
-				glommio::timer::sleep(SESSION_SWEEP_INTERVAL).await;
-				let wills = state.borrow_mut().sweep_expired();
-				for will in wills {
-					let mut shard_state = state.borrow_mut();
-					shard_state.broadcast(&will);
-					shard_state.deliver_local(will, None);
+				let started = Instant::now();
+				glommio::timer::sleep(LOAD_PROBE_INTERVAL).await;
+				let delay = started.elapsed().saturating_sub(LOAD_PROBE_INTERVAL);
+				load.record(delay);
+				let smoothed = load.scheduling_delay();
+				metrics.record_shard_delay(mesh_peer_id, smoothed);
+				// Stall detector with hysteresis: warn on crossing up, clear at half.
+				if !stall_warn.is_zero() {
+					if !warning && smoothed >= stall_warn {
+						warning = true;
+						tracing::warn!(
+							shard = shard_id,
+							delay_ms = smoothed.as_millis(),
+							"shard overloaded: reactor scheduling delay is high"
+						);
+					} else if warning && smoothed < stall_warn / 2 {
+						warning = false;
+						tracing::info!(shard = shard_id, "shard load recovered");
+					}
 				}
 			}
 		})
+		.detach();
+	}
+
+	// Load shedding: while a shard stays overloaded, close a small batch of its
+	// connections each interval so they reconnect and SO_REUSEPORT rehashes them onto
+	// (probably) cooler cores. Opt-in and disruptive, so only spawned when enabled.
+	if config.overload.shed_delay_ms > 0 {
+		let load = load.clone();
+		let state = state.clone();
+		let metrics = metrics.clone();
+		let threshold = Duration::from_millis(u64::from(config.overload.shed_delay_ms));
+		let batch = config.overload.shed_batch;
+		glommio::spawn_local_into(
+			async move {
+				loop {
+					glommio::timer::sleep(SHED_INTERVAL).await;
+					if load.exceeds(threshold) {
+						let shed = state.borrow_mut().shed_connections(batch);
+						if shed > 0 {
+							metrics.record_connections_shed(shed as u64);
+							tracing::warn!(
+								shard = shard_id,
+								shed,
+								"sustained overload: shedding connections to rebalance"
+							);
+						}
+					}
+				}
+			},
+			tq_maintenance,
+		)
+		.expect("spawn load-shedding task")
 		.detach();
 	}
 
@@ -236,19 +337,23 @@ pub async fn init(
 		let state = state.clone();
 		let metrics = metrics.clone();
 		let interval = Duration::from_secs(config.sys.interval);
-		glommio::spawn_local(async move {
-			loop {
-				glommio::timer::sleep(interval).await;
-				let topics = metrics.snapshot().topics();
-				let mut shard_state = state.borrow_mut();
-				for (topic, value) in topics {
-					let mut publish = Publish::new(topic, QoS::AtMostOnce, value.into_bytes());
-					publish.retain = true;
-					shard_state.broadcast(&publish);
-					shard_state.deliver_local(publish, None);
+		glommio::spawn_local_into(
+			async move {
+				loop {
+					glommio::timer::sleep(interval).await;
+					let topics = metrics.snapshot().topics();
+					let mut shard_state = state.borrow_mut();
+					for (topic, value) in topics {
+						let mut publish = Publish::new(topic, QoS::AtMostOnce, value.into_bytes());
+						publish.retain = true;
+						shard_state.broadcast(&publish);
+						shard_state.deliver_local(publish, None);
+					}
 				}
-			}
-		})
+			},
+			tq_maintenance,
+		)
+		.expect("spawn $SYS metrics task")
 		.detach();
 	}
 
@@ -263,6 +368,8 @@ pub async fn init(
 	let limits = config.limits;
 	let max_conns = limits.max_connections_per_shard;
 	let max_conns_per_ip = limits.max_connections_per_ip;
+	// Admission control: reject new connections while this shard is overloaded.
+	let admission_delay = Duration::from_millis(u64::from(config.overload.admission_delay_ms));
 	// Shard-local credential store, shared by every connection on this shard.
 	let auth = Rc::new(Authenticator::from_config(&config.auth));
 	if mesh_peer_id == 0 {
@@ -313,6 +420,17 @@ pub async fn init(
 		};
 
 		let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
+
+		// Admission control: while the shard's scheduling delay is over budget, shed
+		// load at the door. The rejected client retries — from a new source port, so
+		// SO_REUSEPORT may hash it onto a cooler shard. Existing connections are left
+		// alone, so overload doesn't cascade into dropping healthy sessions.
+		if load.exceeds(admission_delay) {
+			metrics.record_admission_rejected();
+			tracing::debug!(shard = shard_id, "overloaded, rejecting new connection");
+			drop(stream);
+			continue;
+		}
 
 		if counts.total.get() >= max_conns {
 			tracing::warn!(

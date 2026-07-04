@@ -7,7 +7,7 @@
 //! client subscribed to `$SYS/#` can monitor the broker over MQTT itself.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Cross-shard broker counters. All fields use relaxed ordering: they are
 /// monotonic (or a balanced inc/dec pair) and only ever read for reporting, so
@@ -26,10 +26,25 @@ pub struct Metrics {
 	bytes_received: AtomicU64,
 	/// Publish payload bytes sent to clients.
 	bytes_sent: AtomicU64,
+	/// Each shard's most recent scheduling delay, in microseconds, indexed by the
+	/// shard's mesh peer id. Sized to the shard count; written by each shard's load
+	/// probe, read by the `$SYS` publisher.
+	shard_delay_us: Box<[AtomicU64]>,
+	/// Connections closed by load shedding since start.
+	connections_shed: AtomicU64,
+	/// New connections rejected by admission control (overload) since start.
+	admission_rejected: AtomicU64,
 }
 
 impl Default for Metrics {
 	fn default() -> Self {
+		Self::with_shards(0)
+	}
+}
+
+impl Metrics {
+	/// Builds metrics with room for `shards` per-shard load gauges.
+	pub fn with_shards(shards: usize) -> Self {
 		Self {
 			start: Instant::now(),
 			clients_connected: AtomicU64::new(0),
@@ -38,11 +53,29 @@ impl Default for Metrics {
 			messages_sent: AtomicU64::new(0),
 			bytes_received: AtomicU64::new(0),
 			bytes_sent: AtomicU64::new(0),
+			shard_delay_us: (0..shards).map(|_| AtomicU64::new(0)).collect(),
+			connections_shed: AtomicU64::new(0),
+			admission_rejected: AtomicU64::new(0),
 		}
 	}
-}
 
-impl Metrics {
+	/// Records a shard's current scheduling delay (reactor saturation signal).
+	pub fn record_shard_delay(&self, shard: usize, delay: Duration) {
+		if let Some(slot) = self.shard_delay_us.get(shard) {
+			slot.store(delay.as_micros() as u64, Ordering::Relaxed);
+		}
+	}
+
+	/// Records `n` connections closed by load shedding.
+	pub fn record_connections_shed(&self, n: u64) {
+		self.connections_shed.fetch_add(n, Ordering::Relaxed);
+	}
+
+	/// Records a new connection rejected by admission control.
+	pub fn record_admission_rejected(&self) {
+		self.admission_rejected.fetch_add(1, Ordering::Relaxed);
+	}
+
 	/// Records a newly connected client (after a successful CONNECT).
 	pub fn client_connected(&self) {
 		self.clients_connected.fetch_add(1, Ordering::Relaxed);
@@ -70,6 +103,12 @@ impl Metrics {
 
 	/// Snapshots the counters for publishing to `$SYS`.
 	pub fn snapshot(&self) -> MetricsSnapshot {
+		let max_delay_us = self
+			.shard_delay_us
+			.iter()
+			.map(|d| d.load(Ordering::Relaxed))
+			.max()
+			.unwrap_or(0);
 		MetricsSnapshot {
 			uptime_secs: self.start.elapsed().as_secs(),
 			clients_connected: self.clients_connected.load(Ordering::Relaxed),
@@ -78,6 +117,9 @@ impl Metrics {
 			messages_sent: self.messages_sent.load(Ordering::Relaxed),
 			bytes_received: self.bytes_received.load(Ordering::Relaxed),
 			bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
+			max_scheduling_delay_ms: max_delay_us / 1000,
+			connections_shed: self.connections_shed.load(Ordering::Relaxed),
+			admission_rejected: self.admission_rejected.load(Ordering::Relaxed),
 		}
 	}
 }
@@ -91,6 +133,10 @@ pub struct MetricsSnapshot {
 	pub messages_sent: u64,
 	pub bytes_received: u64,
 	pub bytes_sent: u64,
+	/// Highest current per-shard scheduling delay (reactor saturation), in ms.
+	pub max_scheduling_delay_ms: u64,
+	pub connections_shed: u64,
+	pub admission_rejected: u64,
 }
 
 impl MetricsSnapshot {
@@ -120,6 +166,18 @@ impl MetricsSnapshot {
 				self.bytes_received.to_string(),
 			),
 			("$SYS/broker/bytes/sent", self.bytes_sent.to_string()),
+			(
+				"$SYS/broker/load/max-scheduling-delay-ms",
+				self.max_scheduling_delay_ms.to_string(),
+			),
+			(
+				"$SYS/broker/load/connections-shed",
+				self.connections_shed.to_string(),
+			),
+			(
+				"$SYS/broker/load/admission-rejected",
+				self.admission_rejected.to_string(),
+			),
 		]
 	}
 }
