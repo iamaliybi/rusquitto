@@ -47,6 +47,11 @@ isolated, shard-local executor — no `Mutex`, no `RwLock`, no work-stealing.
   user may carry `publish` / `subscribe` topic-filter allow-lists: a denied publish is dropped (QoS 0) or
   Not-Authorized-acked (QoS 1/2), and a denied subscribe gets a Not Authorized reason code. Defaults are open,
   so nothing is required until you configure it.
+- **Resource guards** — bounded read buffers and outbound mailboxes, per-shard and per-IP connection caps, payload
+  and subscription/retained caps, plus an optional **per-connection PUBLISH rate limit** (`limits.max_message_rate`).
+  The rate limit *throttles* (paces the client to its budget, applying backpressure) rather than dropping, which
+  bounds how much CPU a single noisy publisher can draw on its pinned core — relevant because a connection is served
+  entirely by the one shard that accepted it.
 - **Cross-shard routing** over a `glommio` channel mesh, so a publisher and subscriber on different cores still reach
   each other. QoS 1/2 forwards apply **backpressure** (an awaiting mesh send), so the delivery guarantee holds across
   shards — the publisher waits rather than dropping when a mesh link is full. QoS 0 stays fire-and-forget.
@@ -134,7 +139,7 @@ The schema has five sections:
 | `[server]`  | `bind`, `port`, `websocket` / `websocket_port`, `listen_backlog`                             |
 | `[runtime]` | `cores` (CPU cores / shard count), CPU `placement`, `mesh_capacity`                           |
 | `[logging]` | `level`, `dir`, log/error file names, `enable_terminal`, `format`                            |
-| `[limits]`  | connection/packet sizing, QoS, keep-alive, plus the security caps (`connect_timeout`, `max_session_expiry`, `max_subscriptions_per_client`, `max_retained_messages`) |
+| `[limits]`  | connection/packet sizing, QoS, keep-alive, plus the security caps (`connect_timeout`, `max_session_expiry`, `max_subscriptions_per_client`, `max_retained_messages`, `max_message_rate`) |
 | `[auth]`    | `allow_anonymous` and `[[auth.users]]` (credentials + `publish`/`subscribe` ACLs)            |
 
 `RUST_LOG` overrides `logging.level` at startup.

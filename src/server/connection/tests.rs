@@ -54,12 +54,17 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 /// A connection wired to a `MockStream`, sharing `out` so the test can read
 /// whatever the connection writes. Anonymous auth is open by default.
 fn make_conn(out: Rc<RefCell<Vec<u8>>>) -> Connection<MockStream> {
+	make_conn_with(out, LimitsConfig::default())
+}
+
+/// `make_conn` with caller-chosen limits.
+fn make_conn_with(out: Rc<RefCell<Vec<u8>>>, limits: LimitsConfig) -> Connection<MockStream> {
 	let stream = MockStream { inbound: VecDeque::new(), outbound: out };
 	Connection::new(
 		stream,
 		0,
 		ShardState::new(),
-		LimitsConfig::default(),
+		limits,
 		Rc::new(Authenticator::from_config(&AuthConfig::default())),
 		Arc::new(Metrics::default()),
 		Arc::new(AtomicBool::new(false)),
@@ -191,6 +196,27 @@ fn publish_qos1_is_acknowledged() {
 
 		match decode(&out) {
 			Packet::PubAck(ack) => assert_eq!(ack.pkid, 42),
+			other => panic!("expected PUBACK, got {other:?}"),
+		}
+	});
+}
+
+#[test]
+fn rate_limited_publish_still_delivers_within_burst() {
+	block_on(async {
+		let out = Rc::new(RefCell::new(Vec::new()));
+		// A generous rate: the first publish is within the burst, so no throttle sleep.
+		let limits = LimitsConfig { max_message_rate: 1000, ..LimitsConfig::default() };
+		let mut conn = make_conn_with(out.clone(), limits);
+		conn.process_packet(connect_packet("c1")).await.unwrap();
+		out.borrow_mut().clear();
+
+		let mut publish = Publish::new("a/b", QoS::AtLeastOnce, b"hi".to_vec());
+		publish.pkid = 9;
+		conn.process_packet(Packet::Publish(publish)).await.unwrap();
+
+		match decode(&out) {
+			Packet::PubAck(ack) => assert_eq!(ack.pkid, 9),
 			other => panic!("expected PUBACK, got {other:?}"),
 		}
 	});

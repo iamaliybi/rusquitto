@@ -6,6 +6,7 @@ use mqttbytes::{
 	v5::{self as mqtt_v5},
 };
 use std::io::{Error, ErrorKind, Result};
+use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 use super::Connection;
@@ -15,6 +16,20 @@ use crate::transport::ByteStream;
 
 impl<S: ByteStream> Connection<S> {
 	pub(super) async fn handle_publish(&mut self, mut publish: mqtt_v5::Publish) -> Result<()> {
+		// Per-connection PUBLISH throttle: reserve a token before doing any routing
+		// work. When the client is over its configured rate the connection sleeps for
+		// the returned delay — pacing this publisher to its budget and yielding the
+		// (pinned) core to other connections — instead of dropping the message. PUBLISH
+		// is the amplifier (one message fans out to every subscriber), so throttling it
+		// bounds the CPU a single noisy client can draw on its core.
+		let wait = match self.rate_limiter.as_mut() {
+			Some(bucket) => bucket.acquire(Instant::now()),
+			None => Duration::ZERO,
+		};
+		if !wait.is_zero() {
+			glommio::timer::sleep(wait).await;
+		}
+
 		// Resolve an inbound topic alias (MQTT 5) before anything else reads the
 		// topic. A PUBLISH may register an alias (topic + alias) or use one (empty
 		// topic + alias); an out-of-range or unknown alias is a protocol error.
