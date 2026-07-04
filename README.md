@@ -23,6 +23,8 @@ isolated, shard-local executor — no `Mutex`, no `RwLock`, no work-stealing.
 - **Topic wildcards** `+` (single level) and `#` (multi level) via a topic trie; `$`-topics are excluded from wildcard
   matches.
 - **Retained messages** — stored, replayed to new subscribers, cleared by empty payload, replicated across shards.
+  Optionally **persisted to disk** (`[persistence]`): the retained set is snapshotted (atomic write, `fdatasync`,
+  via glommio's io_uring file I/O) and restored on startup, so "last known value" topics survive a restart.
 - **Persistent sessions** — honours the Session Expiry Interval: a disconnect *suspends* the session (keeping its
   subscriptions), a reconnect with the same Client ID and Clean Start `false` resumes it (CONNACK `session_present`),
   QoS > 0 messages published while offline are queued and flushed on resume, and unacknowledged in-flight QoS 1/2
@@ -232,6 +234,10 @@ Known edges, deliberately out of scope for 1.0 (tracked in `.agents/progress.md`
 - **Passwords: plaintext or SHA-256.** A `password_hash` avoids storing the secret in the clear, but there is no
   salting or a slow KDF (Argon2/bcrypt) yet, and no enhanced (SASL-style) authentication. Anonymous clients
   bypass ACL (they are unrestricted). Protect the config file with restrictive permissions regardless.
+- **Persistence covers retained messages only.** With `[persistence] enabled`, the retained set is snapshotted to
+  disk and restored on startup (survives graceful restarts fully, and crashes up to the last snapshot). **Sessions
+  and queued (offline) messages are still in-memory only** — a restart drops them; persisting them needs cross-shard
+  snapshot coordination and is planned for a later release.
 
 ## Development
 

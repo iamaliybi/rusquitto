@@ -59,6 +59,15 @@ admission_delay_ms = 0     # reject NEW connections above this delay (0 = off); 
 shed_delay_ms = 0          # shed EXISTING connections above this sustained delay (0 = off); they reconnect and SO_REUSEPORT rehashes them
 shed_batch = 8             # max connections shed per second per shard while shedding
 
+[persistence]
+# Disk-backed durability. Disabled by default (broker is otherwise in-memory).
+# When enabled, the retained-message set is snapshotted and restored across restarts.
+# (Sessions and queued messages are not yet persisted.)
+enabled = false            # master switch
+dir = "data"               # directory for snapshot files (created if missing)
+retained_file = "retained.mqtt"  # retained-message snapshot filename
+snapshot_interval = 300    # seconds between snapshots (0 = only on graceful shutdown); a crash loses updates since the last snapshot
+
 [auth]
 # Default (anonymous allowed, no users) makes auth a no-op.
 allow_anonymous = true              # allow clients that send no username
