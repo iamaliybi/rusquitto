@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use base64::Engine;
 use bytes::BytesMut;
+use futures_lite::io::{AsyncRead, AsyncWrite};
 use futures_lite::{AsyncReadExt, AsyncWriteExt, FutureExt};
-use glommio::net::TcpStream;
 use sha1::{Digest, Sha1};
 
 use crate::transport::ByteStream;
@@ -34,9 +34,13 @@ const MAX_HANDSHAKE_BYTES: usize = 8 * 1024;
 /// Scratch read size for pulling bytes off the socket.
 const READ_CHUNK: usize = 4096;
 
-/// A WebSocket-framed byte stream over a TCP connection.
-pub struct WsStream {
-	inner: TcpStream,
+/// A WebSocket-framed byte stream over an inner transport `S`.
+///
+/// `S` is any async byte stream — a plain TCP stream for `ws://`, or a
+/// [`TlsStream`](crate::transport::tls::TlsStream) for `wss://` — so this codec is
+/// written once and layers over either.
+pub struct WsStream<S> {
+	inner: S,
 	/// Raw bytes read from the socket, not yet decoded into frames.
 	raw: BytesMut,
 	/// Decoded application bytes ready to hand to `read`.
@@ -47,13 +51,13 @@ pub struct WsStream {
 	closed: bool,
 }
 
-impl WsStream {
-	/// Performs the server handshake on an accepted TCP connection and returns the
+impl<S: AsyncRead + AsyncWrite + Unpin> WsStream<S> {
+	/// Performs the server handshake on an accepted connection and returns the
 	/// framed stream, bounding the whole handshake by `timeout` so a client that
 	/// opens the socket but stalls (slow-loris) can't hold the connection — the WS
 	/// handshake runs before the MQTT event loop, so it needs its own deadline.
 	/// Fails (closing the connection) on any malformed or non-MQTT upgrade request.
-	pub async fn accept(inner: TcpStream, max_frame: usize, timeout: Duration) -> Result<Self> {
+	pub async fn accept(inner: S, max_frame: usize, timeout: Duration) -> Result<Self> {
 		let handshake = Self::handshake(inner, max_frame);
 		if timeout.is_zero() {
 			return handshake.await;
@@ -67,7 +71,7 @@ impl WsStream {
 
 	/// The handshake proper: read the HTTP upgrade request, validate it, and reply
 	/// `101 Switching Protocols`. Bounded by [`accept`](Self::accept)'s timeout.
-	async fn handshake(mut inner: TcpStream, max_frame: usize) -> Result<Self> {
+	async fn handshake(mut inner: S, max_frame: usize) -> Result<Self> {
 		let mut raw = BytesMut::new();
 		let mut chunk = [0u8; READ_CHUNK];
 
@@ -123,7 +127,8 @@ impl WsStream {
 		frame.push(0x80 | opcode); // FIN + opcode
 		frame.push(payload.len() as u8); // control payloads are <= 125 bytes
 		frame.extend_from_slice(payload);
-		AsyncWriteExt::write_all(&mut self.inner, &frame).await
+		AsyncWriteExt::write_all(&mut self.inner, &frame).await?;
+		AsyncWriteExt::flush(&mut self.inner).await
 	}
 
 	/// Tries to decode one frame from `raw`, servicing control frames and appending
@@ -159,7 +164,7 @@ impl WsStream {
 	}
 }
 
-impl ByteStream for WsStream {
+impl<S: AsyncRead + AsyncWrite + Unpin> ByteStream for WsStream<S> {
 	async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
 		let mut chunk = [0u8; READ_CHUNK];
 		loop {
@@ -199,7 +204,10 @@ impl ByteStream for WsStream {
 			frame.extend_from_slice(&(len as u64).to_be_bytes());
 		}
 		frame.extend_from_slice(buf);
-		AsyncWriteExt::write_all(&mut self.inner, &frame).await
+		AsyncWriteExt::write_all(&mut self.inner, &frame).await?;
+		// Flush so a buffering inner transport (TLS, for `wss`) actually emits the
+		// frame; a no-op for plain TCP.
+		AsyncWriteExt::flush(&mut self.inner).await
 	}
 }
 

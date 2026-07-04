@@ -3,9 +3,12 @@
 //! [`ByteStream`] is the abstraction the connection layer depends on (DIP): an
 //! async, byte-oriented, bidirectional stream. Plain TCP satisfies it directly;
 //! the WebSocket transport wraps a TCP stream in a frame codec that also satisfies
-//! it. `Connection` is written once against `ByteStream` and works over either.
+//! it; the TLS transport wraps either in a rustls session. `Connection` is written
+//! once against `ByteStream` and works over any of them — including stacked
+//! combinations such as WebSocket-over-TLS (`wss://`).
 
 pub mod tcp;
+pub mod tls;
 pub mod websocket;
 
 use std::io::Result;

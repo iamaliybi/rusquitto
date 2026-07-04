@@ -43,6 +43,7 @@ impl Cli {
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
 	pub server: ServerConfig,
+	pub tls: TlsConfig,
 	pub runtime: RuntimeConfig,
 	pub logging: LoggingConfig,
 	pub limits: LimitsConfig,
@@ -71,6 +72,40 @@ impl ServerConfig {
 	/// The WebSocket port when the listener is enabled, else `None`.
 	pub fn websocket_port(&self) -> Option<u16> {
 		self.websocket.then_some(self.websocket_port)
+	}
+}
+
+/// `[tls]` — TLS termination via rustls. Disabled by default. When enabled, a
+/// native MQTT-over-TLS (`mqtts`) listener runs on `port`; when `websocket` is
+/// also set, a WebSocket-over-TLS (`wss`) listener runs on `websocket_port`. Both
+/// present the same certificate. Only TLS 1.3 and 1.2 with strong AEAD cipher
+/// suites are offered (see [`transport::tls`](crate::transport::tls)).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TlsConfig {
+	/// Master switch for all TLS listeners.
+	pub enabled: bool,
+	/// Port for native MQTT over TLS (`mqtts`). IANA-registered default is 8883.
+	pub port: u16,
+	/// Whether to also accept MQTT-over-WebSocket over TLS (`wss`) for browsers.
+	pub websocket: bool,
+	/// Port for the `wss` listener (used only when `enabled` and `websocket`).
+	pub websocket_port: u16,
+	/// PEM certificate chain, leaf certificate first. Required when `enabled`.
+	pub cert_file: Option<PathBuf>,
+	/// PEM private key (PKCS#8, PKCS#1, or SEC1). Required when `enabled`.
+	pub key_file: Option<PathBuf>,
+}
+
+impl TlsConfig {
+	/// The `mqtts` port when TLS is enabled, else `None`.
+	pub fn mqtts_port(&self) -> Option<u16> {
+		self.enabled.then_some(self.port)
+	}
+
+	/// The `wss` port when TLS and its WebSocket listener are both enabled, else `None`.
+	pub fn wss_port(&self) -> Option<u16> {
+		(self.enabled && self.websocket).then_some(self.websocket_port)
 	}
 }
 
@@ -258,6 +293,19 @@ impl Default for ServerConfig {
 	}
 }
 
+impl Default for TlsConfig {
+	fn default() -> Self {
+		Self {
+			enabled: false,
+			port: 8883,
+			websocket: true,
+			websocket_port: 8884,
+			cert_file: None,
+			key_file: None,
+		}
+	}
+}
+
 impl Default for RuntimeConfig {
 	fn default() -> Self {
 		Self {
@@ -331,16 +379,40 @@ impl Config {
 		if self.server.port == 0 {
 			return invalid("server.port must be non-zero");
 		}
-		if self.server.websocket {
-			if self.server.websocket_port == 0 {
-				return invalid("server.websocket_port must be non-zero when websocket is enabled");
-			}
-			if self.server.websocket_port == self.server.port {
-				return invalid("server.websocket_port must differ from server.port");
-			}
+		if self.server.websocket && self.server.websocket_port == 0 {
+			return invalid("server.websocket_port must be non-zero when websocket is enabled");
 		}
 		if self.server.listen_backlog <= 0 {
 			return invalid("server.listen_backlog must be positive");
+		}
+		if self.tls.enabled {
+			if self.tls.cert_file.is_none() || self.tls.key_file.is_none() {
+				return invalid("tls.cert_file and tls.key_file are required when tls.enabled is true");
+			}
+			if self.tls.port == 0 {
+				return invalid("tls.port must be non-zero when tls.enabled is true");
+			}
+			if self.tls.websocket && self.tls.websocket_port == 0 {
+				return invalid("tls.websocket_port must be non-zero when tls.websocket is enabled");
+			}
+		}
+		// Every active listener binds the same address via SO_REUSEPORT, so their
+		// ports must all differ. Collect the enabled ones and reject any collision.
+		let active_ports = [
+			Some(("server.port", self.server.port)),
+			self.server
+				.websocket_port()
+				.map(|p| ("server.websocket_port", p)),
+			self.tls.mqtts_port().map(|p| ("tls.port", p)),
+			self.tls.wss_port().map(|p| ("tls.websocket_port", p)),
+		];
+		let mut seen = std::collections::HashMap::new();
+		for (name, port) in active_ports.into_iter().flatten() {
+			if let Some(other) = seen.insert(port, name) {
+				return Err(ConfigError::Validation(format!(
+					"listener port {port} is used by both {other} and {name}"
+				)));
+			}
 		}
 		if let Some(0) = self.runtime.cores {
 			return invalid("runtime.cores must be at least 1 when set");
@@ -494,6 +566,57 @@ mod tests {
 		u.password_hash = Some("not-hex".to_string());
 		c.auth.users = vec![u];
 		assert!(c.validate().is_err());
+	}
+
+	#[test]
+	fn tls_enabled_requires_cert_and_key() {
+		let mut c = Config::default();
+		c.tls.enabled = true;
+		assert!(c.validate().is_err(), "no cert/key set");
+
+		c.tls.cert_file = Some(PathBuf::from("cert.pem"));
+		c.tls.key_file = Some(PathBuf::from("key.pem"));
+		assert!(c.validate().is_ok(), "cert and key set");
+	}
+
+	#[test]
+	fn tls_disabled_ignores_its_ports_and_cert() {
+		let mut c = Config::default();
+		c.tls.enabled = false;
+		c.tls.port = c.server.port; // would collide if TLS were active
+		assert!(c.validate().is_ok());
+	}
+
+	#[test]
+	fn listener_ports_must_be_unique() {
+		let mut c = Config::default();
+		c.tls.enabled = true;
+		c.tls.cert_file = Some(PathBuf::from("cert.pem"));
+		c.tls.key_file = Some(PathBuf::from("key.pem"));
+
+		c.tls.port = c.server.port; // mqtts clashes with plain MQTT
+		assert!(c.validate().is_err());
+
+		c.tls.port = 8883;
+		c.tls.websocket_port = c.server.websocket_port; // wss clashes with plain ws
+		assert!(c.validate().is_err());
+
+		c.tls.websocket_port = 8884;
+		assert!(c.validate().is_ok(), "all four ports distinct");
+	}
+
+	#[test]
+	fn tls_port_helpers_track_enablement() {
+		let mut c = Config::default();
+		assert_eq!(c.tls.mqtts_port(), None);
+		assert_eq!(c.tls.wss_port(), None);
+
+		c.tls.enabled = true;
+		assert_eq!(c.tls.mqtts_port(), Some(8883));
+		assert_eq!(c.tls.wss_port(), Some(8884));
+
+		c.tls.websocket = false;
+		assert_eq!(c.tls.wss_port(), None, "wss requires tls.websocket");
 	}
 
 	#[test]

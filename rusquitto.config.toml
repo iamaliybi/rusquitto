@@ -9,6 +9,19 @@ websocket = true          # also accept MQTT-over-WebSocket (browser clients)
 websocket_port = 1884     # WebSocket listener port (must differ from `port`)
 listen_backlog = 1024     # per-shard listen(2) backlog (> 0)
 
+[tls]
+# TLS termination (rustls). Disabled by default. Only TLS 1.3 and 1.2 are offered,
+# with strong AEAD + ECDHE cipher suites; older protocols/ciphers are impossible.
+enabled = false           # master switch for the mqtts / wss listeners
+port = 8883               # native MQTT-over-TLS (mqtts) port; must differ from other listeners
+websocket = true          # also serve MQTT-over-WebSocket-over-TLS (wss) for browsers
+websocket_port = 8884     # wss listener port (used only when enabled and websocket)
+# cert_file = "certs/server.pem"  # PEM certificate chain, leaf first (required when enabled)
+# key_file  = "certs/server.key"  # PEM private key: PKCS#8, PKCS#1, or SEC1 (required when enabled)
+# For mqtts:// / wss:// in production, front rusquitto with a trusted certificate
+# (e.g. from your CA or Let's Encrypt). No client-certificate auth: clients
+# authenticate at the MQTT layer (username/password) over the encrypted link.
+
 [runtime]
 # cores = 8               # CPU cores to run on (one shard/executor per core). Default: all online; over-count is clamped.
 placement = "max-spread"  # max-spread (latency) | max-pack (locality) | unbound (no pinning)

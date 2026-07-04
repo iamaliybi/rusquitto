@@ -5,6 +5,39 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): from 1.0 on, the major
 version bumps for breaking changes, the minor for features, and the patch for fixes.
 
+## [Unreleased]
+
+### Added
+
+- **TLS termination (`mqtts://` `:8883`, `wss://` `:8884`).** Opt-in via the new
+  `[tls]` config section (`enabled`, `port`, `websocket`, `websocket_port`,
+  `cert_file`, `key_file`). Built on rustls with the `ring` provider, layered
+  behind the existing `ByteStream` seam so the MQTT engine is reused unchanged;
+  `WsStream` was made generic over its inner stream, so `wss://` is WebSocket over
+  TLS with no duplicated protocol code. Security posture: **only TLS 1.3 and 1.2**
+  are offered, restricted to a curated list of **AEAD + ECDHE** cipher suites
+  (forward secrecy; no CBC/RC4/3DES/static-RSA). The TLS handshake is bounded by
+  `connect_timeout` (a slow-loris guard), the shared `ServerConfig` is built once
+  and fails startup fast on a bad cert/key, and all listener ports are validated
+  to be distinct. No client-certificate (mTLS) auth — clients authenticate at the
+  MQTT layer over the encrypted link. Verified end-to-end with `mosquitto` v5 over
+  `mqtts` and an `openssl`-driven `wss` upgrade, including confirming TLS 1.0/1.1
+  are rejected.
+
+### Changed
+
+- **Code structure.** Split the two largest files by responsibility (no behaviour
+  change): `server/connection.rs` (1318 lines) → `connection/{mod,connect,publish,
+  subscribe,ack,delivery}.rs`, and `broker/shard.rs` → `shard/{mod,routing,mesh,
+  tests}.rs`. Folded repeated encode-then-write boilerplate into a `Connection::send`
+  helper.
+- **Tests (34 → 59).** Added a `ByteStream` mock harness that drives the connection
+  state machine without sockets, config-validation tests, and rustls handshake
+  tests (in-memory negotiation proving both TLS 1.3 and 1.2, and that only the
+  curated cipher suites are offered).
+- **Tooling.** A versioned `.githooks/pre-commit` runs `cargo fmt --check`, clippy
+  (`-D warnings`), and the test suite before each commit (`./.githooks/install.sh`).
+
 ## [1.0.0] - 2026-07-03
 
 First production release. Adds a WebSocket transport, a production security pass,
