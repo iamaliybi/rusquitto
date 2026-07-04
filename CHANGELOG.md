@@ -9,6 +9,29 @@ version bumps for breaking changes, the minor for features, and the patch for fi
 
 ### Added
 
+- **Overload handling** (`[overload]`) — a per-shard subsystem for the single-hot-core
+  case, modelled on Seastar/ScyllaDB. Each shard runs a lightweight probe that measures
+  its **reactor scheduling delay** (how far behind normal-priority work runs — a
+  saturation signal), smoothed into an EWMA and exposed at
+  `$SYS/broker/load/max-scheduling-delay-ms`. On top of it:
+  - **Scheduling groups**: background housekeeping (`$SYS`, session sweep, shedding)
+    now runs in a low-share glommio task queue, so under load it yields to the
+    client-serving work on the default queue instead of competing with it.
+  - **Stall WARN** (`overload.stall_warn_ms`): logs while a shard stays overloaded
+    (with hysteresis), and an info line when it recovers.
+  - **Admission control** (`overload.admission_delay_ms`, opt-in): rejects new
+    connections while a shard is overloaded, so the client's retry may hash onto a
+    cooler core; existing connections are untouched.
+  - **Load shedding** (`overload.shed_delay_ms` / `shed_batch`, opt-in): under
+    sustained overload, closes a batch of connections per second so they reconnect
+    from a new source port and `SO_REUSEPORT` rehashes them elsewhere — the
+    thread-per-core way to rebalance (move the connection, since compute can't move).
+  - New `$SYS/broker/load/{connections-shed,admission-rejected}` counters.
+
+  Verified end-to-end by saturating one core (1500 subscribers + a flood publisher):
+  the gauge climbed from ~0 to seconds of delay and recovered afterward, the stall
+  WARN fired, admission control rejected new connections, and shedding closed
+  connections in batches.
 - **Per-connection PUBLISH rate limiting** (`limits.max_message_rate`, messages/sec,
   `0` = off). A token bucket (one-second burst, then paced to the rate) *throttles*
   an over-rate publisher — the connection sleeps for the computed delay, applying

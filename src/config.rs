@@ -47,6 +47,7 @@ pub struct Config {
 	pub runtime: RuntimeConfig,
 	pub logging: LoggingConfig,
 	pub limits: LimitsConfig,
+	pub overload: OverloadConfig,
 	pub auth: AuthConfig,
 	pub sys: SysConfig,
 }
@@ -208,6 +209,33 @@ pub struct LimitsConfig {
 	pub max_message_rate: u32,
 }
 
+/// `[overload]` — per-shard overload handling. A lightweight probe tracks each
+/// shard's *scheduling delay* (how far behind its reactor is on normal-priority
+/// work, i.e. reactor saturation). Detection is always on and cheap; the
+/// mitigations below act on that signal and are opt-in.
+///
+/// The thread-per-core model pins a connection to the shard that accepted it and
+/// has no work-stealing, so these levers *prevent* and *rebalance* rather than
+/// migrate compute: reject at the door, or shed so the client rehashes elsewhere.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OverloadConfig {
+	/// Log a WARN while a shard's scheduling delay stays above this many
+	/// milliseconds (`0` = never). A cheap stall detector.
+	pub stall_warn_ms: u32,
+	/// Reject new connections on a shard whose scheduling delay exceeds this many
+	/// milliseconds (`0` = disabled). The rejected client's retry may hash onto a
+	/// cooler core.
+	pub admission_delay_ms: u32,
+	/// Shed (close) existing connections on a shard whose scheduling delay exceeds
+	/// this many milliseconds (`0` = disabled), up to `shed_batch` per second. A
+	/// shed client reconnects from a new source port, which `SO_REUSEPORT` rehashes
+	/// — usually onto a cooler core. Disruptive; off by default.
+	pub shed_delay_ms: u32,
+	/// Maximum connections shed per second per shard while shedding is active.
+	pub shed_batch: usize,
+}
+
 /// `[auth]` — connection authentication. When `allow_anonymous` is true and no
 /// users are defined (the default), authentication is a no-op and any client may
 /// connect.
@@ -349,6 +377,17 @@ impl Default for LimitsConfig {
 			max_subscriptions_per_client: 1024,
 			max_retained_messages: 100_000,
 			max_message_rate: 0,
+		}
+	}
+}
+
+impl Default for OverloadConfig {
+	fn default() -> Self {
+		Self {
+			stall_warn_ms: 100,
+			admission_delay_ms: 0,
+			shed_delay_ms: 0,
+			shed_batch: 8,
 		}
 	}
 }

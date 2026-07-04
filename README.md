@@ -52,6 +52,13 @@ isolated, shard-local executor — no `Mutex`, no `RwLock`, no work-stealing.
   The rate limit *throttles* (paces the client to its budget, applying backpressure) rather than dropping, which
   bounds how much CPU a single noisy publisher can draw on its pinned core — relevant because a connection is served
   entirely by the one shard that accepted it.
+- **Overload handling** (`[overload]`) — because a connection is pinned to one shard and there is no work-stealing,
+  each shard tracks its **reactor scheduling delay** (saturation, exposed at `$SYS/broker/load/max-scheduling-delay-ms`)
+  and acts on it: a **stall WARN**, optional **admission control** (reject new connections while overloaded so the
+  client's retry may land on a cooler core), and optional **load shedding** (close a batch of connections so they
+  reconnect and `SO_REUSEPORT` rehashes them elsewhere — the thread-per-core way to rebalance, by moving the
+  *connection* since the compute can't move). Background housekeeping (`$SYS`, session sweep, shedding) runs in a
+  low-priority glommio task queue so it yields to client-serving work under load.
 - **Cross-shard routing** over a `glommio` channel mesh, so a publisher and subscriber on different cores still reach
   each other. QoS 1/2 forwards apply **backpressure** (an awaiting mesh send), so the delivery guarantee holds across
   shards — the publisher waits rather than dropping when a mesh link is full. QoS 0 stays fire-and-forget.

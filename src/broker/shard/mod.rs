@@ -240,6 +240,33 @@ impl ShardState {
 		}
 	}
 
+	/// Sheds up to `max` currently-connected sessions to relieve an overloaded
+	/// shard, returning how many were shed.
+	///
+	/// Dropping a session's live mailbox closes the sender, so the connection's
+	/// event loop wakes with a closed receiver and ends (its normal cleanup then
+	/// suspends or discards the session per its expiry, exactly as any disconnect).
+	/// The client reconnects from a *new* source port, so `SO_REUSEPORT` rehashes
+	/// it — usually onto a less-loaded shard. Already-suspended sessions (no live
+	/// mailbox) are skipped. This is how the thread-per-core model rebalances: it
+	/// moves the *connection*, since the compute can't move between cores.
+	pub fn shed_connections(&mut self, max: usize) -> usize {
+		if max == 0 {
+			return 0;
+		}
+		let mut shed = 0;
+		for session in self.sessions.values_mut() {
+			if shed >= max {
+				break;
+			}
+			if session.mailbox.is_some() {
+				session.mailbox = None;
+				shed += 1;
+			}
+		}
+		shed
+	}
+
 	/// Arms a delayed Will Message on a suspended session: it fires from
 	/// [`sweep_expired`](Self::sweep_expired) once `delay_secs` elapses, unless the
 	/// client reconnects first (which clears it in [`open_session`](Self::open_session)).
