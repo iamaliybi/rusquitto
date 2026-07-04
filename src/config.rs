@@ -48,6 +48,7 @@ pub struct Config {
 	pub logging: LoggingConfig,
 	pub limits: LimitsConfig,
 	pub overload: OverloadConfig,
+	pub persistence: PersistenceConfig,
 	pub auth: AuthConfig,
 	pub sys: SysConfig,
 }
@@ -236,6 +237,32 @@ pub struct OverloadConfig {
 	pub shed_batch: usize,
 }
 
+/// `[persistence]` — disk-backed durability. Disabled by default; the broker is
+/// otherwise entirely in-memory. When enabled, the **retained-message** set is
+/// snapshotted to `dir/retained_file` periodically and on graceful shutdown, and
+/// restored on startup — so retained "last known value" topics survive a restart.
+/// (Sessions and queued messages are not yet persisted.)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PersistenceConfig {
+	/// Master switch for on-disk persistence.
+	pub enabled: bool,
+	/// Directory holding the snapshot files (created if missing).
+	pub dir: PathBuf,
+	/// File name for the retained-message snapshot.
+	pub retained_file: String,
+	/// Seconds between snapshots (`0` = snapshot only on graceful shutdown). A crash
+	/// may lose retained updates made since the last snapshot.
+	pub snapshot_interval: u64,
+}
+
+impl PersistenceConfig {
+	/// Full path to the retained-message snapshot file.
+	pub fn retained_path(&self) -> PathBuf {
+		self.dir.join(&self.retained_file)
+	}
+}
+
 /// `[auth]` — connection authentication. When `allow_anonymous` is true and no
 /// users are defined (the default), authentication is a no-op and any client may
 /// connect.
@@ -392,6 +419,17 @@ impl Default for OverloadConfig {
 	}
 }
 
+impl Default for PersistenceConfig {
+	fn default() -> Self {
+		Self {
+			enabled: false,
+			dir: PathBuf::from("data"),
+			retained_file: "retained.mqtt".to_string(),
+			snapshot_interval: 300,
+		}
+	}
+}
+
 // ===========================================================================
 // Loading, validation, and derived values
 // ===========================================================================
@@ -469,6 +507,9 @@ impl Config {
 		}
 		if self.limits.max_payload_size == 0 {
 			return invalid("limits.max_payload_size must be non-zero");
+		}
+		if self.persistence.enabled && self.persistence.retained_file.is_empty() {
+			return invalid("persistence.retained_file must be set when persistence is enabled");
 		}
 		if self.limits.initial_read_buffer == 0 {
 			return invalid("limits.initial_read_buffer must be non-zero");
@@ -661,6 +702,20 @@ mod tests {
 
 		c.tls.websocket = false;
 		assert_eq!(c.tls.wss_port(), None, "wss requires tls.websocket");
+	}
+
+	#[test]
+	fn persistence_enabled_requires_a_retained_file() {
+		let mut c = Config::default();
+		c.persistence.enabled = true;
+		assert!(c.validate().is_ok(), "default retained_file is set");
+		assert_eq!(
+			c.persistence.retained_path(),
+			PathBuf::from("data/retained.mqtt")
+		);
+
+		c.persistence.retained_file = String::new();
+		assert!(c.validate().is_err());
 	}
 
 	#[test]

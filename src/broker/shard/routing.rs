@@ -66,6 +66,30 @@ impl ShardState {
 			.collect()
 	}
 
+	/// Snapshots the whole retained set, for persistence.
+	pub fn retained_messages(&self) -> Vec<Publish> {
+		self.retained.values().cloned().collect()
+	}
+
+	/// Restores retained messages from a snapshot (startup), respecting the shard's
+	/// retained cap. Every shard loads the same snapshot into its own table, so no
+	/// cross-shard broadcast is needed.
+	pub fn load_retained(&mut self, messages: Vec<Publish>) {
+		for message in messages {
+			// Empty-payload "clears" are never persisted, but skip them defensively.
+			if message.payload.is_empty() {
+				continue;
+			}
+			if self.retained_limit > 0
+				&& self.retained.len() >= self.retained_limit
+				&& !self.retained.contains_key(&message.topic)
+			{
+				continue;
+			}
+			self.retained.insert(message.topic.clone(), message);
+		}
+	}
+
 	/// Fans a message out to the local subscribers whose filter matches the publish
 	/// topic.
 	///

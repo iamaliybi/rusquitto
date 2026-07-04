@@ -2,6 +2,7 @@ use crate::auth::Authenticator;
 use crate::broker::mesh::MeshMsg;
 use crate::broker::shard::ShardState;
 use crate::config::Config;
+use crate::persistence;
 use crate::server::connection::Connection;
 use crate::server::overload::LoadMonitor;
 use crate::telemetry::metrics::Metrics;
@@ -227,6 +228,29 @@ pub async fn init(
 		s.set_retained_limit(config.limits.max_retained_messages);
 	}
 
+	// Restore persisted retained messages before accepting, so early subscribers see
+	// them. Every shard loads the same snapshot into its own table (retained is
+	// replicated across shards), so no cross-shard coordination is needed.
+	if config.persistence.enabled {
+		let path = config.persistence.retained_path();
+		match persistence::load_retained(&path).await {
+			Ok(messages) => {
+				let restored = messages.len();
+				state.borrow_mut().load_retained(messages);
+				if mesh_peer_id == 0 && restored > 0 {
+					tracing::info!(
+						shard = shard_id,
+						retained = restored,
+						"restored retained messages from disk"
+					);
+				}
+			}
+			Err(e) => {
+				tracing::error!(shard = shard_id, error = %e, path = %path.display(), "failed to load retained snapshot");
+			}
+		}
+	}
+
 	// Drain inbound cross-shard messages into local fan-out / migration handling.
 	for (_producer, receiver) in receivers.streams() {
 		let state = state.clone();
@@ -329,6 +353,35 @@ pub async fn init(
 		)
 		.expect("spawn load-shedding task")
 		.detach();
+	}
+
+	// Peer 0 owns persisting the retained snapshot (all shards hold identical
+	// copies). Periodic snapshots run on the background queue; a final one is written
+	// on graceful shutdown at the end of this function.
+	if config.persistence.enabled && mesh_peer_id == 0 {
+		if let Err(e) = std::fs::create_dir_all(&config.persistence.dir) {
+			tracing::error!(error = %e, dir = %config.persistence.dir.display(), "failed to create persistence dir");
+		}
+		let snapshot_secs = config.persistence.snapshot_interval;
+		if snapshot_secs > 0 {
+			let state = state.clone();
+			let path = config.persistence.retained_path();
+			glommio::spawn_local_into(
+				async move {
+					loop {
+						glommio::timer::sleep(Duration::from_secs(snapshot_secs)).await;
+						let messages = state.borrow().retained_messages();
+						match persistence::save_retained(&path, &messages).await {
+							Ok(()) => tracing::debug!(retained = messages.len(), "retained snapshot written"),
+							Err(e) => tracing::error!(error = %e, "retained snapshot failed"),
+						}
+					}
+				},
+				tq_maintenance,
+			)
+			.expect("spawn persistence snapshot task")
+			.detach();
+		}
 	}
 
 	// One shard owns publishing `$SYS` metrics (broker-wide totals). Messages are
@@ -515,6 +568,23 @@ pub async fn init(
 	while counts.total.get() > 0 && Instant::now() < deadline {
 		glommio::timer::sleep(SHUTDOWN_DRAIN_POLL).await;
 	}
+
+	// Final retained snapshot on graceful shutdown (peer 0), capturing anything since
+	// the last periodic write so a clean stop loses nothing.
+	if config.persistence.enabled && mesh_peer_id == 0 {
+		let messages = state.borrow().retained_messages();
+		match persistence::save_retained(&config.persistence.retained_path(), &messages).await {
+			Ok(()) => {
+				tracing::info!(
+					shard = shard_id,
+					retained = messages.len(),
+					"wrote final retained snapshot"
+				)
+			}
+			Err(e) => tracing::error!(shard = shard_id, error = %e, "final retained snapshot failed"),
+		}
+	}
+
 	tracing::info!(
 		shard = shard_id,
 		remaining = counts.total.get(),

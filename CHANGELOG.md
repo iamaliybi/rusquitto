@@ -5,6 +5,24 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): from 1.0 on, the major
 version bumps for breaking changes, the minor for features, and the patch for fixes.
 
+## [Unreleased]
+
+### Added
+
+- **Retained-message persistence** (`[persistence]`, opt-in) — the retained set is
+  snapshotted to disk and restored on startup, so "last known value" topics survive
+  a restart. Every shard holds an identical retained copy, so one shard (peer 0)
+  writes the snapshot and every shard reloads it on boot — no cross-shard
+  coordination. The snapshot is the concatenated MQTT wire bytes of each retained
+  PUBLISH behind a magic header (same codec as the network, so all v5 properties
+  round-trip). Writes are atomic (temp file → `fdatasync` → rename) via glommio's
+  io_uring `BufferedFile`, so they never block the reactor and a crash mid-write
+  can't corrupt the previous snapshot. Snapshots run periodically
+  (`snapshot_interval`) and on graceful shutdown. Verified end-to-end: retained
+  messages survive a graceful restart and a `kill -9` (up to the last snapshot);
+  non-retained messages and retained clears behave correctly across restart.
+  *Sessions and queued messages are still in-memory only.*
+
 ## [1.2.0] - 2026-07-04
 
 ### Added
