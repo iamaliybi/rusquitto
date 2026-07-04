@@ -14,10 +14,13 @@ mod ack;
 mod connect;
 mod delivery;
 mod publish;
+mod ratelimit;
 mod subscribe;
 
 #[cfg(test)]
 mod tests;
+
+use ratelimit::TokenBucket;
 
 use bytes::BytesMut;
 use futures_lite::FutureExt;
@@ -166,6 +169,9 @@ pub struct Connection<S: ByteStream> {
 	keepalive: Option<Duration>,
 	/// Count of active subscriptions, enforced against `limits.max_subscriptions_per_client`.
 	subscription_count: usize,
+	/// Per-connection inbound PUBLISH throttle. `Some` when `limits.max_message_rate`
+	/// is set: bounds how much CPU one noisy publisher can draw on its pinned core.
+	rate_limiter: Option<TokenBucket>,
 }
 
 impl<S: ByteStream> Connection<S> {
@@ -214,6 +220,8 @@ impl<S: ByteStream> Connection<S> {
 				.then(|| Instant::now() + Duration::from_secs(u64::from(limits.connect_timeout))),
 			keepalive: None,
 			subscription_count: 0,
+			rate_limiter: (limits.max_message_rate > 0)
+				.then(|| TokenBucket::per_second(limits.max_message_rate, Instant::now())),
 		}
 	}
 

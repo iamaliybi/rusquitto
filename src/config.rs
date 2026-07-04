@@ -202,6 +202,10 @@ pub struct LimitsConfig {
 	pub max_subscriptions_per_client: usize,
 	/// Maximum distinct retained messages stored per shard (`0` = unlimited).
 	pub max_retained_messages: usize,
+	/// Maximum inbound PUBLISH messages per second, per connection (`0` = unlimited).
+	/// A client exceeding it is throttled (paced to the rate), not disconnected.
+	/// Bounds how much CPU one noisy publisher can draw on its pinned core.
+	pub max_message_rate: u32,
 }
 
 /// `[auth]` — connection authentication. When `allow_anonymous` is true and no
@@ -344,6 +348,7 @@ impl Default for LimitsConfig {
 			max_session_expiry: 86_400,
 			max_subscriptions_per_client: 1024,
 			max_retained_messages: 100_000,
+			max_message_rate: 0,
 		}
 	}
 }

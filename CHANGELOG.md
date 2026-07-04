@@ -5,6 +5,19 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): from 1.0 on, the major
 version bumps for breaking changes, the minor for features, and the patch for fixes.
 
+## [Unreleased]
+
+### Added
+
+- **Per-connection PUBLISH rate limiting** (`limits.max_message_rate`, messages/sec,
+  `0` = off). A token bucket (one-second burst, then paced to the rate) *throttles*
+  an over-rate publisher — the connection sleeps for the computed delay, applying
+  TCP backpressure — rather than dropping messages. In the thread-per-core model a
+  connection is served entirely by the shard that accepted it, so this bounds how
+  much CPU one noisy publisher can draw on its pinned core. Verified end-to-end: 30
+  messages down one connection at a 10/s limit are delivered over ~2s with zero
+  drops (vs ~0.2s unlimited).
+
 ## [1.1.0] - 2026-07-04
 
 ### Added

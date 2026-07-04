@@ -48,6 +48,7 @@ connect_timeout = 10                # seconds a new socket has to send CONNECT b
 max_session_expiry = 86400          # cap on Session Expiry Interval, seconds (0 = uncapped)
 max_subscriptions_per_client = 1024 # cap on active subscriptions per client (0 = unlimited)
 max_retained_messages = 100000      # cap on distinct retained topics per shard (0 = unlimited)
+max_message_rate = 0                # max inbound PUBLISH/sec per connection (0 = unlimited); over-rate clients are throttled, not dropped
 
 [auth]
 # Default (anonymous allowed, no users) makes auth a no-op.
