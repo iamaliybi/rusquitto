@@ -104,7 +104,7 @@ impl<S: ByteStream> Connection<S> {
 		}
 
 		let sub_ack = mqtt_v5::SubAck::new(subscribe.pkid, return_codes);
-		self.send(|buf| sub_ack.write(buf)).await?;
+		self.send(|buf| sub_ack.write(buf))?;
 
 		// Replay matching retained messages, delivered with the retain flag set and
 		// downgraded to min(message QoS, granted QoS) for this subscription. Routed
@@ -118,8 +118,7 @@ impl<S: ByteStream> Connection<S> {
 				qos,
 				retain: true,
 				sub_ids: sub_ids.clone(),
-			})
-			.await?;
+			})?;
 		}
 
 		Ok(())
@@ -145,6 +144,6 @@ impl<S: ByteStream> Connection<S> {
 
 		let mut unsub_ack = mqtt_v5::UnsubAck::new(unsubscribe.pkid);
 		unsub_ack.reasons = reasons;
-		self.send(|buf| unsub_ack.write(buf)).await
+		self.send(|buf| unsub_ack.write(buf))
 	}
 }

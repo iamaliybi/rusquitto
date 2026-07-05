@@ -5,6 +5,37 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): from 1.0 on, the major
 version bumps for breaking changes, the minor for features, and the patch for fixes.
 
+## [Unreleased]
+
+### Changed
+
+- **Per-connection memory diet** for high concurrency on small hosts (1–2 GB):
+  the outbound mailbox no longer pre-allocates its ring (glommio's bounded
+  channel reserved 320 KiB *per connection*; now an unbounded channel with the
+  same drop-on-full bound enforced at the routing site — idle cost zero), the
+  read assembly buffer starts empty and grows on demand with an adaptive
+  512 B–8 KiB per-read reservation (reads land directly in the buffer, removing
+  the fixed 2 KiB scratch copy), and oversized buffers are trimmed once idle so
+  a burst's high-water mark isn't pinned forever. Measured (2000 connections,
+  release build): idle RSS 24.9 → 16.1 KiB/conn, adversarial stalled-subscriber
+  burst 86.9 → 31.1 KiB/conn, idle virtual 342.8 → 0.84 KiB/conn.
+  `limits.initial_read_buffer` now defaults to `0` (grow on demand); a non-zero
+  value still pre-sizes the buffer.
+- **Coalesced writes**: every packet a wakeup produces (ack bursts, fan-out
+  batches, resume retransmits) is encoded into one output buffer and written
+  with a single `write_all` — one io_uring op, one TLS record, one WebSocket
+  frame per batch instead of one per packet. The buffer flushes at 16 KiB
+  mid-batch, which also caps the elastic memory a stalled consumer can pin.
+
+### Added
+
+- **Memory tooling** (`stress/`): `memprobe.py` measures resident/virtual
+  memory per idle connection and under a stalled-subscriber burst;
+  `soak.py` runs adversarial churn/flood/stall/recover cycles for a
+  configurable duration, samples broker RSS, and fails on sustained growth
+  (leak/fragmentation detection). Verified: RSS plateaus (+0.7 % over a
+  14-cycle run) under repeated adversarial cycles.
+
 ## [1.3.0] - 2026-07-05
 
 ### Added

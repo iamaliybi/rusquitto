@@ -407,3 +407,39 @@ over the glommio mesh. Builds with zero warnings.
 - `route` collects matches then dedups by `client_id` (a client overlapping via several filters gets one copy).
 - Build target note: binary is at `target/x86_64-unknown-linux-gnu/debug/rusquitto` (a custom default target triple is
   configured), NOT `target/debug/`.
+
+---
+
+## Phase 5 — Connection memory diet + write coalescing (2026-07-05)
+
+Target: high concurrency on 1-2 GB hosts (t4g-class). Baseline measured with
+stress/memprobe.py (2000 conns, release): idle 24.9 KiB RSS/conn, 342.8 KiB
+VmSize/conn, stalled-subscriber burst 86.9 KiB/conn, +66 MB retained after
+close-all.
+
+Top-3 hogs found: (1) glommio bounded local_channel PRE-ALLOCATES its ring —
+MAILBOX_CAPACITY 8192 x 40 B Delivery = 320 KiB virtual per conn, resident after
+bursts; (2) eager 4 KiB initial_read_buffer + 2 KiB temp_buf held across await
+in every task future (+1 memcpy per read); (3) per-packet write path: fresh
+BytesMut + one write_all (= 1 io_uring op / TLS record / WS frame) per packet.
+
+Fixes: mailbox -> new_unbounded() + MAILBOX_LIMIT=256 drop-on-full guard at the
+routing site (session.rs const, checked via LocalSender::len()); read path ->
+lazy adaptive buffer (512 B-8 KiB chunk, resize/truncate directly into
+BytesMut tail, cancel-safe via truncate(valid) after the race), buffers trimmed
+when empty above 16 KiB; write path -> per-connection out: BytesMut buffer, all
+sends append, one flush per event-loop wakeup (drain-parse -> drain-mailbox ->
+flush -> block), FLUSH_THRESHOLD 16 KiB doubles as the stalled-consumer memory
+ceiling. event_loop restructured accordingly (parse_packet is sync; the race
+returns raw bytes). initial_read_buffer default 4096 -> 0 (0 = on demand).
+
+Result (same probe): idle 16.1 KiB/conn RSS (VmSize 0.84 KiB), burst 31.1
+KiB/conn. run() future = 3312 B, Connection = 832 B. Remaining ~12 KiB/conn is
+glommio task/sources/channel + allocator overhead — needs a heaptrack pass
+(follow-up). stress/soak.py added (churn/flood/stall/recover cycles, RSS trend
+verdict): PASS, +0.7% over 14 cycles. Verified: 77 unit tests, clippy -D
+warnings, mosquitto v5 QoS2 + retained round-trip on the new event loop.
+
+GOTCHA: tests drive process_packet directly and now must flush — see
+tests::drive(). GOTCHA: glommio LocalReceiver has no try_recv; non-blocking
+drain uses futures_lite::future::poll_once(recv()).

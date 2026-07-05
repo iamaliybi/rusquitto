@@ -7,7 +7,7 @@ use std::rc::Rc;
 use mqttbytes::{QoS, v5::Publish};
 
 use super::ShardState;
-use crate::broker::session::{Delivery, OFFLINE_QUEUE_LIMIT};
+use crate::broker::session::{Delivery, MAILBOX_LIMIT, OFFLINE_QUEUE_LIMIT};
 use crate::broker::topics::filter_matches;
 use crate::protocol::min_qos;
 
@@ -194,7 +194,13 @@ impl ShardState {
 		};
 		match &session.mailbox {
 			Some(mailbox) => {
-				let _ = mailbox.try_send(Delivery { publish: publish.clone(), qos, retain, sub_ids });
+				// The mailbox channel is unbounded so an idle connection allocates
+				// nothing; this length guard enforces the same drop-on-full bound a
+				// bounded channel would (a consumer that stops reading its socket
+				// stops draining, and unbounded growth would be a DoS).
+				if mailbox.len() < MAILBOX_LIMIT {
+					let _ = mailbox.try_send(Delivery { publish: publish.clone(), qos, retain, sub_ids });
+				}
 			}
 			None if qos != QoS::AtMostOnce => {
 				if session.offline_queue.len() >= OFFLINE_QUEUE_LIMIT {

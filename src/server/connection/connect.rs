@@ -25,7 +25,9 @@ impl<S: ByteStream> Connection<S> {
 		let mut conn_ack = mqtt_v5::ConnAck::new(code, false);
 		// Attach empty properties so mqttbytes emits the mandatory v5 length byte.
 		conn_ack.properties = Some(mqtt_v5::ConnAckProperties::new());
-		self.send(|buf| conn_ack.write(buf)).await?;
+		// The buffered CONNACK reaches the wire via the best-effort flush on the
+		// connection's exit path, right after this error unwinds the event loop.
+		self.send(|buf| conn_ack.write(buf))?;
 		Err(Error::new(
 			ErrorKind::PermissionDenied,
 			"authentication failed",
@@ -228,7 +230,7 @@ impl<S: ByteStream> Connection<S> {
 		ack_props.topic_alias_max = Some(Self::INBOUND_TOPIC_ALIAS_MAX);
 
 		conn_ack.properties = Some(ack_props);
-		self.send(|buf| conn_ack.write(buf)).await?;
+		self.send(|buf| conn_ack.write(buf))?;
 
 		// The handshake is complete: further packets are now expected, and the idle
 		// deadline switches from the handshake timeout to keep-alive enforcement. The

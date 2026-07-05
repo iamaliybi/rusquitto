@@ -15,6 +15,14 @@ use mqttbytes::{QoS, v5::Publish};
 /// unbounded backlog.
 pub const OFFLINE_QUEUE_LIMIT: usize = 1024;
 
+/// Upper bound on deliveries queued in a *connected* session's mailbox, enforced
+/// at the routing site (the channel itself is unbounded so an idle connection
+/// allocates nothing). This is a hard DoS guard: if a subscriber stops reading
+/// its socket, its connection task parks on the blocked write and stops draining
+/// the mailbox — without the bound, other clients' publishes would grow it
+/// without limit. Further deliveries to a full mailbox are dropped.
+pub const MAILBOX_LIMIT: usize = 256;
+
 /// Stage of an outbound QoS 1/2 message awaiting acknowledgement, held per
 /// in-flight packet id so the exchange can resume after a reconnect.
 #[derive(Clone, Copy)]

@@ -11,7 +11,7 @@ use crate::transport::ByteStream;
 
 impl<S: ByteStream> Connection<S> {
 	pub(super) async fn handle_ping(&mut self) -> Result<()> {
-		self.send(|buf| mqtt_v5::PingResp.write(buf)).await
+		self.send(|buf| mqtt_v5::PingResp.write(buf))
 	}
 
 	pub(super) async fn handle_disconnect(&mut self, disconnect: mqtt_v5::Disconnect) -> Result<()> {
@@ -34,7 +34,7 @@ impl<S: ByteStream> Connection<S> {
 		// transaction is complete; release the packet id and let a held message
 		// through the freed window slot.
 		if self.inflight.remove(&puback.pkid).is_some() {
-			self.drain_pending().await?;
+			self.drain_pending()?;
 		}
 		Ok(())
 	}
@@ -49,7 +49,6 @@ impl<S: ByteStream> Connection<S> {
 		}
 
 		self.send(|buf| mqtt_v5::PubRel::new(pubrec.pkid).write(buf))
-			.await
 	}
 
 	pub(super) async fn handle_pubrel(&mut self, pubrel: mqtt_v5::PubRel) -> Result<()> {
@@ -60,14 +59,13 @@ impl<S: ByteStream> Connection<S> {
 		}
 
 		self.send(|buf| mqtt_v5::PubComp::new(pubrel.pkid).write(buf))
-			.await
 	}
 
 	pub(super) async fn handle_pubcomp(&mut self, pubcomp: mqtt_v5::PubComp) -> Result<()> {
 		// QoS 2, sender side (step 4): the client finalized the transaction.
 		// Release the packet id and admit a held message into the freed slot.
 		if self.inflight.remove(&pubcomp.pkid).is_some() {
-			self.drain_pending().await?;
+			self.drain_pending()?;
 		}
 		Ok(())
 	}

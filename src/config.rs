@@ -183,7 +183,10 @@ pub struct LimitsConfig {
 	pub max_connections_per_ip: usize,
 	/// Maximum accepted MQTT packet size, in bytes.
 	pub max_payload_size: usize,
-	/// Initial per-connection assembly buffer capacity, in bytes.
+	/// Initial per-connection assembly buffer capacity, in bytes. `0` (the
+	/// default, recommended) allocates nothing up front: the buffer grows on
+	/// demand from the first read and is trimmed when idle, so idle connections
+	/// hold no read-buffer memory.
 	pub initial_read_buffer: usize,
 	/// Outbound QoS 1/2 in-flight window per connection (informational ceiling).
 	pub max_inflight: u16,
@@ -402,7 +405,7 @@ impl Default for LimitsConfig {
 			max_connections_per_shard: 16_384,
 			max_connections_per_ip: 0,
 			max_payload_size: 64 * 1024,
-			initial_read_buffer: 4 * 1024,
+			initial_read_buffer: 0,
 			max_inflight: 128,
 			max_qos: 2,
 			keep_alive: 60,
@@ -518,9 +521,6 @@ impl Config {
 		}
 		if self.persistence.enabled && self.persistence.retained_file.is_empty() {
 			return invalid("persistence.retained_file must be set when persistence is enabled");
-		}
-		if self.limits.initial_read_buffer == 0 {
-			return invalid("limits.initial_read_buffer must be non-zero");
 		}
 		if self.sys.enabled && self.sys.interval == 0 {
 			return invalid("sys.interval must be non-zero when sys.enabled is true");

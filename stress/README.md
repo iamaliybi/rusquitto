@@ -18,6 +18,8 @@ and ends with a health check + a broker-liveness/panic scan.
 | `stresser.rs`  | Rust (std only) | Compiled, many-threaded throughput hammer for max load |
 | `netchaos.sh`  | Bash + tc/hping3 | Kernel/TCP-level chaos (latency, loss, SYN flood) — needs root |
 | `run.sh`       | Bash | Orchestrator: build → launch → attack → teardown |
+| `memprobe.py`  | Python (stdlib) | Per-connection RSS/VmSize measurement: N idle conns, optional stalled-subscriber burst (`--burst`) |
+| `soak.py`      | Python (stdlib) | Long-run memory-stability soak: churn/flood/stall/recover cycles, RSS sampling to CSV, fails on sustained growth |
 
 Everything is dependency-free: `attack.py` needs only Python 3.8+, `stresser.rs`
 compiles with a bare `rustc`, and `netchaos.sh` degrades gracefully if `tc`/`hping3`
@@ -45,6 +47,14 @@ Compiled throughput hammer (heaviest load):
 ```bash
 rustc -O stresser.rs -o stresser
 ./stresser 127.0.0.1:1883 --connections 4000 --duration 20 --qos 1 --payload 128
+```
+
+Memory measurement and long-run stability (broker must already be running):
+
+```bash
+ulimit -n 65536
+python3 memprobe.py 2000 --burst       # KiB/conn idle + under stalled-subscriber burst
+python3 soak.py --minutes 60           # adversarial soak; exit 1 on sustained RSS growth
 ```
 
 ## Scenarios (`attack.py`)
