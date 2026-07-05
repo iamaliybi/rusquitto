@@ -1,6 +1,6 @@
 [package]
 name = "rusquitto"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2024"
 default-run = "rusquitto"
 
@@ -24,8 +24,10 @@ toml = "1.1"
 # Process signals (graceful shutdown on SIGTERM / SIGINT)
 signal-hook = "0.4"
 
-# Password hashing (SHA-256 for `[[auth.users]]` password_hash)
+# Password hashing for `[[auth.users]]` password_hash: legacy SHA-256 hex, plus
+# Argon2id PHC strings (salted, memory-hard — the recommended form).
 sha2 = "0.11"
+argon2 = "0.5"
 
 # WebSocket transport: RFC 6455 handshake (SHA-1 + base64 of Sec-WebSocket-Key)
 sha1 = "0.11"
