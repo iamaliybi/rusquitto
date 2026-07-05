@@ -186,6 +186,13 @@ pub(super) async fn accept_loop(
 			AcceptTurn::Failed | AcceptTurn::Tick => continue,
 		};
 
+		// Disable Nagle on the accepted socket *explicitly*. The listener sets
+		// TCP_NODELAY (`transport::tcp`) and Linux happens to inherit it, but MQTT is
+		// request/response — a coalesced small PUBACK/PUBLISH costs a round-trip of
+		// latency — so guarantee it per-connection rather than lean on kernel
+		// inheritance that isn't contractual across platforms/versions.
+		let _ = stream.set_nodelay(true);
+
 		let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
 
 		// Admission control: while the shard's scheduling delay is over budget, shed

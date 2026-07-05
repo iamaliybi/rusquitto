@@ -108,7 +108,15 @@ impl<S: ByteStream> Connection<S> {
 	/// client id for a client publish (No Local), or `None` for a
 	/// broker-originated one such as a Will Message.
 	pub(super) async fn fan_out(&self, message: mqtt_v5::Publish, publisher: Option<&str>) {
-		let senders = self.shard.borrow().mesh_senders();
+		// Forward to peer shards only when there are any: a single-shard broker has
+		// no peers, so skip cloning the senders handle and the self-only loop and go
+		// straight to local delivery — the hot path for the common 1-core deployment.
+		let senders = {
+			let shard = self.shard.borrow();
+			(shard.mesh_peers() > 0)
+				.then(|| shard.mesh_senders())
+				.flatten()
+		};
 		if let Some(senders) = senders {
 			let me = senders.peer_id();
 			for idx in 0..senders.nr_consumers() {

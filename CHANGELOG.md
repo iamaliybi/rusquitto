@@ -5,6 +5,33 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): from 1.0 on, the major
 version bumps for breaking changes, the minor for features, and the patch for fixes.
 
+## [1.9.1] - 2026-07-06
+
+Robustness plus a measurement: the ack-bound throughput and cross-shard
+single-message latency items from the audit were investigated and found to be at
+their floor, with no application-level headroom.
+
+### Changed
+
+- **`TCP_NODELAY` is now set explicitly on every accepted socket**, not left to
+  kernel inheritance from the listener. MQTT is request/response, so Nagle
+  coalescing a small PUBACK/PUBLISH would cost a round-trip of latency — setting
+  the option per-connection guarantees it regardless of platform or version.
+- **Single-shard brokers skip the mesh fan-out path.** `fan_out` no longer clones
+  the (absent) peer-senders handle or runs the self-only loop when there are no
+  peers; it goes straight to local delivery.
+
+### Notes on the audit items (measured, not guessed)
+
+Single-shard QoS 1 request-response is **55 µs p50** (76 µs p90, 128 µs p99), and
+`TCP_NODELAY` was already effective (no Nagle artifacts) — so the per-request cost
+is the `mqttbytes` parse plus the socket round-trip, at parity with a mature C
+broker; the change above is a portability guarantee, not a latency change here.
+The cross-shard single-message tax is one cross-thread reactor wake
+(glommio-internal). Neither has application-level headroom; going lower is the
+below-glommio work tracked in `next-steps.md` §1. **These are robustness/cleanup
+changes, not a throughput or latency win.**
+
 ## [1.9.0] - 2026-07-06
 
 Cross-shard reliability and hot-path efficiency: the mesh control plane is now
