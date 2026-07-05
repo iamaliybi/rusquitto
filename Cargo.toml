@@ -1,6 +1,6 @@
 [package]
 name = "rusquitto"
-version = "1.6.0"
+version = "1.6.5"
 edition = "2024"
 default-run = "rusquitto"
 

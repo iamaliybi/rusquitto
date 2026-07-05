@@ -5,7 +5,7 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): from 1.0 on, the major
 version bumps for breaking changes, the minor for features, and the patch for fixes.
 
-## [Unreleased]
+## [1.6.5] - 2026-07-05
 
 ### Changed
 
@@ -412,6 +412,8 @@ All changes are additive; there are no breaking changes to existing behavior.
   SUBSCRIBE/UNSUBSCRIBE, PINGREQ/PINGRESP, DISCONNECT; topic-trie wildcard
   matching (`+` / `#`); retained messages; cross-shard routing over a glommio
   channel mesh; structured `tracing` logging; and TOML configuration with a CLI.
+
+[1.6.5]: https://github.com/iamaliybi/rusquitto/releases/tag/v1.6.5
 
 [1.6.0]: https://github.com/iamaliybi/rusquitto/releases/tag/v1.6.0
 
