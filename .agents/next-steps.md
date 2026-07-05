@@ -38,6 +38,28 @@ These are settled product decisions, not backlog:
   hot-reload into new handshakes without dropping live connections (per-shard,
   no cross-core coordination).
 
+## Shipped in v1.8.1
+
+- **Lazily boxed topic-alias tables** (`Option<Box<AliasTables>>`) — idle
+  3.87 → 3.7 KiB/conn; a non-aliasing connection holds 8 bytes, not two `HashMap`s.
+- **`examples/park_probe.rs`** — the feasibility spike that decomposed the idle
+  floor and proved the parked-fd path (0.08 KiB, ~46×). Groundwork for §1 below;
+  nothing in the broker changed.
+
+## Shipped in v1.9.0
+
+- **Reliable mesh control plane** — session `Claim`/`Handoff` and shared-sub
+  `Join`/`Leave` moved from best-effort (drop-on-full) to a per-shard reliable
+  outbox (never drops; FIFO; awaiting `send_to` backpressure). Closes the
+  transient double/zero-delivery and lost-migration risk under overload; `$SYS`
+  and QoS 0 publishes stay best-effort.
+- **Batch-drained inbound mesh receiver** — a peer's forwarded burst is handled
+  in one wake instead of one reactor reschedule per message (cross-shard CPU and
+  tail latency under load).
+- **QoS 1/2 delivery clones the PUBLISH once, not twice** — the retransmit copy
+  is taken only when outbound aliasing could clear the topic; otherwise the
+  message is moved into the in-flight table after a successful write.
+
 ## Open weaknesses & review targets
 
 None is committed; this is the honest list of where we are weak, in rough value
@@ -94,24 +116,18 @@ From the v1.7.0 audit + benchmark:
 
    Risk: high (a second io_uring ring cooperating with glommio's reactor, plus the
    egress-wake correctness). Gate each phase on the `alloc_probe`/battery numbers.
-2. ~~Cross-shard mesh reliability under overload.~~ **Addressed in v1.9.0** — the
-   control plane (`Claim`/`Handoff`, shared-sub `Join`/`Leave`) now goes through a
-   per-shard reliable outbox (never drops; FIFO; awaiting `send_to` backpressure),
-   while `$SYS`/QoS 0 stay best-effort. Verified exactly-once shared-sub delivery
-   across shards.
-3. **No per-core throughput superiority on the ack-bound path.** Single-shard
-   QoS 1 is ~76k msg/s vs Mosquitto's ~83k — per core the mature C event loop is
-   marginally faster; the audit's specific gap is the *publisher-ack* microbench
-   (no delivery), which is parse-bound (`mqttbytes`) + one boxed handler alloc per
-   publish (the box shrinks idle memory, so removing it would regress §1). v1.9.0
-   cut a `Publish` clone from the *delivery* path (helps QoS pub/sub fan-out, not
-   the pure-ack bench). Remaining per-core parity on the ack bench is bounded by
-   the parser and the memory/CPU trade-off of the handler boxing — low headroom.
-4. ~~Cross-shard latency tax (~50 µs p50).~~ **Partially addressed in v1.9.0** —
-   the inbound mesh receiver now batch-drains (one wake per forwarded burst, not
-   one reschedule per message), cutting cross-shard CPU + tail latency under load.
-   Single-message p50 is still bounded by the cross-thread wake (glommio-internal);
-   a faster mesh wakeup or topology-aware placement would trim it further.
+2. **Per-core parity on the ack-bound path — low headroom.** Single-shard QoS 1 is
+   ~76k msg/s vs Mosquitto's ~83k. The audit's gap is the *publisher-ack*
+   microbench (no delivery): parse-bound (`mqttbytes`) plus one boxed handler
+   alloc per publish — and that box is what keeps idle memory low, so removing it
+   would regress §1. v1.9.0 cut a `Publish` clone from the *delivery* path (helps
+   fan-out, not the pure-ack bench). What remains is a parser + memory/CPU
+   trade-off, not a clear win.
+3. **Cross-shard single-message latency (~50 µs p50) — residual.** v1.9.0's
+   batch-drain cut the CPU and tail latency of cross-shard *bursts*, but a single
+   forwarded message's p50 is still bounded by the cross-thread reactor wake
+   (glommio-internal). A faster mesh wakeup or topology-aware subscriber placement
+   would trim it further.
 
 The audit found **no race conditions and no memory leaks** — the shared-nothing
 model makes intra-shard data races structurally impossible, and RSS returns to
