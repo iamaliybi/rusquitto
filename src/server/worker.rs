@@ -102,6 +102,29 @@ async fn accept_on(listener: Option<&TcpListener>, transport: Transport, shard_i
 	}
 }
 
+/// Session snapshot files orphaned by a decrease in shard count — `sessions-<n>.mqtt`
+/// for `n >= shard_count`. Peer 0 loads these at startup so no durable session is
+/// lost when `cores` shrinks between runs.
+fn orphan_session_files(dir: &std::path::Path, shard_count: usize) -> Vec<std::path::PathBuf> {
+	let mut out = Vec::new();
+	let Ok(entries) = std::fs::read_dir(dir) else {
+		return out;
+	};
+	for entry in entries.flatten() {
+		let path = entry.path();
+		if let Some(name) = path.file_name().and_then(|n| n.to_str())
+			&& let Some(idx) = name
+				.strip_prefix("sessions-")
+				.and_then(|s| s.strip_suffix(".mqtt"))
+				.and_then(|n| n.parse::<usize>().ok())
+			&& idx >= shard_count
+		{
+			out.push(path);
+		}
+	}
+	out
+}
+
 /// Per-shard live-connection accounting: the total count plus a per-IP tally.
 /// Single-threaded (shard-local), so plain `Cell`/`RefCell` suffice — no locks.
 #[derive(Default)]
@@ -205,6 +228,8 @@ pub async fn init(
 	// Mesh peer id is 0-based and unique per shard (glommio executor ids are
 	// 1-based). Peer 0 publishes broker-wide `$SYS` metrics.
 	let mesh_peer_id = senders.peer_id();
+	// Total shard count, captured before `senders` is moved into the shard state.
+	let shard_count = senders.nr_consumers();
 
 	// A low-share, latency-insensitive task queue for background housekeeping
 	// (session sweep, `$SYS`, shedding). Under load the scheduler starves it in
@@ -248,6 +273,40 @@ pub async fn init(
 			Err(e) => {
 				tracing::error!(shard = shard_id, error = %e, path = %path.display(), "failed to load retained snapshot");
 			}
+		}
+	}
+
+	// Restore this shard's persisted sessions. Sessions are shard-local, so each
+	// shard loads its own file; peer 0 additionally loads any files orphaned by a
+	// decrease in `cores`, so no durable session is lost when the shard count
+	// shrinks. Loaded sessions are suspended — a reconnecting client resumes one
+	// directly, or the cross-shard `Claim`/`Handoff` migrates it to wherever the
+	// client lands.
+	if config.persistence.enabled {
+		let _ = std::fs::create_dir_all(&config.persistence.dir);
+		let now = Instant::now();
+		let mut paths = vec![config.persistence.session_path(mesh_peer_id)];
+		if mesh_peer_id == 0 {
+			paths.extend(orphan_session_files(&config.persistence.dir, shard_count));
+		}
+		let mut restored = 0;
+		for path in paths {
+			match persistence::load_sessions(&path).await {
+				Ok(sessions) => {
+					restored += sessions.len();
+					state.borrow_mut().load_sessions(sessions, now);
+				}
+				Err(e) => {
+					tracing::error!(shard = shard_id, error = %e, path = %path.display(), "failed to load session snapshot");
+				}
+			}
+		}
+		if restored > 0 {
+			tracing::info!(
+				shard = shard_id,
+				sessions = restored,
+				"restored sessions from disk"
+			);
 		}
 	}
 
@@ -382,6 +441,29 @@ pub async fn init(
 			.expect("spawn persistence snapshot task")
 			.detach();
 		}
+	}
+
+	// Every shard periodically snapshots its own suspended sessions (they are
+	// shard-local, unlike the replicated retained set). Runs on the background queue.
+	if config.persistence.enabled && config.persistence.snapshot_interval > 0 {
+		let state = state.clone();
+		let path = config.persistence.session_path(mesh_peer_id);
+		let snapshot_secs = config.persistence.snapshot_interval;
+		glommio::spawn_local_into(
+			async move {
+				loop {
+					glommio::timer::sleep(Duration::from_secs(snapshot_secs)).await;
+					let sessions = state.borrow().persist_sessions(Instant::now());
+					match persistence::save_sessions(&path, &sessions).await {
+						Ok(()) => tracing::debug!(sessions = sessions.len(), "session snapshot written"),
+						Err(e) => tracing::error!(error = %e, "session snapshot failed"),
+					}
+				}
+			},
+			tq_maintenance,
+		)
+		.expect("spawn session snapshot task")
+		.detach();
 	}
 
 	// One shard owns publishing `$SYS` metrics (broker-wide totals). Messages are
@@ -569,19 +651,35 @@ pub async fn init(
 		glommio::timer::sleep(SHUTDOWN_DRAIN_POLL).await;
 	}
 
-	// Final retained snapshot on graceful shutdown (peer 0), capturing anything since
-	// the last periodic write so a clean stop loses nothing.
-	if config.persistence.enabled && mesh_peer_id == 0 {
-		let messages = state.borrow().retained_messages();
-		match persistence::save_retained(&config.persistence.retained_path(), &messages).await {
+	// Final snapshots on graceful shutdown, capturing anything since the last periodic
+	// write so a clean stop loses nothing. By now every connection has drained and its
+	// durable session is suspended in the shard state, so this captures them all.
+	if config.persistence.enabled {
+		// Retained set (peer 0 only — it is replicated across shards).
+		if mesh_peer_id == 0 {
+			let messages = state.borrow().retained_messages();
+			match persistence::save_retained(&config.persistence.retained_path(), &messages).await {
+				Ok(()) => {
+					tracing::info!(
+						shard = shard_id,
+						retained = messages.len(),
+						"wrote final retained snapshot"
+					)
+				}
+				Err(e) => tracing::error!(shard = shard_id, error = %e, "final retained snapshot failed"),
+			}
+		}
+		// This shard's sessions (every shard writes its own).
+		let sessions = state.borrow().persist_sessions(Instant::now());
+		match persistence::save_sessions(&config.persistence.session_path(mesh_peer_id), &sessions).await {
 			Ok(()) => {
 				tracing::info!(
 					shard = shard_id,
-					retained = messages.len(),
-					"wrote final retained snapshot"
+					sessions = sessions.len(),
+					"wrote final session snapshot"
 				)
 			}
-			Err(e) => tracing::error!(shard = shard_id, error = %e, "final retained snapshot failed"),
+			Err(e) => tracing::error!(shard = shard_id, error = %e, "final session snapshot failed"),
 		}
 	}
 

@@ -262,3 +262,101 @@ fn sweep_fires_due_delayed_will_and_reaps_expired_session() {
 		"expired session reclaimed"
 	);
 }
+
+/// The full on-shard persistence cycle, minus disk: a suspended session's
+/// subscriptions, offline queue, in-flight QoS state, and expiry are captured by
+/// `persist_sessions` and faithfully reinstalled by `load_sessions` into a fresh
+/// shard. (The codec's byte round-trip is covered separately under `persistence`;
+/// this guards the `ShardState` integration those bytes are produced from.)
+#[test]
+fn persist_then_load_restores_a_full_suspended_session() {
+	use crate::broker::session::{InflightMessage, InflightState};
+
+	let now = Instant::now();
+	let mut src = ShardState::default();
+
+	// A suspended session carrying durable QoS state and a finite expiry.
+	src.sessions.insert(
+		"psess".to_string(),
+		Session {
+			mailbox: None,
+			expires_at: Some(now + Duration::from_secs(3600)),
+			generation: 7,
+			snapshot: SessionSnapshot {
+				inflight: HashMap::from([(
+					5,
+					InflightMessage {
+						publish: pubm("out/5", QoS::AtLeastOnce, b"i5", false),
+						state: InflightState::Qos1,
+					},
+				)]),
+				incoming_qos2: HashMap::from([(9, pubm("in/9", QoS::ExactlyOnce, b"i9", false))]),
+				next_pkid: 42,
+			},
+			offline_queue: VecDeque::new(),
+			pending_will: None,
+		},
+	);
+	// A subscription (No Local + a sub id) and one message queued while offline.
+	src.subscribe(
+		"home/+/temp",
+		"psess",
+		opts(QoS::AtLeastOnce, true, false, None, Some(3)),
+	);
+	src.deliver_local(
+		pubm("home/kitchen/temp", QoS::AtLeastOnce, b"21.5", false),
+		Some("other"),
+	);
+	assert_eq!(
+		offline(&src, "psess").len(),
+		1,
+		"message queued while offline"
+	);
+
+	// Persist, then restore into a brand-new shard.
+	let persisted = src.persist_sessions(now);
+	assert_eq!(persisted.len(), 1);
+	let mut dst = ShardState::default();
+	dst.load_sessions(persisted, now);
+
+	// Restored as a suspended session, with its expiry.
+	let session = dst.sessions.get("psess").expect("session restored");
+	assert!(session.mailbox.is_none(), "restored session is suspended");
+	assert!(session.expires_at.is_some(), "finite expiry restored");
+
+	// Durable QoS state round-trips exactly.
+	assert_eq!(session.snapshot.next_pkid, 42);
+	assert!(matches!(
+		session.snapshot.inflight[&5].state,
+		InflightState::Qos1
+	));
+	assert_eq!(session.snapshot.inflight[&5].publish.topic, "out/5");
+	assert_eq!(session.snapshot.incoming_qos2[&9].topic, "in/9");
+
+	// Offline queue round-trips (payload + sub ids preserved).
+	let q = offline(&dst, "psess");
+	assert_eq!(q.len(), 1);
+	assert_eq!(&q[0].publish.payload[..], b"21.5");
+	assert_eq!(q[0].sub_ids, vec![3]);
+
+	// The subscription itself was reinstalled in the trie, No Local option and all:
+	// the client's own publish is skipped; another client's matches and is queued.
+	dst.deliver_local(
+		pubm("home/bath/temp", QoS::AtLeastOnce, b"self", false),
+		Some("psess"),
+	);
+	assert_eq!(
+		offline(&dst, "psess").len(),
+		1,
+		"No Local survived restore: own publish skipped"
+	);
+	dst.deliver_local(
+		pubm("home/bath/temp", QoS::AtLeastOnce, b"warm", false),
+		Some("other"),
+	);
+	assert_eq!(
+		offline(&dst, "psess").len(),
+		2,
+		"restored subscription still matches"
+	);
+}

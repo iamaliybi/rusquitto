@@ -164,6 +164,36 @@ impl TopicTrie {
 		out
 	}
 
+	/// Like [`take_client`](Self::take_client) but *non-destructive*: returns a
+	/// client's subscriptions without removing them. Used to snapshot a session for
+	/// persistence while it stays live in the trie.
+	pub fn client_subscriptions(&self, client_id: &str) -> Vec<FlatSub> {
+		let mut out = Vec::new();
+		let mut segments: Vec<String> = Vec::new();
+		Self::collect_client_rec(&self.root, client_id, &mut segments, &mut out);
+		out
+	}
+
+	fn collect_client_rec(node: &Node, client_id: &str, segments: &mut Vec<String>, out: &mut Vec<FlatSub>) {
+		for s in &node.subscribers {
+			if s.client_id == client_id {
+				out.push(FlatSub {
+					filter: segments.join("/"),
+					qos: s.qos,
+					nolocal: s.nolocal,
+					retain_as_published: s.retain_as_published,
+					share_group: s.share_group.clone(),
+					sub_id: s.sub_id,
+				});
+			}
+		}
+		for (seg, child) in node.children.iter() {
+			segments.push(seg.to_string());
+			Self::collect_client_rec(child, client_id, segments, out);
+			segments.pop();
+		}
+	}
+
 	fn take_client_rec(node: &mut Node, client_id: &str, segments: &mut Vec<String>, out: &mut Vec<FlatSub>) {
 		node.subscribers.retain(|s| {
 			if s.client_id == client_id {

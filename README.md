@@ -234,10 +234,14 @@ Known edges, deliberately out of scope for 1.0 (tracked in `.agents/progress.md`
 - **Passwords: plaintext or SHA-256.** A `password_hash` avoids storing the secret in the clear, but there is no
   salting or a slow KDF (Argon2/bcrypt) yet, and no enhanced (SASL-style) authentication. Anonymous clients
   bypass ACL (they are unrestricted). Protect the config file with restrictive permissions regardless.
-- **Persistence covers retained messages only.** With `[persistence] enabled`, the retained set is snapshotted to
-  disk and restored on startup (survives graceful restarts fully, and crashes up to the last snapshot). **Sessions
-  and queued (offline) messages are still in-memory only** — a restart drops them; persisting them needs cross-shard
-  snapshot coordination and is planned for a later release.
+- **Persistence is snapshot-based, not a write-ahead log.** With `[persistence] enabled`, both the retained set and
+  suspended sessions (subscriptions, in-flight QoS 1/2 state, and offline queue) are snapshotted to disk and restored
+  on startup — a graceful restart preserves them fully, and a crash preserves them up to the last snapshot
+  (`snapshot_interval`), so updates in the final window are lost. Restored sessions come back **suspended**: a
+  reconnecting client resumes one directly if it lands on the holding shard, or the cross-shard `Claim`/`Handoff`
+  migrates it to wherever `SO_REUSEPORT` places the client — inheriting the same best-effort-under-mesh-overload caveat
+  as live cross-shard resume. Sessions are shard-local (one file per shard); if `runtime.cores` shrinks between runs,
+  peer 0 loads the sessions orphaned on now-absent shards so none are lost.
 
 ## Development
 

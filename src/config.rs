@@ -238,10 +238,12 @@ pub struct OverloadConfig {
 }
 
 /// `[persistence]` — disk-backed durability. Disabled by default; the broker is
-/// otherwise entirely in-memory. When enabled, the **retained-message** set is
-/// snapshotted to `dir/retained_file` periodically and on graceful shutdown, and
-/// restored on startup — so retained "last known value" topics survive a restart.
-/// (Sessions and queued messages are not yet persisted.)
+/// otherwise entirely in-memory. When enabled, both the **retained-message** set
+/// and **suspended sessions** (their subscriptions, in-flight QoS 1/2 state, and
+/// offline queue) are snapshotted under `dir` periodically and on graceful
+/// shutdown, and restored on startup — so retained "last known value" topics and
+/// offline sessions survive a restart. Retained is replicated identically on every
+/// shard (one snapshot file); sessions are shard-local (one file per shard).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PersistenceConfig {
@@ -260,6 +262,12 @@ impl PersistenceConfig {
 	/// Full path to the retained-message snapshot file.
 	pub fn retained_path(&self) -> PathBuf {
 		self.dir.join(&self.retained_file)
+	}
+
+	/// Full path to a shard's session snapshot file. Sessions are shard-local, so
+	/// each shard (mesh peer) persists its own file.
+	pub fn session_path(&self, peer_id: usize) -> PathBuf {
+		self.dir.join(format!("sessions-{peer_id}.mqtt"))
 	}
 }
 

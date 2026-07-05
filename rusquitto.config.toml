@@ -61,8 +61,10 @@ shed_batch = 8             # max connections shed per second per shard while she
 
 [persistence]
 # Disk-backed durability. Disabled by default (broker is otherwise in-memory).
-# When enabled, the retained-message set is snapshotted and restored across restarts.
-# (Sessions and queued messages are not yet persisted.)
+# When enabled, both the retained-message set and suspended sessions (their
+# subscriptions, in-flight QoS 1/2 state, and offline queue) are snapshotted and
+# restored across restarts. Retained is one shared file; sessions are one file per
+# shard (sessions-<n>.mqtt), since sessions are shard-local.
 enabled = false            # master switch
 dir = "data"               # directory for snapshot files (created if missing)
 retained_file = "retained.mqtt"  # retained-message snapshot filename

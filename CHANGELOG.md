@@ -21,7 +21,19 @@ version bumps for breaking changes, the minor for features, and the patch for fi
   (`snapshot_interval`) and on graceful shutdown. Verified end-to-end: retained
   messages survive a graceful restart and a `kill -9` (up to the last snapshot);
   non-retained messages and retained clears behave correctly across restart.
-  *Sessions and queued messages are still in-memory only.*
+
+- **Session persistence** (`[persistence]`, same opt-in switch) — suspended
+  (offline) sessions are now snapshotted to disk alongside retained messages and
+  restored on startup, so a client with a non-zero Session Expiry Interval keeps
+  its subscriptions, in-flight QoS 1/2 state, and offline message queue across a
+  broker restart. Sessions are shard-local, so each shard persists its own
+  `sessions-<n>.mqtt` file (nested length-prefixed encoding, PUBLISHes stored as
+  MQTT wire bytes so all v5 properties round-trip); if `runtime.cores` shrinks
+  between runs, peer 0 loads any orphaned session files so none are lost. Restored
+  sessions come back suspended and resume directly or via the cross-shard
+  `Claim`/`Handoff` migration, so they inherit the same best-effort-under-mesh
+  caveat as live cross-shard resume. Writes reuse the same atomic io_uring codec as
+  retained snapshots.
 
 ## [1.2.0] - 2026-07-04
 
