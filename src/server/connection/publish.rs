@@ -96,26 +96,29 @@ impl<S: ByteStream> Connection<S> {
 			};
 		}
 
-		// Normalize for fan-out: clear the publisher's packet id and dup flag, but
-		// keep the original QoS so each subscriber can be downgraded individually
-		// to `min(publish QoS, granted QoS)` at delivery time.
-		let mut msg = publish.clone();
-		msg.pkid = 0;
-		msg.dup = false;
+		// Capture the publisher-scoped fields, then normalize the message for
+		// fan-out *in place* (clear the packet id and dup flag; keep the QoS so
+		// each subscriber is downgraded individually at delivery time). In-place
+		// beats cloning: the clone would copy the topic string on every publish
+		// and hold a second `Publish`-sized slot across the fan-out await in
+		// every connection's state machine.
+		let pkid = publish.pkid;
+		let qos = publish.qos;
+		publish.pkid = 0;
+		publish.dup = false;
 
 		// Inbound QoS handshake (receiver side).
-		match publish.qos {
+		match qos {
 			// Fire and forget.
 			QoS::AtMostOnce => {
-				self.fan_out(msg, Some(&self.client_id)).await;
+				self.fan_out(publish, Some(&self.client_id)).await;
 				Ok(())
 			}
 			// At least once: forward (awaiting mesh backpressure), then acknowledge —
 			// the PUBACK is only sent once the message has been accepted for delivery
 			// on every shard, so the guarantee holds cross-shard.
 			QoS::AtLeastOnce => {
-				self.fan_out(msg, Some(&self.client_id)).await;
-				let pkid = publish.pkid;
+				self.fan_out(publish, Some(&self.client_id)).await;
 				self.send(|buf| mqtt_v5::PubAck::new(pkid).write(buf))
 			}
 			// Exactly once: store the message and acknowledge receipt with PubRec.
@@ -126,7 +129,7 @@ impl<S: ByteStream> Connection<S> {
 				// of concurrent unacknowledged QoS 2 PUBLISHes. A fresh pkid past the
 				// quota is a protocol violation → DISCONNECT (0x93). A re-send of a
 				// pkid we already hold doesn't count against the quota.
-				if !self.incoming_qos2.contains_key(&publish.pkid)
+				if !self.incoming_qos2.contains_key(&pkid)
 					&& self.incoming_qos2.len() >= usize::from(self.limits.max_inflight)
 				{
 					warn!(
@@ -139,8 +142,7 @@ impl<S: ByteStream> Connection<S> {
 						"receive maximum exceeded",
 					));
 				}
-				let pkid = publish.pkid;
-				self.incoming_qos2.insert(pkid, msg);
+				self.incoming_qos2.insert(pkid, publish);
 				self.send(|buf| mqtt_v5::PubRec::new(pkid).write(buf))
 			}
 		}

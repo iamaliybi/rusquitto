@@ -402,3 +402,52 @@ fn no_local_on_shared_subscription_is_rejected() {
 		}
 	});
 }
+
+/// Diagnostic, not a regression test (hence ignored): prints the size of every
+/// future in the connection state machine — the numbers behind the memory work
+/// in v1.6.0. Run with `cargo test probe_future_tree -- --ignored --nocapture`.
+/// Findings as of 1.6.x: run() ≈ 3.3 KiB, dominated by process_packet (2.4 KiB)
+/// → handle_publish (1.6 KiB) → fan_out (1.2 KiB), which hold several
+/// `Publish`-sized (208 B) slots. Source-level slot elimination (in-place
+/// transforms, by-ref passing) does NOT shrink the machine — rustc allocates
+/// slots conservatively — so further reduction needs structural change.
+#[test]
+#[ignore]
+fn probe_future_tree() {
+	use std::mem::{size_of, size_of_val};
+	block_on(async {
+		let out = Rc::new(RefCell::new(Vec::new()));
+		let mut conn = make_conn(out);
+		println!("Packet enum:            {}", size_of::<Packet>());
+		println!("Publish struct:         {}", size_of::<Publish>());
+		println!(
+			"Connection<MockStream>: {}",
+			size_of::<Connection<MockStream>>()
+		);
+		let f = conn.run();
+		println!("run():                  {}", size_of_val(&f));
+		drop(f);
+		let f = conn.event_loop();
+		println!("event_loop():           {}", size_of_val(&f));
+		drop(f);
+		let f = conn.process_packet(Packet::PingReq);
+		println!("process_packet():       {}", size_of_val(&f));
+		drop(f);
+		let publish = Publish::new("t", QoS::AtLeastOnce, b"x".to_vec());
+		let f = conn.handle_publish(publish.clone());
+		println!("handle_publish():       {}", size_of_val(&f));
+		drop(f);
+		let f = conn.fan_out(publish, None);
+		println!("fan_out():              {}", size_of_val(&f));
+		drop(f);
+		let sub = Subscribe::new("a/b", QoS::AtLeastOnce);
+		let f = conn.handle_subscribe(sub);
+		println!("handle_subscribe():     {}", size_of_val(&f));
+		drop(f);
+		let f = conn.resume_delivery(VecDeque::new());
+		println!("resume_delivery():      {}", size_of_val(&f));
+		drop(f);
+		let f = conn.flush();
+		println!("flush():                {}", size_of_val(&f));
+	});
+}

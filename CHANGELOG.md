@@ -5,6 +5,18 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): from 1.0 on, the major
 version bumps for breaking changes, the minor for features, and the patch for fixes.
 
+## [Unreleased]
+
+### Changed
+
+- **One less allocation per inbound PUBLISH**: the fan-out message is now
+  normalized in place instead of cloned, removing a topic-string allocation and
+  copy from the hottest path in the broker. (Probing showed the *state-machine
+  size* is unaffected — rustc allocates await-spanning slots conservatively —
+  so the sub-4-KiB idle-connection goal needs structural change; the
+  `probe_future_tree` diagnostic in `connection/tests.rs` documents the
+  breakdown for whoever picks that up.)
+
 ## [1.6.0] - 2026-07-05
 
 Small-host hardening: less memory per connection (process *and* kernel side),

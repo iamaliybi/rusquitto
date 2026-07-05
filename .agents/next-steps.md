@@ -20,9 +20,13 @@ via boxed transport pipelines), `malloc_trim` on the maintenance tick,
 Ideas noted along the way, in rough value order — none is planned or promised:
 
 - **Sub-4-KiB idle connections** — the remaining footprint is the connection
-  state machine itself (~4.5 KiB boxed) plus session/channel bookkeeping;
-  shrinking further means slimming `event_loop`/handler futures. `examples/
-  allocprobe.rs` measures it.
+  state machine (~4.5 KiB boxed: `run()` 3.3 KiB + `Connection` 880 B) plus
+  session/channel bookkeeping. **Probed and found resistant to source-level
+  surgery** (see `probe_future_tree` in `connection/tests.rs`): eliminating
+  `Publish` slots at the source did not shrink the machine — rustc allocates
+  await-spanning slots conservatively. A real reduction means a hand-rolled
+  (non-async) state machine for the hot loop, or waiting on rustc layout
+  improvements. `examples/allocprobe.rs` + the probe test measure it.
 - **Session/queued-message WAL** — persistence is snapshot-based; a
   write-ahead log would close the crash window (`snapshot_interval`).
 - **mTLS** (client-certificate authentication) and certificate hot-reload.
