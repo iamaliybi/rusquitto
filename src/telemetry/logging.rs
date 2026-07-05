@@ -121,12 +121,16 @@ pub fn init(config: Config<'_>) -> std::io::Result<Guards> {
 			.boxed(),
 	});
 
-	Registry::default()
+	// `try_init` (not `init`) so a second call in the same process — e.g. embedding
+	// the broker, or an in-process integration test that starts several brokers —
+	// is a no-op rather than a panic. The first global subscriber wins; the caller
+	// still gets its `Guards` back (its file appenders simply aren't attached).
+	let _ = Registry::default()
 		.with(env_filter) // global, runtime-reloadable verbosity
 		.with(stdout_layer) // Option: present only if enable_terminal
 		.with(file_layer)
 		.with(error_layer)
-		.init();
+		.try_init();
 
 	Ok(Guards { _app: app_guard, _err: err_guard, reload })
 }

@@ -138,9 +138,10 @@ edit it. Sections: `[server]`, `[runtime]` (`cores`, `placement`, `mesh_capacity
   (`examples/alloc_probe.rs`, the `stresser` example) opt out with a file-level `#![allow(...)]`.
 - The connection state machine is unit-tested over an **in-memory `ByteStream` mock**
   (`src/server/connection/tests.rs`), so the full MQTT handshake runs without real sockets. Add handler
-  tests there rather than spinning up a broker. `examples/alloc_probe.rs` measures idle memory per
-  connection; the `stresser` example (`stress/stresser.rs`, registered in `Cargo.toml`) is the throughput
-  hammer.
+  tests there rather than spinning up a broker. **End-to-end** flows (real broker in-process + real
+  sockets) live in `tests/integration.rs`; the full testing strategy, layer by layer, is in
+  [`TESTING.md`](TESTING.md). `examples/alloc_probe.rs` measures idle memory per connection; the `stresser`
+  example (`stress/stresser.rs`, registered in `Cargo.toml`) is the throughput hammer.
 - glommio executor ids are **1-based**; use the mesh `peer_id()` (0-based) when electing a single shard to
   do broker-wide work (e.g. publishing `$SYS`).
 - rustfmt uses **hard tabs**, 4-space width, `max_width = 120`, and `use_small_heuristics = "Off"`.

@@ -689,3 +689,26 @@ headroom — measured, not guessed.
   `mesh_peers()==0` (single-shard). A/B: new RTT p50=56µs (within noise).
 - Told the user honestly: robustness/cleanup, NOT a throughput/latency win.
   CHANGELOG + next-steps say so. 94 tests, clippy/fmt clean.
+
+## Phase 12 — end-to-end integration test suite + TESTING.md (2026-07-06, v1.9.2)
+
+Closed the biggest test-coverage gap: E2E MQTT flows were only covered by Python
+scripts run by hand, not `cargo test`. Now `tests/integration.rs` (15 tests) boots
+a REAL broker in-process (`rusquitto::run`) on an ephemeral port and drives it with
+a minimal Rust MQTT5 client (mqttbytes + std TcpStream). Covers: CONNACK, QoS0/1/2
+full handshakes, downgrade-to-granted, retained replay+clear, +/# wildcards,
+unsubscribe, persistent-session offline-queue replay, will-on-abrupt-close,
+malformed-frame survival, auth (bad-pw/anon reject/success), ACL, cross-shard
+delivery, shared-sub exactly-once. Brokers are lazily started + SHARED per config
+via OnceLock (3 fixtures: default anon cores=1, auth cores=1, multishard cores=3 =
+5 executor rings total — under WSL's low RLIMIT_MEMLOCK, works fine; stable across
+3 runs, ~2s). GOTCHA: had to make logging init idempotent — `.init()`→`.try_init()`
+in telemetry/logging.rs, else the 2nd broker in-process panics on the global
+subscriber. Also a genuine robustness win for embedding. GOTCHA: the integration
+test uses std::thread (client harness) so needs `#![allow(clippy::disallowed_methods)]`
+like the examples. Test client key details: `read()` accumulates socket bytes +
+`v5::read` until a frame; the broker's minimal DISCONNECT (E0 form) fails v5::read
+=> treated as close; `recv()` auto-completes receiver-side QoS handshakes so the
+window doesn't stall. Also wrote TESTING.md (root) — the full A-Z test strategy
+(unit/integration/adversarial/crash-recovery/mTLS/soak/probes) + known gaps
+(no parser fuzz yet; wss not E2E). 94 unit + 15 integration, clippy/fmt clean.

@@ -5,6 +5,35 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): from 1.0 on, the major
 version bumps for breaking changes, the minor for features, and the patch for fixes.
 
+## [1.9.2] - 2026-07-06
+
+Test coverage: a real end-to-end integration suite, plus documentation of the
+whole testing strategy.
+
+### Added
+
+- **`tests/integration.rs` — 15 end-to-end tests** that boot a real broker
+  in-process and drive it over real TCP sockets with a minimal MQTT 5 client
+  (built on `mqttbytes`), covering flows the unit tests (over an in-memory mock
+  stream) can't: CONNACK, QoS 0/1/2 full handshakes, QoS downgrade-to-granted,
+  retained replay + clear, `+`/`#` wildcards, unsubscribe, persistent-session
+  offline-queue replay, will-on-abrupt-disconnect, malformed-frame survival, auth
+  (bad password / anonymous rejection / success), ACL enforcement, cross-shard
+  delivery, and shared-subscription exactly-once delivery across shards. Brokers
+  are lazily started and shared per configuration, so the suite adds ~2 s to
+  `cargo test` and runs in CI.
+- **`TESTING.md`** — the full testing strategy, layer by layer: unit
+  (mock-stream state machine), integration (in-process broker), the adversarial
+  battery, crash-recovery and mTLS harnesses, soak, and the memory/throughput
+  probes — with how to run each and the known gaps (no parser fuzzing yet; `wss`
+  not exercised end-to-end).
+
+### Changed
+
+- **Logging init is now idempotent** (`try_init` instead of `init`), so starting
+  more than one broker in a single process — embedding, or the integration suite —
+  is a no-op on the second call rather than a panic.
+
 ## [1.9.1] - 2026-07-06
 
 Robustness plus a measurement: the ack-bound throughput and cross-shard
