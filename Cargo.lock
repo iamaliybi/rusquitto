@@ -699,6 +699,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.7.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9080b15e63775b9a2ac7dca720f7050a8b955e092ea0f6020a4a80f69998cdc0"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1053,7 +1064,7 @@ dependencies = [
 
 [[package]]
 name = "rusquitto"
-version = "1.8.0"
+version = "1.8.1"
 dependencies = [
  "argon2",
  "base64",
@@ -1062,6 +1073,7 @@ dependencies = [
  "futures-lite 2.6.1",
  "futures-rustls",
  "glommio",
+ "io-uring",
  "libc",
  "mqttbytes",
  "rcgen",

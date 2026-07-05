@@ -52,14 +52,48 @@ order.
 
 From the v1.7.0 audit + benchmark:
 
-1. **Per-connection memory density — the main scalability ceiling.** Idle
-   footprint is **3.87 KiB/conn vs Mosquitto's 0.76 KiB** (~5×). We took the
-   connection state machine itself to ~600 B; the remaining floor is glommio's
-   per-connection internals (~1.7 KiB task + stream/source allocations). Going
-   lower means pooling/slabbing the async task, shrinking glommio source
-   allocations, or a lightweight non-async path for idle connections — i.e.
-   changes at or below the glommio boundary. This is the biggest lever on
-   how many connections one box holds.
+1. **Per-connection memory density — the main scalability ceiling.** Idle is
+   **3.7 KiB/conn vs Mosquitto's 0.76 KiB** (was 3.87; the topic-alias tables are
+   now lazily boxed, `Option<Box<AliasTables>>`). The `alloc_probe` histogram
+   decomposes that 3.7 KiB into three buckets:
+   - **~1.6 KiB — our boxed connection future** (`sizeof(Connection)` + the
+     `event_loop` frame, allocated by `boxed_run`). Partly shrinkable by boxing
+     more cold-for-idle fields (the alias boxing shaved ~0.1 KiB; boxing the QoS
+     maps + sharing `limits` via `Rc` would reach ~3.5). Diminishing returns.
+   - **~1.9 KiB — glommio's per-connection task + io_uring `Source`(s)** for the
+     parked read. **Not a buffer** — our `TcpStream` is `NonBuffered`, so option
+     "shrink glommio buffers" has nothing to give. Only removable by dropping the
+     per-idle task entirely.
+   - **~0.3 KiB — smalls** (`client_id`, the mailbox channel node, the span).
+
+   **The 5× gap is architectural**, not a tuning miss: task-per-connection vs.
+   Mosquitto's one-event-loop + struct-per-fd. The only lever that closes it is a
+   **parked idle path** (evaluated options 1–3 from the audit: slab-tasks and
+   buffer-shrink are dead ends; the non-async idle path is the one with headroom).
+
+   **Proven feasible + quantified** (`examples/park_probe.rs`): an idle fd held as
+   a 48-B `ParkedConn` on one shared `IORING_OP_POLL_ADD` ring, no per-connection
+   task, costs **0.06 KiB heap / 0.08 KiB RSS per connection — a ~46× reduction**,
+   an order of magnitude under Mosquitto. The wake path is proven: 2000/2000 fds
+   delivered a readiness completion naming their connection, and glommio streams
+   expose `IntoRawFd`/`FromRawFd` so the fd hand-off works.
+
+   **Staged build (the real project, ~v1.9.0):**
+   - *Phase 1* — per-shard readiness ring: a raw io_uring for parked fds (glommio
+     doesn't expose its `POLL_ADD`), driven by one glommio task awaiting the
+     ring's eventfd. Plain-TCP only at first (TLS/WS carry mid-stream state).
+   - *Phase 2* — park predicate + transition: in `event_loop`, when idle and
+     `inflight`/`incoming_qos2`/`pending_outbound`/`inbound` are all empty and no
+     partial frame is buffered (the 1.8.0 `partial_since` guard already tracks
+     this), serialize into `ParkedConn`, register the fd, and return (task freed).
+   - *Phase 3* — unpark: ingress readiness **and** egress (`route`→`deliver_to`
+     targeting a parked client) both resurrect a task that rebuilds a `Connection`
+     over the fd, drains, and re-parks. Egress-wake is the subtle part.
+   - *Phase 4* — parked keep-alive expiry (task-less, via the sweep timer), a
+     `$SYS/broker/parked-connections` gauge, and shedding/migration interaction.
+
+   Risk: high (a second io_uring ring cooperating with glommio's reactor, plus the
+   egress-wake correctness). Gate each phase on the `alloc_probe`/battery numbers.
 2. **Cross-shard mesh reliability under overload.** Mesh control messages are
    best-effort (drop-on-full). Under sustained saturation, shared-subscription
    single-delivery and session migration can transiently double- or

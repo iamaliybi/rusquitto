@@ -5,6 +5,31 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): from 1.0 on, the major
 version bumps for breaking changes, the minor for features, and the patch for fixes.
 
+## [1.8.1] - 2026-07-06
+
+Idle-connection memory: a safe reduction, plus the measurement that grounds the
+larger density work.
+
+### Changed
+
+- **Topic-alias tables are now lazily boxed** (`Option<Box<AliasTables>>`). A
+  connection that never registers an inbound alias and is never assigned an
+  outbound one holds 8 bytes here instead of two `HashMap`s, so the idle /
+  non-aliasing common case pays nothing. Idle heap drops **3.87 → 3.7 KiB/conn**
+  (`alloc_probe`), with no change to the aliasing path.
+
+### Added
+
+- **`examples/park_probe.rs`** — a feasibility spike (io-uring dev-dependency,
+  not used by the broker) that decomposes and attacks the idle floor. It shows
+  `alloc_probe`'s ~1.9 KiB/conn is glommio's per-connection task + io_uring read
+  `Source` (not a buffer — the stream is `NonBuffered`), and that parking an idle
+  fd as a 48-byte struct on one shared `IORING_OP_POLL_ADD` ring — no
+  per-connection task — costs **0.06 KiB heap / 0.08 KiB RSS** (a ~46× reduction,
+  an order of magnitude under Mosquitto), with the wake path proven for all
+  2000/2000 fds. The staged plan for the parked idle path is in
+  `.agents/next-steps.md`.
+
 ## [1.8.0] - 2026-07-05
 
 Durability and transport-security release: a session write-ahead log, mutual TLS
