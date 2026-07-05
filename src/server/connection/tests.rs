@@ -108,7 +108,7 @@ fn encode_packet(packet: &Packet, buf: &mut BytesMut) {
 /// responses reach the mock stream too.
 async fn drive(conn: &mut Connection<MockStream>, packet: Packet) -> Result<()> {
 	let max_packet = conn.limits.max_payload_size;
-	encode_packet(&packet, &mut conn.buffer);
+	encode_packet(&packet, &mut conn.inbound);
 	let result = conn.process_one(max_packet).await;
 	conn.flush().await.expect("flush mock stream");
 	result.map(|processed| assert!(processed, "test packet must parse completely"))

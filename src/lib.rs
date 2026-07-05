@@ -29,7 +29,7 @@ use std::sync::atomic::AtomicBool;
 use glommio::channels::channel_mesh::{Full, MeshBuilder};
 use glommio::{CpuSet, LocalExecutorPoolBuilder, PoolPlacement};
 
-use crate::broker::mesh::MeshMsg;
+use crate::broker::messages::MeshMsg;
 use crate::config::{Config, LogFormat, Placement};
 
 /// Boots the broker from a validated [`Config`]: initialises logging, binds one
@@ -119,7 +119,7 @@ pub fn run(config: Config) -> std::io::Result<()> {
 			let shutdown = Arc::clone(&shutdown);
 			let metrics = Arc::clone(&metrics);
 			let tls_config = tls_config.clone();
-			async move { server::worker::init(mesh, config, shutdown, metrics, tls_config).await }
+			async move { server::shard::run_shard(mesh, config, shutdown, metrics, tls_config).await }
 		})
 		.expect("failed to spawn local executor")
 		.join_all();

@@ -5,6 +5,45 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): from 1.0 on, the major
 version bumps for breaking changes, the minor for features, and the patch for fixes.
 
+## [1.7.0] - 2026-07-05
+
+Structural refactor from an architectural review — no behaviour, protocol, API,
+config, or performance change (allocprobe idle memory, the throughput A/B, and
+the full smoke battery are unchanged).
+
+### Changed
+
+- **The shared-nothing invariant is now mechanically enforced.** A new
+  `clippy.toml` disallows `Mutex`/`RwLock`/`Condvar`/`std::sync::mpsc`/`Barrier`
+  and `std::thread::{spawn,sleep}` with reasons pointing at the channel mesh; the
+  pre-commit hook already runs `clippy -D warnings`, so a cross-thread lock or
+  ad-hoc thread now fails the commit instead of silently breaking the model.
+- **`server/worker.rs` (882 lines) split into `server/shard/`** by concern:
+  `shard.rs` (`run_shard` orchestration — renamed from `init`), `accept.rs`
+  (accept loop, connection accounting, admission control, listener binding),
+  `serve.rs` (transport-stack dispatch), `maintenance.rs` (persistence
+  restore/snapshot, mesh drain, load probe, session sweep, shedding). A new
+  `ConnCtx` bundle collapses the seven positional arguments that were threaded
+  through the serve path (removing four `#[allow(too_many_arguments)]`).
+- **Clearer names**: `Connection.state` → `shard` (it is the *shard*-shared
+  state, not connection state — the key thread-per-core distinction);
+  `Connection.buffer`/`out` → `inbound`/`outbound`; `ShardState.mesh` →
+  `mesh_tx` (it holds only senders); `broker/mesh.rs` → `broker/messages.rs`
+  (the mesh *vocabulary*, distinct from `broker/shard/mesh.rs`, the *behaviour*);
+  `connection/ack.rs` → `control.rs`; `examples/allocprobe.rs` → `alloc_probe.rs`.
+- **`broker/session.rs` split**: the `Delivery`/`Mailbox` delivery types (used by
+  routing, connection, and persistence) moved to a new `broker/delivery.rs`,
+  separating the broker's delivery lingua franca from durable session state.
+- **The last process-global mutable atom is gone**: the server-assigned client-id
+  counter (`static NEXT_CLIENT_ID: AtomicU64`) is now a shard-local field on
+  `ShardState` — the generated id already embeds the shard id, so per-shard
+  counters stay broker-unique with zero cross-core traffic on the CONNECT path.
+- **Module layout modernised**: all eight `foo/mod.rs` files migrated to the
+  file-based `foo.rs`-beside-`foo/` form.
+- **`stress/stresser.rs` is now a Cargo example** (`--example stresser`), so the
+  throughput hammer gets `fmt`/`clippy`/CI coverage while remaining
+  dependency-free and standalone-`rustc`-compilable.
+
 ## [1.6.5] - 2026-07-05
 
 ### Changed
@@ -412,6 +451,8 @@ All changes are additive; there are no breaking changes to existing behavior.
   SUBSCRIBE/UNSUBSCRIBE, PINGREQ/PINGRESP, DISCONNECT; topic-trie wildcard
   matching (`+` / `#`); retained messages; cross-shard routing over a glommio
   channel mesh; structured `tracing` logging; and TOML configuration with a CLI.
+
+[1.7.0]: https://github.com/iamaliybi/rusquitto/releases/tag/v1.7.0
 
 [1.6.5]: https://github.com/iamaliybi/rusquitto/releases/tag/v1.6.5
 

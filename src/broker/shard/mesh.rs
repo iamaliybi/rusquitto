@@ -9,21 +9,22 @@ use glommio::channels::local_channel::LocalSender;
 use mqttbytes::v5::Publish;
 
 use super::ShardState;
-use crate::broker::mesh::{MeshMsg, MigratedSession, MigratedSub, SessionControl, SharedEvent};
-use crate::broker::session::{Delivery, SessionSnapshot};
+use crate::broker::delivery::Delivery;
+use crate::broker::messages::{MeshMsg, MigratedSession, MigratedSub, SessionControl, SharedEvent};
+use crate::broker::session::SessionSnapshot;
 use crate::broker::topics::SubOptions;
 
 impl ShardState {
 	/// Stores this shard's mesh senders so publishes can be forwarded to peers.
 	pub fn set_mesh(&mut self, senders: Senders<MeshMsg>) {
-		self.mesh = Some(Rc::new(senders));
+		self.mesh_tx = Some(Rc::new(senders));
 	}
 
 	/// A cloneable handle to this shard's mesh senders. Lets the publish path
 	/// `await` a cross-shard `send_to` (backpressure for QoS > 0) after dropping the
 	/// `ShardState` borrow, rather than dropping the message with `try_send_to`.
 	pub fn mesh_senders(&self) -> Option<Rc<Senders<MeshMsg>>> {
-		self.mesh.clone()
+		self.mesh_tx.clone()
 	}
 
 	/// Forwards a publish to every *other* shard in the mesh, best-effort. Each peer
@@ -36,7 +37,7 @@ impl ShardState {
 	///
 	/// [`mesh_senders`]: Self::mesh_senders
 	pub fn broadcast(&self, publish: &Publish) {
-		let Some(senders) = &self.mesh else {
+		let Some(senders) = &self.mesh_tx else {
 			return;
 		};
 		let me = senders.peer_id();
@@ -51,14 +52,14 @@ impl ShardState {
 	/// The number of *other* shards in the mesh (peers this shard can talk to).
 	/// Zero for a single-shard broker, which short-circuits cross-shard migration.
 	pub fn mesh_peers(&self) -> usize {
-		self.mesh
+		self.mesh_tx
 			.as_ref()
 			.map_or(0, |s| s.nr_consumers().saturating_sub(1))
 	}
 
 	/// Sends a single control message to one peer shard (best effort, drop-on-full).
 	fn send_control_to(&self, peer: usize, control: SessionControl) {
-		if let Some(senders) = &self.mesh {
+		if let Some(senders) = &self.mesh_tx {
 			let _ = senders.try_send_to(peer, MeshMsg::Control(Box::new(control)));
 		}
 	}
@@ -68,7 +69,7 @@ impl ShardState {
 	/// message). Peers fold it into their replicated membership view so all
 	/// shards agree on the group's connected members.
 	pub(super) fn broadcast_shared(&self, group: &str, client_id: &str, join: bool) {
-		let Some(senders) = &self.mesh else {
+		let Some(senders) = &self.mesh_tx else {
 			return;
 		};
 		let me = senders.peer_id();
@@ -111,7 +112,7 @@ impl ShardState {
 	/// `resume = false` (Clean Start) they discard it instead. A no-op when there
 	/// are no peers.
 	pub fn broadcast_claim(&self, client_id: &str, resume: bool) {
-		let Some(senders) = &self.mesh else {
+		let Some(senders) = &self.mesh_tx else {
 			return;
 		};
 		let me = senders.peer_id();

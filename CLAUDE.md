@@ -68,28 +68,40 @@ config → protocol → transport → auth → broker → server → telemetry
 ```
 
 `lib.rs::run()` is the composition root: it inits logging, builds one shared read-only `tls::ServerConfig`
-and one `channel_mesh`, then `LocalExecutorPoolBuilder::on_all_shards` spawns `server::worker::init` per core.
+and one `channel_mesh`, then `LocalExecutorPoolBuilder::on_all_shards` spawns `server::shard::run_shard` per core.
+
+Two things named "shard", on purpose: **`server::shard`** is the shard's *runtime* (bind listeners, accept
+loop, background tasks, drain), **`broker::shard::ShardState`** is the shard's *data* (sessions, trie,
+retain). Modules are **file-based** (`foo.rs` beside `foo/`), not `mod.rs`.
 
 **Key seams to understand before making changes:**
 
-- **`transport::ByteStream`** (`src/transport/mod.rs`) is a dependency-inversion seam: an async
-  bidirectional byte stream. TCP satisfies it directly; WebSocket wraps a TCP stream in an RFC 6455 frame
-  codec; TLS (rustls) wraps *either*. `Connection` is written **once** against `ByteStream`, so the entire
-  MQTT engine is reused unchanged across TCP / WS / TLS / WS-over-TLS (`wss://`). Add a transport by
-  implementing this trait — do not special-case transports inside the connection code.
+- **`transport::ByteStream`** (`src/transport.rs`) is a dependency-inversion seam: an async bidirectional
+  byte stream. TCP satisfies it directly; WebSocket wraps a TCP stream in an RFC 6455 frame codec; TLS
+  (rustls) wraps *either*. `Connection` is written **once** against `ByteStream`, so the entire MQTT engine
+  is reused unchanged across TCP / WS / TLS / WS-over-TLS (`wss://`). Add a transport by implementing this
+  trait — do not special-case transports inside the connection code.
 
-- **`broker::shard::ShardState`** (`src/broker/shard/mod.rs`) is the per-shard world: sessions, retained
+- **`server::shard`** (`src/server/shard.rs` + `src/server/shard/`) is the per-shard runtime. `shard.rs`'s
+  `run_shard` orchestrates; the concerns are split: `accept.rs` (accept loop, `ConnCounts`/`ConnSlot`
+  accounting, admission control, `Listeners`), `serve.rs` (transport-stack dispatch + the `boxed_*` seams),
+  `maintenance.rs` (persistence restore/snapshot, mesh drain, load probe, session sweep, shedding). The
+  clonable `ConnCtx` bundle carries the per-connection handles.
+
+- **`broker::shard::ShardState`** (`src/broker/shard.rs`) is the per-shard *data*: sessions, retained
   table, and subscription trie. It is `Rc<RefCell<>>`-shared between all connections on the shard — **safe
-  precisely because no other core touches it**. Its concerns are split across sibling files: `mod.rs`
-  (session lifecycle: open/close/suspend/expire), `routing.rs` (one publish → per-subscriber deliveries),
-  and `mesh.rs` (cross-shard forwarding + session migration).
+  precisely because no other core touches it**. Its concerns are split across sibling files: `shard.rs`
+  (session lifecycle: open/close/suspend/expire), `shard/routing.rs` (one publish → per-subscriber
+  deliveries), and `shard/mesh.rs` (cross-shard forwarding + session migration). The one-message-in-flight
+  `Delivery`/`Mailbox` types live in `broker/delivery.rs` (the broker's delivery lingua franca), the mesh
+  wire vocabulary (`MeshMsg`, `SessionControl`, `SharedEvent`) in `broker/messages.rs`.
 
-- **`server::connection`** (`src/server/connection/`) is the per-connection state machine and all MQTT
-  packet handlers, split by concern (`connect`, `publish`, `subscribe`, `ack`, `delivery`, `ratelimit`).
-  Durable QoS/session state lives *in the connection* while online (hot path, no shared borrow) and rests in
-  the `ShardState` session only between connections.
+- **`server::connection`** (`src/server/connection.rs` + `src/server/connection/`) is the per-connection
+  state machine and all MQTT packet handlers, split by concern (`connect`, `publish`, `subscribe`,
+  `control`, `delivery`, `ratelimit`). Durable QoS/session state lives *in the connection* while online
+  (hot path, no shared borrow) and rests in the `ShardState` session only between connections.
 
-- **Cross-shard routing** goes over `broker::mesh` (`MeshMsg` on a glommio `channel_mesh`). A PUBLISH fans
+- **Cross-shard routing** goes over `broker::messages` (`MeshMsg` on a glommio `channel_mesh`). A PUBLISH fans
   out to local subscribers, then is forwarded to peer shards which each run their own local match — no shard
   reads another's memory. QoS 1/2 forwards apply backpressure (awaiting send); `$SYS` metric publishes use
   best-effort non-blocking sends.
@@ -117,18 +129,22 @@ edit it. Sections: `[server]`, `[runtime]` (`cores`, `placement`, `mesh_capacity
 ## Conventions
 
 - **Preserve the shared-nothing invariant.** No `Mutex`/`RwLock`, no `std::thread`, nothing crossing shards
-  except via the mesh. Shard-local state is single-threaded `Rc<RefCell<>>` on purpose.
+  except via the mesh. Shard-local state is single-threaded `Rc<RefCell<>>` on purpose. This is now
+  **mechanically enforced**: `clippy.toml` disallows those types/methods, and the pre-commit hook runs
+  clippy with `-D warnings`, so a violation fails the commit. Deliberately-threaded test harnesses
+  (`examples/alloc_probe.rs`, the `stresser` example) opt out with a file-level `#![allow(...)]`.
 - The connection state machine is unit-tested over an **in-memory `ByteStream` mock**
   (`src/server/connection/tests.rs`), so the full MQTT handshake runs without real sockets. Add handler
-  tests there rather than spinning up a broker.
+  tests there rather than spinning up a broker. `examples/alloc_probe.rs` measures idle memory per
+  connection; the `stresser` example (`stress/stresser.rs`, registered in `Cargo.toml`) is the throughput
+  hammer.
 - glommio executor ids are **1-based**; use the mesh `peer_id()` (0-based) when electing a single shard to
   do broker-wide work (e.g. publishing `$SYS`).
 - rustfmt uses **hard tabs**, 4-space width, `max_width = 120`, and `use_small_heuristics = "Off"`.
 
 ## Working notes
 
-`.agents/` holds the detailed engineering log: `overview.md` (feature matrix), `architecture.md`,
-`dependencies.md`, `next-steps.md` (roadmap), and `progress.md` (full implementation history + gotchas).
-**Note the `.agents/` "Key Files" tables predate the current `src/` layout** (e.g. `broker/engine.rs` →
-`broker/shard/mod.rs`, `metrics.rs` → `telemetry/metrics.rs`, `net/` → `transport/`); trust the actual tree
-and `src/lib.rs` for module structure. Version history is in `CHANGELOG.md`.
+`.agents/` holds the detailed engineering log: `overview.md` (feature matrix), `architecture.md` (with a
+current Key Files table), `dependencies.md`, `next-steps.md` (roadmap), and `progress.md` (full
+implementation history + gotchas). When in doubt, trust the actual tree and `src/lib.rs` for module
+structure. Version history is in `CHANGELOG.md`.

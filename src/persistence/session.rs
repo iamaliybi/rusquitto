@@ -20,7 +20,7 @@ use super::codec::{
 	Reader, put_opt_str, put_opt_u32, put_publish, put_str, put_u8, put_u16, put_u32, qos_from_u8, qos_to_u8,
 	read_file, write_atomic,
 };
-use crate::broker::mesh::{MigratedSession, MigratedSub};
+use crate::broker::messages::{MigratedSession, MigratedSub};
 use crate::broker::session::{InflightMessage, InflightState, PersistedSession};
 
 /// Magic header identifying a rusquitto session snapshot, version 1.

@@ -1,0 +1,22 @@
+# Mechanical enforcement of the thread-per-core, shared-nothing architecture.
+#
+# rusquitto pins one shard (glommio LocalExecutor) per core; shard state is
+# `Rc<RefCell<...>>` and cross-shard communication happens ONLY over the
+# glommio channel mesh (`broker::messages::MeshMsg`). Nothing in this crate may
+# introduce cross-thread locking or ad-hoc threads — that would silently break
+# the performance model the whole broker is built on. The pre-commit hook runs
+# `cargo clippy --all-targets -- -D warnings`, so a violation fails the commit.
+
+disallowed-types = [
+    { path = "std::sync::Mutex", reason = "shared-nothing broker: keep state shard-local (Rc<RefCell>) or cross shards via the channel mesh" },
+    { path = "std::sync::RwLock", reason = "shared-nothing broker: keep state shard-local (Rc<RefCell>) or cross shards via the channel mesh" },
+    { path = "std::sync::Condvar", reason = "shared-nothing broker: use glommio timers/channels, never thread parking" },
+    { path = "std::sync::mpsc::Sender", reason = "cross-shard messages go over the glommio channel mesh, not std mpsc" },
+    { path = "std::sync::mpsc::Receiver", reason = "cross-shard messages go over the glommio channel mesh, not std mpsc" },
+    { path = "std::sync::Barrier", reason = "shards rendezvous through the mesh join, never thread barriers" },
+]
+
+disallowed-methods = [
+    { path = "std::thread::spawn", reason = "one pinned thread per core, spawned only by the executor pool in lib::run; use glommio::spawn_local within a shard" },
+    { path = "std::thread::sleep", reason = "never block a shard's reactor; use glommio::timer::sleep" },
+]

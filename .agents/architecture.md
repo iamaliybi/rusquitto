@@ -23,7 +23,7 @@ CPU Core N  ←→  OS Thread N  ←→  Glommio LocalExecutor N
 All shards bind the *same* address/port (`127.0.0.1:1883`). The kernel hashes the TCP 4-tuple and distributes SYN
 packets across the listening sockets — fair, hardware-level load balancing with no central dispatcher.
 
-Key socket options set in `src/net/socket.rs`:
+Key socket options set in `src/transport/tcp.rs`:
 
 ```rust
 socket.set_reuse_address(true)
@@ -95,7 +95,7 @@ Exact resume within a shard; always exact for `runtime.cores = 1`. See [next-ste
 
 Built on glommio's `channels::channel_mesh` — a full mesh of shared channels connecting every shard.
 
-- Each shard `join()`s the mesh in `worker::init` and spawns a task draining inbound channels.
+- Each shard `join()`s the mesh in `server::shard::run_shard` and spawns a task draining inbound channels.
 - A PUBLISH fans out to local subscribers, then is broadcast to **every** peer shard, which runs its own
   local match. No shard reads another's state.
 - Forwarding uses non-blocking `try_send_to` (drop-on-full) → cross-shard QoS > 0 is best-effort for now.
@@ -106,17 +106,26 @@ Built on glommio's `channels::channel_mesh` — a full mesh of shared channels c
 
 ## Key Files
 
-| File                       | Role                                                        |
-|----------------------------|-------------------------------------------------------------|
-| `src/main.rs`              | Entry: CLI/config load, CPU detection, executor pool launch |
-| `src/config.rs`            | CLI (clap) + TOML config tree (serde), validation           |
-| `src/auth.rs`              | Per-shard `Authenticator`: username/password + topic ACL     |
-| `src/metrics.rs`           | Cross-shard `Metrics` atomics, published to `$SYS/broker/...` |
-| `src/logger.rs`            | tracing setup: non-blocking appenders, spans, redaction     |
-| `src/server/worker.rs`     | Per-shard init: mesh join, socket bind, accept loop, session expiry sweep |
-| `src/server/connection.rs` | Per-packet dispatch, all MQTT handlers, live QoS + session state |
-| `src/broker/engine.rs`     | `ShardState`: sessions (persist/expiry/takeover), subs, retain, mesh |
-| `src/broker/topic_trie.rs` | Wildcard-aware subscription trie (`+` / `#`)                |
-| `src/net/socket.rs`        | Low-level socket creation with SO_REUSEPORT                 |
-| `src/net/tcp_listener.rs`  | Glommio TcpListener wrapper                                 |
-| `src/bin/mosquitto.rs`     | Binary: runs `scripts/mosquitto.sh` via bash                |
+Current as of v1.7.0 (the module-layout refactor). Modules are file-based
+(`foo.rs` beside `foo/`), not `mod.rs`.
+
+| File                              | Role                                                                 |
+|-----------------------------------|----------------------------------------------------------------------|
+| `src/main.rs` / `src/lib.rs`      | Entry (CLI/config load) and `run()` composition root: logging, TLS config, mesh, executor pool |
+| `src/config.rs`                   | CLI (clap) + TOML config tree (serde), validation                    |
+| `src/auth.rs`                     | Per-shard `Authenticator`: username/password (plaintext/SHA-256/Argon2) + topic ACL |
+| `src/protocol.rs`                 | Pure MQTT helpers (QoS, topic/filter validation, shared-filter parse) |
+| `src/telemetry/metrics.rs`        | Cross-shard `Metrics` atomics, published to `$SYS/broker/...`         |
+| `src/telemetry/logging.rs`        | tracing setup: non-blocking appenders, spans, redaction              |
+| `src/transport.rs`                | `ByteStream` trait; `tcp.rs` (SO_REUSEPORT + socket buffers), `websocket.rs`, `tls.rs` |
+| `src/server/shard.rs` + `shard/`  | Per-shard **runtime**: `run_shard`; `accept.rs` (loop/accounting/admission/`Listeners`), `serve.rs` (transport dispatch), `maintenance.rs` (persistence/mesh-drain/sweep/load) |
+| `src/server/connection.rs` + `connection/` | Per-connection state machine + MQTT handlers (`connect`/`publish`/`subscribe`/`control`/`delivery`/`ratelimit`) |
+| `src/server/overload.rs`          | `LoadMonitor`: reactor scheduling-delay EWMA for admission/shedding   |
+| `src/broker/shard.rs` + `shard/`  | `ShardState` (per-shard **data**): sessions/subs/retain; `routing.rs` (fan-out), `mesh.rs` (cross-shard migration + shared-sub membership) |
+| `src/broker/delivery.rs`          | `Delivery`/`Mailbox` + queue limits — the delivery lingua franca     |
+| `src/broker/messages.rs`          | Mesh wire vocabulary: `MeshMsg`, `SessionControl`, `SharedEvent`, `MigratedSession` |
+| `src/broker/session.rs`           | Durable session value types (`SessionSnapshot`, `PersistedSession`, …) |
+| `src/broker/topics/trie.rs`       | Wildcard-aware subscription trie (`+` / `#`); `interner.rs` interns segments |
+| `src/persistence.rs` + `persistence/` | Atomic io_uring snapshot/restore: `retained.rs`, `session.rs`, shared `codec.rs` |
+| `clippy.toml`                     | Mechanical shared-nothing enforcement (no `Mutex`/`RwLock`/`std::thread`) |
+| `examples/alloc_probe.rs` / `stress/stresser.rs` | Idle-memory probe and throughput hammer (both Cargo examples) |

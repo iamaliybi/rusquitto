@@ -8,13 +8,12 @@ use std::collections::VecDeque;
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::io::{Error, ErrorKind, Result};
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-use super::{Connection, MAX_CLIENT_ID_LEN, NEXT_CLIENT_ID, SESSION_CLAIM_TIMEOUT};
+use super::{Connection, MAX_CLIENT_ID_LEN, SESSION_CLAIM_TIMEOUT};
 use crate::auth::AuthResult;
-use crate::broker::mesh::MigratedSession;
+use crate::broker::messages::MigratedSession;
 use crate::telemetry::logging::redact;
 use crate::transport::ByteStream;
 
@@ -67,7 +66,9 @@ impl<S: ByteStream> Connection<S> {
 		// session takeover).
 		let assigned = connect.client_id.is_empty();
 		if assigned {
-			let n = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
+			// The counter is shard-local (no cross-core traffic on the CONNECT
+			// path); the shard id baked into the string keeps ids broker-unique.
+			let n = self.shard.borrow_mut().next_assigned_id();
 			let rand = RandomState::new().hash_one(n);
 			self.client_id = format!("auto-{}-{}-{:016x}", self.shard_id, n, rand);
 		} else {
@@ -161,7 +162,7 @@ impl<S: ByteStream> Connection<S> {
 		let mut offline_queue = VecDeque::new();
 		if let Some(mailbox) = self.mailbox_tx.take() {
 			let handle = self
-				.state
+				.shard
 				.borrow_mut()
 				.open_session(&self.client_id, mailbox, clean_start);
 			self.session_generation = handle.generation;
@@ -178,12 +179,12 @@ impl<S: ByteStream> Connection<S> {
 		// of them owns it and migrate it here. A Clean Start instead tells peers to
 		// discard any session they may still hold from an earlier rehash.
 		if clean_start {
-			self.state.borrow().broadcast_claim(&self.client_id, false);
+			self.shard.borrow().broadcast_claim(&self.client_id, false);
 		} else if !session_present && let Some(migrated) = self.claim_remote_session().await {
 			info!("resumed session migrated from another shard");
 			self.subscription_count = migrated.subscriptions.len();
 			let (snapshot, offline) = self
-				.state
+				.shard
 				.borrow_mut()
 				.install_migrated(&self.client_id, migrated);
 			self.inflight = snapshot.inflight;
@@ -268,7 +269,7 @@ impl<S: ByteStream> Connection<S> {
 	/// mesh or a wedged peer, so treating that as "no session" is safe (the stranded
 	/// session simply expires on its old shard).
 	async fn claim_remote_session(&mut self) -> Option<MigratedSession> {
-		let nr_peers = self.state.borrow().mesh_peers();
+		let nr_peers = self.shard.borrow().mesh_peers();
 		if nr_peers == 0 {
 			return None; // Single-shard broker: no peers to claim from.
 		}
@@ -276,7 +277,7 @@ impl<S: ByteStream> Connection<S> {
 		// Register a mailbox for the Handoff replies, then broadcast the claim.
 		let (tx, rx) = local_channel::new_unbounded::<Option<MigratedSession>>();
 		{
-			let mut state = self.state.borrow_mut();
+			let mut state = self.shard.borrow_mut();
 			state.register_claim(self.client_id.clone(), tx);
 			state.broadcast_claim(&self.client_id, true);
 		}
@@ -306,7 +307,7 @@ impl<S: ByteStream> Connection<S> {
 		};
 		let found = collect.or(timeout).await;
 
-		self.state.borrow_mut().unregister_claim(&self.client_id);
+		self.shard.borrow_mut().unregister_claim(&self.client_id);
 		found
 	}
 }

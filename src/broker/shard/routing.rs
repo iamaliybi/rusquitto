@@ -7,7 +7,7 @@ use std::rc::Rc;
 use mqttbytes::{QoS, v5::Publish};
 
 use super::ShardState;
-use crate::broker::session::{Delivery, MAILBOX_LIMIT, OFFLINE_QUEUE_LIMIT};
+use crate::broker::delivery::{Delivery, MAILBOX_LIMIT, OFFLINE_QUEUE_LIMIT};
 use crate::broker::topics::filter_matches;
 use crate::protocol::min_qos;
 

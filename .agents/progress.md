@@ -547,3 +547,40 @@ Remaining floor ~1.7 KiB/conn = glommio task (600) + stream/source allocs
 Verified: 87 tests, clippy -D warnings, QoS 0/1/2 smoke, WS smoke, 2-shard
 shared-sub exactly-once (40/40), throughput A/B. probe_future_tree doc updated
 as the regression watchpoint.
+
+---
+
+## Phase 8 — Architectural refactor (2026-07-05, v1.7.0)
+
+Behaviour-preserving structure pass (allocprobe 3.9 KiB/conn unchanged; all
+transport/persistence/shared-sub smokes pass; 87 tests):
+
+- clippy.toml: disallowed-types (Mutex/RwLock/Condvar/mpsc/Barrier) +
+  disallowed-methods (thread::spawn/sleep) => shared-nothing now MECHANICALLY
+  enforced by the pre-commit clippy -D warnings. Test harnesses (alloc_probe,
+  stresser examples) opt out with file-level #![allow(clippy::disallowed_methods)].
+- server/worker.rs (882) -> server/shard.rs (run_shard, was init) + shard/
+  {accept,serve,maintenance}.rs. New ConnCtx bundle killed the 7-arg serve chain
+  + 4x too_many_arguments allows. ShardIds{executor,peer} bundle for the spawn
+  orchestration. GOTCHA: LoadMonitor::new() returns Rc<Self>; passing &LoadMonitor
+  and calling .clone() clones the REFERENCE (escape error) - take &Rc<LoadMonitor>,
+  use Rc::clone.
+- Renames: Connection.state->shard, buffer/out->inbound/outbound,
+  ShardState.mesh->mesh_tx, broker/mesh.rs->messages.rs (vocabulary vs
+  shard/mesh.rs behaviour), connection/ack.rs->control.rs, allocprobe->alloc_probe.
+- broker/session.rs -> extracted Delivery/Mailbox/limits into broker/delivery.rs.
+- NEXT_CLIENT_ID static AtomicU64 -> ShardState.next_assigned_id (shard-local;
+  id embeds shard_id so still unique). Last mutable global gone.
+- All 8 foo/mod.rs -> foo.rs (file-based modules). Pure git mv, zero code change.
+- stress/stresser.rs registered as [[example]] with explicit path; needs
+  #![allow(clippy::disallowed_methods)]; surfaced a latent is_multiple_of lint
+  (invisible under bare rustc) - fixed.
+- DEFERRED (documented, not done): multi-crate workspace split - premature at
+  8.9k LoC, would break the child-module test pattern for zero isolation gain.
+- Docs: CLAUDE.md architecture section + .agents/architecture.md Key Files table
+  fully rewritten to current layout.
+
+GOTCHA reconfirmed hard this session: backticks inside a double-quoted
+wsl bash -lc "..." get command-substituted even around a single-quoted heredoc
+delimiter. Use the Write/Edit tools for any content with backticks, never inline
+python heredocs with backtick-containing strings.

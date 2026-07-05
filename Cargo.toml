@@ -1,6 +1,6 @@
 [package]
 name = "rusquitto"
-version = "1.6.5"
+version = "1.7.0"
 edition = "2024"
 default-run = "rusquitto"
 
@@ -47,3 +47,9 @@ rustls-pemfile = "2"
 [dev-dependencies]
 # Self-signed certificate generation for the TLS handshake tests.
 rcgen = "0.14.8"
+
+# The stress hammer lives under stress/ (dependency-free, also builds with a bare
+# `rustc`), but is registered as an example so `cargo clippy`/`fmt`/CI cover it.
+[[example]]
+name = "stresser"
+path = "stress/stresser.rs"

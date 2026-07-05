@@ -1,3 +1,3 @@
 pub mod connection;
 pub mod overload;
-pub mod worker;
+pub mod shard;

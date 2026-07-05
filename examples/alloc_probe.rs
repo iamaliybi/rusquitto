@@ -5,7 +5,12 @@
 //! per-connection *live-heap* delta broken down by allocation size class —
 //! separating true heap cost from allocator/page overhead (the RSS gap).
 //!
-//! Run: `cargo run --release --example allocprobe -- 2000`
+//! Run: `cargo run --release --example alloc_probe -- 2000`
+
+// This probe is a deliberately multi-threaded test harness — it hosts the broker
+// on one thread and drives clients from the main thread — so the crate-wide
+// thread-per-core lints (which forbid `std::thread`) don't apply to it.
+#![allow(clippy::disallowed_methods)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{Read, Write};

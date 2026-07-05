@@ -7,11 +7,11 @@
 //! - [`connect`] — the CONNECT handshake, authentication, and session resume.
 //! - [`publish`] — inbound PUBLISH handling and the receiver-side QoS flows.
 //! - [`subscribe`] — SUBSCRIBE / UNSUBSCRIBE and retained replay.
-//! - [`ack`] — PING, DISCONNECT, and the sender-side QoS acknowledgements.
+//! - [`control`] — PING, DISCONNECT, and the sender-side QoS acknowledgements.
 //! - [`delivery`] — the outbound path: window control, fan-out, retransmit.
 
-mod ack;
 mod connect;
+mod control;
 mod delivery;
 mod publish;
 mod ratelimit;
@@ -34,24 +34,20 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Error, ErrorKind, Result};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 use crate::auth::Authenticator;
-use crate::broker::session::{Delivery, InflightMessage, Mailbox};
+use crate::broker::delivery::{Delivery, Mailbox};
+use crate::broker::session::InflightMessage;
 use crate::broker::shard::ShardState;
 use crate::config::LimitsConfig;
 use crate::telemetry::metrics::Metrics;
 use crate::transport::ByteStream;
 
-/// Monotonic counter for assigning identifiers to clients that connect without
-/// one (MQTT 5 allows an empty client id, leaving the server to assign it).
-/// Combined with the shard id it is unique across the whole broker.
-static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(0);
-
 /// How long a CONNECT handler waits for peers to answer a cross-shard session
-/// [`Claim`](crate::broker::mesh::SessionControl::Claim) before giving up and
+/// [`Claim`](crate::broker::messages::SessionControl::Claim) before giving up and
 /// treating the session as fresh. Mesh replies normally arrive in microseconds;
 /// this only bounds the wait if a reply is dropped (drop-on-full mesh) or a peer
 /// is wedged, so it can be generous without slowing the common case (which
@@ -115,11 +111,11 @@ enum Event {
 
 pub struct Connection<S: ByteStream> {
 	stream: S,
-	buffer: BytesMut,
+	inbound: BytesMut,
 	/// Coalesced output: every outbound packet is encoded here and the whole
 	/// batch is written with one `write_all` per event-loop wakeup (one io_uring
 	/// op — and one TLS record / WebSocket frame — instead of one per packet).
-	out: BytesMut,
+	outbound: BytesMut,
 	/// Adaptive per-read reservation in `buffer`, between [`READ_CHUNK_MIN`] and
 	/// [`READ_CHUNK_MAX`]: doubles when reads come back full, halves when they
 	/// come back nearly empty, so idle connections hold small buffers.
@@ -127,7 +123,7 @@ pub struct Connection<S: ByteStream> {
 	shard_id: usize,
 	client_id: String,
 	/// Shard-local broker state, shared with every other connection on this core.
-	state: Rc<RefCell<ShardState>>,
+	shard: Rc<RefCell<ShardState>>,
 	/// Sender half of this connection's mailbox, held until CONNECT hands it to
 	/// the registry. `None` thereafter — the registry owns it (it is not `Clone`).
 	mailbox_tx: Option<Mailbox>,
@@ -229,7 +225,7 @@ impl<S: ByteStream> Connection<S> {
 	pub fn new(
 		stream: S,
 		shard_id: usize,
-		state: Rc<RefCell<ShardState>>,
+		shard: Rc<RefCell<ShardState>>,
 		limits: LimitsConfig,
 		auth: Rc<Authenticator>,
 		metrics: Arc<Metrics>,
@@ -240,12 +236,12 @@ impl<S: ByteStream> Connection<S> {
 			stream,
 			// `with_capacity(0)` (the default) allocates nothing; the buffer grows
 			// on demand from the first read and is trimmed when it empties.
-			buffer: BytesMut::with_capacity(limits.initial_read_buffer),
-			out: BytesMut::new(),
+			inbound: BytesMut::with_capacity(limits.initial_read_buffer),
+			outbound: BytesMut::new(),
 			read_chunk: READ_CHUNK_MIN,
 			shard_id,
 			client_id: String::new(),
-			state,
+			shard,
 			mailbox_tx: Some(mailbox_tx),
 			mailbox_rx,
 			incoming_qos2: HashMap::new(),
@@ -288,18 +284,18 @@ impl<S: ByteStream> Connection<S> {
 	where
 		F: FnOnce(&mut BytesMut) -> std::result::Result<usize, MqttError>,
 	{
-		encode(&mut self.out)
+		encode(&mut self.outbound)
 			.map(|_| ())
 			.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))
 	}
 
 	/// Writes the coalesced output buffer to the socket in one `write_all`.
 	async fn flush(&mut self) -> Result<()> {
-		if self.out.is_empty() {
+		if self.outbound.is_empty() {
 			return Ok(());
 		}
-		self.stream.write_all(&self.out).await?;
-		self.out.clear();
+		self.stream.write_all(&self.outbound).await?;
+		self.outbound.clear();
 		Ok(())
 	}
 
@@ -315,11 +311,11 @@ impl<S: ByteStream> Connection<S> {
 	/// large packet in, a deep fan-out out) doesn't pin its high-water memory on
 	/// an idle connection. The next use re-grows on demand.
 	fn shrink_buffers(&mut self) {
-		if self.buffer.is_empty() && self.buffer.capacity() > BUFFER_RETAIN_MAX {
-			self.buffer = BytesMut::new();
+		if self.inbound.is_empty() && self.inbound.capacity() > BUFFER_RETAIN_MAX {
+			self.inbound = BytesMut::new();
 		}
-		if self.out.is_empty() && self.out.capacity() > BUFFER_RETAIN_MAX {
-			self.out = BytesMut::new();
+		if self.outbound.is_empty() && self.outbound.capacity() > BUFFER_RETAIN_MAX {
+			self.outbound = BytesMut::new();
 		}
 	}
 
@@ -350,7 +346,7 @@ impl<S: ByteStream> Connection<S> {
 			};
 			let pending = std::mem::take(&mut self.pending_outbound);
 			let will = self.will.take();
-			let owned = self.state.borrow_mut().close_session(
+			let owned = self.shard.borrow_mut().close_session(
 				&self.client_id,
 				self.session_generation,
 				self.session_expiry,
@@ -370,7 +366,7 @@ impl<S: ByteStream> Connection<S> {
 					self.fan_out(*will, None).await;
 				} else {
 					debug!(topic = %will.topic, delay, "arming delayed will message");
-					self.state
+					self.shard
 						.borrow_mut()
 						.arm_will(&self.client_id, self.session_generation, *will, delay);
 				}
@@ -419,7 +415,7 @@ impl<S: ByteStream> Connection<S> {
 					self.deadline = Some(Instant::now() + window);
 				}
 				// A large ack burst shouldn't balloon the output buffer.
-				if self.out.len() >= FLUSH_THRESHOLD {
+				if self.outbound.len() >= FLUSH_THRESHOLD {
 					self.flush().await?;
 				}
 			}
@@ -433,7 +429,7 @@ impl<S: ByteStream> Connection<S> {
 							warn!(error = %e, "delivery error, closing connection");
 							return Err(e);
 						}
-						if self.out.len() >= FLUSH_THRESHOLD {
+						if self.outbound.len() >= FLUSH_THRESHOLD {
 							self.flush().await?;
 						}
 					}
@@ -450,12 +446,12 @@ impl<S: ByteStream> Connection<S> {
 			// The read reserves `read_chunk` bytes in the assembly buffer and reads
 			// directly into it (no intermediate copy). `valid` marks the real data
 			// length so a cancelled read's zeroed reservation is always dropped.
-			let valid = self.buffer.len();
+			let valid = self.inbound.len();
 			let deadline = self.deadline;
 			let chunk = self.read_chunk;
 			let event = {
 				let stream = &mut self.stream;
-				let buffer = &mut self.buffer;
+				let buffer = &mut self.inbound;
 				let read = async {
 					buffer.resize(valid + chunk, 0);
 					match stream.read(&mut buffer[valid..]).await {
@@ -492,13 +488,13 @@ impl<S: ByteStream> Connection<S> {
 					}
 				}
 				Event::ReadErr(e) => {
-					self.buffer.truncate(valid);
+					self.inbound.truncate(valid);
 					warn!(error = %e, "network error, closing connection");
 					return Err(e);
 				}
 				Event::Outgoing(delivery) => {
 					// The read lost the race: drop its zeroed reservation.
-					self.buffer.truncate(valid);
+					self.inbound.truncate(valid);
 					match delivery {
 						Some(delivery) => {
 							if let Err(e) = self.deliver(delivery) {
@@ -513,7 +509,7 @@ impl<S: ByteStream> Connection<S> {
 				// within the keep-alive window. Either way, drop the connection (an
 				// abnormal close, so a keep-alive timeout still fires the will).
 				Event::Timeout => {
-					self.buffer.truncate(valid);
+					self.inbound.truncate(valid);
 					if self.connected {
 						warn!("keep-alive timeout, closing connection");
 						let _ = self.send_disconnect(mqtt_v5::DisconnectReasonCode::KeepAliveTimeout);
@@ -579,7 +575,7 @@ impl<S: ByteStream> Connection<S> {
 	/// kilobytes out of every connection's *resident* memory. The remaining
 	/// inline arms are tiny (acks and pings are effectively synchronous).
 	async fn process_one(&mut self, max_packet: usize) -> Result<bool> {
-		let Some(packet) = Self::parse_packet(&mut self.buffer, max_packet)? else {
+		let Some(packet) = Self::parse_packet(&mut self.inbound, max_packet)? else {
 			return Ok(false);
 		};
 

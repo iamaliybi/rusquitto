@@ -11,8 +11,9 @@ use std::rc::Rc;
 use tracing::{debug, warn};
 
 use super::{Connection, PENDING_OUTBOUND_LIMIT};
-use crate::broker::mesh::MeshMsg;
-use crate::broker::session::{Delivery, InflightMessage, InflightState};
+use crate::broker::delivery::Delivery;
+use crate::broker::messages::MeshMsg;
+use crate::broker::session::{InflightMessage, InflightState};
 use crate::transport::ByteStream;
 
 /// Boxes a blocking mesh send on a plain (non-async) stack frame, so its future
@@ -107,7 +108,7 @@ impl<S: ByteStream> Connection<S> {
 	/// client id for a client publish (No Local), or `None` for a
 	/// broker-originated one such as a Will Message.
 	pub(super) async fn fan_out(&self, message: mqtt_v5::Publish, publisher: Option<&str>) {
-		let senders = self.state.borrow().mesh_senders();
+		let senders = self.shard.borrow().mesh_senders();
 		if let Some(senders) = senders {
 			let me = senders.peer_id();
 			for idx in 0..senders.nr_consumers() {
@@ -130,7 +131,7 @@ impl<S: ByteStream> Connection<S> {
 				}
 			}
 		}
-		self.state.borrow_mut().deliver_local(message, publisher);
+		self.shard.borrow_mut().deliver_local(message, publisher);
 	}
 
 	/// Queues a routed message for this client at the given effective QoS and
@@ -214,9 +215,9 @@ impl<S: ByteStream> Connection<S> {
 
 		// Encode straight into the coalesced output buffer; on failure, roll the
 		// partial bytes back so the batch stays well-formed.
-		let start = self.out.len();
-		if let Err(e) = message.write(&mut self.out) {
-			self.out.truncate(start);
+		let start = self.outbound.len();
+		if let Err(e) = message.write(&mut self.outbound) {
+			self.outbound.truncate(start);
 			if let Some(pkid) = pkid {
 				self.inflight.remove(&pkid);
 			}
@@ -230,7 +231,7 @@ impl<S: ByteStream> Connection<S> {
 		// larger packet. Drop it (rolling back the encoded bytes, the in-flight
 		// slot, and a just-registered alias the client will now never see) — it
 		// can never be delivered.
-		let written = self.out.len() - start;
+		let written = self.outbound.len() - start;
 		if let Some(max) = self.peer_max_packet_size
 			&& written as u64 > u64::from(max)
 		{
@@ -238,7 +239,7 @@ impl<S: ByteStream> Connection<S> {
 				size = written,
 				max, "outbound publish exceeds client max packet size, dropping"
 			);
-			self.out.truncate(start);
+			self.outbound.truncate(start);
 			if let Some(pkid) = pkid {
 				self.inflight.remove(&pkid);
 			}
@@ -285,9 +286,9 @@ impl<S: ByteStream> Connection<S> {
 				"retransmitting in-flight messages"
 			);
 		}
-		// Direct field borrows keep `self.inflight` (shared) and `self.out`
+		// Direct field borrows keep `self.inflight` (shared) and `self.outbound`
 		// (mutable) disjoint, so no intermediate per-packet buffers are needed.
-		let out = &mut self.out;
+		let out = &mut self.outbound;
 		for (pkid, entry) in &self.inflight {
 			match entry.state {
 				// Message not yet acknowledged: resend the PUBLISH marked DUP.
@@ -307,7 +308,7 @@ impl<S: ByteStream> Connection<S> {
 				}
 			}
 		}
-		if self.out.len() >= super::FLUSH_THRESHOLD {
+		if self.outbound.len() >= super::FLUSH_THRESHOLD {
 			self.flush().await?;
 		}
 
@@ -317,7 +318,7 @@ impl<S: ByteStream> Connection<S> {
 			debug!(count = offline_queue.len(), "flushing offline queue");
 			for delivery in offline_queue {
 				self.deliver(delivery)?;
-				if self.out.len() >= super::FLUSH_THRESHOLD {
+				if self.outbound.len() >= super::FLUSH_THRESHOLD {
 					self.flush().await?;
 				}
 			}

@@ -24,8 +24,9 @@ use glommio::channels::channel_mesh::Senders;
 use glommio::channels::local_channel::LocalSender;
 use mqttbytes::v5::Publish;
 
-use crate::broker::mesh::{MeshMsg, MigratedSession, MigratedSub};
-use crate::broker::session::{Delivery, Mailbox, PersistedSession, SessionHandle, SessionSnapshot};
+use crate::broker::delivery::{Delivery, Mailbox};
+use crate::broker::messages::{MeshMsg, MigratedSession, MigratedSub};
+use crate::broker::session::{PersistedSession, SessionHandle, SessionSnapshot};
 use crate::broker::topics::{SubOptions, TopicTrie};
 
 /// MQTT 5 Session Expiry Interval sentinel meaning "the session never expires".
@@ -61,7 +62,7 @@ struct Session {
 	/// QoS > 0 messages that matched while the client was offline, delivered in
 	/// order when it reconnects. Bounded by [`OFFLINE_QUEUE_LIMIT`].
 	///
-	/// [`OFFLINE_QUEUE_LIMIT`]: crate::broker::session::OFFLINE_QUEUE_LIMIT
+	/// [`OFFLINE_QUEUE_LIMIT`]: crate::broker::delivery::OFFLINE_QUEUE_LIMIT
 	offline_queue: VecDeque<Delivery>,
 	/// A Will Message armed with a non-zero Will Delay Interval: `(will, deadline)`.
 	/// Published by [`sweep_expired`](ShardState::sweep_expired) once the deadline
@@ -90,17 +91,17 @@ pub struct ShardState {
 	/// shard joins the mesh in `worker::init`. Held in an `Rc` so a connection can
 	/// clone the handle and `await` a cross-shard send without keeping this
 	/// `ShardState` borrowed across the await.
-	mesh: Option<Rc<Senders<MeshMsg>>>,
+	mesh_tx: Option<Rc<Senders<MeshMsg>>>,
 	/// In-flight cross-shard session claims this shard is awaiting, keyed by client
 	/// id. When a `Handoff` reply arrives on the mesh it is delivered through the
 	/// matching sender, waking the CONNECT handler blocked on the claim.
 	pending_claims: HashMap<String, LocalSender<Option<MigratedSession>>>,
-	/// Round-robin cursor per shared-subscription group (keyed by `group` + the
-	/// matched filter), advanced each time a message is load-balanced to a member so
-	/// deliveries rotate across the group.
+	/// Round-robin cursor per shared-subscription group, keyed by group name,
+	/// advanced each time a purely-local group load-balances a message so its
+	/// deliveries rotate across the members.
 	shared_cursor: HashMap<String, usize>,
 	/// Replicated view of *remote* shards' connected shared-group members, keyed by
-	/// group name, maintained by [`SharedEvent`](crate::broker::mesh::SharedEvent)
+	/// group name, maintained by [`SharedEvent`](crate::broker::messages::SharedEvent)
 	/// broadcasts. Sorted (`BTreeSet`) so every shard indexes an identical member
 	/// order when it computes the global delivery pick. Local members are not in
 	/// here — they come from the trie at match time.
@@ -108,6 +109,11 @@ pub struct ShardState {
 	/// Cap on distinct retained topics stored on this shard (`0` = unlimited). Bounds
 	/// the memory a flood of retained publishes to unique topics can consume.
 	retained_limit: usize,
+	/// Per-shard counter for server-assigned client ids (MQTT 5 allows an empty
+	/// CONNECT client id). Shard-local on purpose: the shard id is baked into the
+	/// generated id string, so per-shard counters stay broker-unique without any
+	/// cross-core atomic on the CONNECT path.
+	next_assigned_id: u64,
 }
 
 impl ShardState {
@@ -119,6 +125,14 @@ impl ShardState {
 	/// Sets the cap on distinct retained topics (`0` = unlimited).
 	pub fn set_retained_limit(&mut self, limit: usize) {
 		self.retained_limit = limit;
+	}
+
+	/// Hands out the next per-shard counter value for a server-assigned client id
+	/// (see the field docs for why this is shard-local rather than a global).
+	pub fn next_assigned_id(&mut self) -> u64 {
+		let n = self.next_assigned_id;
+		self.next_assigned_id += 1;
+		n
 	}
 
 	/// Opens (or resumes) a session for a connecting client, installing its live

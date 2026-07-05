@@ -7,7 +7,7 @@ use std::rc::Rc;
 use tracing::{debug, warn};
 
 use super::Connection;
-use crate::broker::session::Delivery;
+use crate::broker::delivery::Delivery;
 use crate::broker::topics::SubOptions;
 use crate::protocol::{min_qos, parse_shared_filter, sub_reason_code, valid_subscribe_filter};
 use crate::transport::ByteStream;
@@ -68,7 +68,7 @@ impl<S: ByteStream> Connection<S> {
 			let granted = min_qos(filter.qos, self.limits.max_qos());
 
 			{
-				let mut state = self.state.borrow_mut();
+				let mut state = self.shard.borrow_mut();
 				let is_new = state.subscribe(
 					effective,
 					&self.client_id,
@@ -142,7 +142,7 @@ impl<S: ByteStream> Connection<S> {
 			// removes the matching shared entry rather than a phantom literal filter.
 			let (effective, share_group) = parse_shared_filter(filter).unwrap_or((filter, None));
 			let removed = self
-				.state
+				.shard
 				.borrow_mut()
 				.unsubscribe(effective, &self.client_id, share_group);
 			if removed {

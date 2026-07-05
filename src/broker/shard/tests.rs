@@ -364,7 +364,7 @@ fn persist_then_load_restores_a_full_suspended_session() {
 
 #[test]
 fn shared_events_maintain_the_remote_view() {
-	use crate::broker::mesh::SharedEvent;
+	use crate::broker::messages::SharedEvent;
 	let mut s = ShardState::default();
 	s.apply_shared_event(SharedEvent::Join { group: "g".into(), client_id: "r1".into() });
 	s.apply_shared_event(SharedEvent::Join { group: "g".into(), client_id: "r2".into() });
@@ -380,7 +380,7 @@ fn shared_events_maintain_the_remote_view() {
 
 #[test]
 fn shared_global_pick_skips_local_suspended_when_remote_members_exist() {
-	use crate::broker::mesh::SharedEvent;
+	use crate::broker::messages::SharedEvent;
 	let mut s = ShardState::default();
 	// A suspended local member of group g...
 	arm(&mut s, "local");
@@ -404,7 +404,7 @@ fn shared_global_pick_skips_local_suspended_when_remote_members_exist() {
 /// every message must be delivered to exactly one member cluster-wide.
 #[test]
 fn shared_global_pick_delivers_exactly_once_across_shards() {
-	use crate::broker::mesh::SharedEvent;
+	use crate::broker::messages::SharedEvent;
 
 	// Shard A owns alice; shard B owns bob. Each sees the other via its
 	// replicated remote view — exactly what the mesh Join broadcasts build.
