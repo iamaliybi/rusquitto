@@ -96,6 +96,15 @@ pub struct ShardState {
 	/// id. When a `Handoff` reply arrives on the mesh it is delivered through the
 	/// matching sender, waking the CONNECT handler blocked on the claim.
 	pending_claims: HashMap<String, LocalSender<Option<MigratedSession>>>,
+	/// Reliable outbound queue for **control-plane** mesh messages (session
+	/// `Claim`/`Handoff` and shared-subscription `Join`/`Leave`). Enqueuing is
+	/// synchronous and never drops; a drain task sends each with the awaiting
+	/// `send_to` (mesh backpressure), so control messages survive an overloaded
+	/// link instead of being silently dropped like the best-effort data plane
+	/// (`$SYS`, QoS 0 publishes). `None` on a single-shard broker (no peers).
+	/// Control volume is low (membership + migration events), so the queue stays
+	/// small even under sustained data-plane saturation.
+	control_tx: Option<LocalSender<(usize, MeshMsg)>>,
 	/// Round-robin cursor per shared-subscription group, keyed by group name,
 	/// advanced each time a purely-local group load-balances a message so its
 	/// deliveries rotate across the members.

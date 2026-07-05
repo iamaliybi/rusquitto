@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use futures_rustls::TlsAcceptor;
 use glommio::TaskQueueHandle;
 use glommio::channels::channel_mesh::Receivers;
+use glommio::channels::local_channel;
 use mqttbytes::{QoS, v5::Publish};
 
 use super::{LOAD_PROBE_INTERVAL, MALLOC_TRIM_EVERY, SESSION_SWEEP_INTERVAL, SHED_INTERVAL};
@@ -164,25 +165,68 @@ pub(super) fn spawn_background(
 ) {
 	let (shard_id, mesh_peer_id) = (ids.executor, ids.peer);
 	// Drain inbound cross-shard messages into local fan-out / migration handling.
+	// After a blocking `recv` wakes, drain every message already queued without
+	// yielding between them (via `poll_once`), so a burst forwarded from a peer is
+	// handled in a single wake instead of one reactor reschedule per message —
+	// cutting cross-shard scheduling latency and CPU under load. `poll_once` on a
+	// local-channel `recv` is cancel-safe: a pending poll takes no message.
 	for (_producer, receiver) in receivers.streams() {
 		let state = state.clone();
 		glommio::spawn_local(async move {
 			while let Some(msg) = receiver.recv().await {
-				match msg {
-					MeshMsg::Publish(publish) => state.borrow_mut().deliver_local(publish, None),
-					MeshMsg::Control(control) => state.borrow_mut().on_control(*control),
-					MeshMsg::Shared(event) => state.borrow_mut().apply_shared_event(event),
+				handle_mesh_msg(&state, msg);
+				while let Some(Some(msg)) = futures_lite::future::poll_once(receiver.recv()).await {
+					handle_mesh_msg(&state, msg);
 				}
 			}
 		})
 		.detach();
 	}
 
+	spawn_control_drain(state);
 	spawn_session_sweep(state, tq_maintenance, mesh_peer_id);
 	spawn_load_probe(metrics, load, config, shard_id, mesh_peer_id);
 	spawn_load_shedding(state, metrics, load, config, tq_maintenance, shard_id);
 	spawn_snapshotters(state, config, tq_maintenance, mesh_peer_id);
 	spawn_sys_metrics(state, config, metrics, tq_maintenance, mesh_peer_id);
+}
+
+/// Applies one inbound mesh message to the shard: a forwarded publish fans out
+/// locally, a session control message drives migration, a shared-sub event
+/// updates the replicated membership view. Each takes the borrow transiently.
+fn handle_mesh_msg(state: &Shard, msg: MeshMsg) {
+	match msg {
+		MeshMsg::Publish(publish) => state.borrow_mut().deliver_local(publish, None),
+		MeshMsg::Control(control) => state.borrow_mut().on_control(*control),
+		MeshMsg::Shared(event) => state.borrow_mut().apply_shared_event(event),
+	}
+}
+
+/// Spawns the reliable control-plane drain (foreground): it awaits the shard's
+/// control outbox and forwards each message with the awaiting `send_to` (mesh
+/// backpressure), so session `Claim`/`Handoff` and shared-subscription
+/// `Join`/`Leave` are never dropped under load — unlike the best-effort data
+/// plane. FIFO, so a `Join` is never reordered past a later `Leave`. A no-op on a
+/// single-shard broker (no peers).
+fn spawn_control_drain(state: &Shard) {
+	let senders = {
+		let s = state.borrow();
+		if s.mesh_peers() == 0 {
+			return;
+		}
+		s.mesh_senders()
+	};
+	let Some(senders) = senders else {
+		return;
+	};
+	let (tx, rx) = local_channel::new_unbounded::<(usize, MeshMsg)>();
+	state.borrow_mut().set_control_tx(tx);
+	glommio::spawn_local(async move {
+		while let Some((peer, msg)) = rx.recv().await {
+			let _ = senders.send_to(peer, msg).await;
+		}
+	})
+	.detach();
 }
 
 /// Periodically reclaim suspended sessions whose expiry has lapsed and publish

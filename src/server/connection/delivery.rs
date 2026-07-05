@@ -169,7 +169,7 @@ impl<S: ByteStream> Connection<S> {
 			props.subscription_identifiers = sub_ids.to_vec();
 		}
 
-		let pkid = match qos {
+		let inflight = match qos {
 			QoS::AtMostOnce => {
 				message.pkid = 0;
 				None
@@ -177,21 +177,30 @@ impl<S: ByteStream> Connection<S> {
 			QoS::AtLeastOnce => {
 				let pkid = self.alloc_pkid();
 				message.pkid = pkid;
-				self.track_inflight(pkid, &message, InflightState::Qos1);
-				Some(pkid)
+				Some((pkid, InflightState::Qos1))
 			}
 			QoS::ExactlyOnce => {
 				let pkid = self.alloc_pkid();
 				message.pkid = pkid;
-				self.track_inflight(pkid, &message, InflightState::Qos2Pending);
-				Some(pkid)
+				Some((pkid, InflightState::Qos2Pending))
 			}
+		};
+
+		// The QoS > 0 retransmit copy must keep the *full* topic, but the outbound
+		// alias below may clear `message.topic`. Clone one here only when aliasing is
+		// possible (the client advertised a Topic Alias Maximum); otherwise `message`
+		// keeps its topic and is moved into the in-flight table after the write — one
+		// Publish clone instead of two on the common (non-aliasing) delivery path.
+		let retransmit_copy = if inflight.is_some() && self.peer_topic_alias_max > 0 {
+			Some(message.clone())
+		} else {
+			None
 		};
 
 		// Outbound topic alias (MQTT 5): when the client accepts aliases, a repeat
 		// of a registered topic goes out as just the alias (empty topic name); the
 		// first use of a topic registers an alias alongside the full name. Applied
-		// *after* the in-flight copy was stored above, so a retransmit on a later
+		// *after* the retransmit copy was captured above, so a retransmit on a later
 		// connection (whose alias table starts empty) still carries the full topic.
 		let mut newly_aliased: Option<String> = None;
 		if self.peer_topic_alias_max > 0 {
@@ -226,9 +235,6 @@ impl<S: ByteStream> Connection<S> {
 		let start = self.outbound.len();
 		if let Err(e) = message.write(&mut self.outbound) {
 			self.outbound.truncate(start);
-			if let Some(pkid) = pkid {
-				self.inflight.remove(&pkid);
-			}
 			if let Some(topic) = &newly_aliased
 				&& let Some(a) = self.aliases.as_mut()
 			{
@@ -250,9 +256,6 @@ impl<S: ByteStream> Connection<S> {
 				max, "outbound publish exceeds client max packet size, dropping"
 			);
 			self.outbound.truncate(start);
-			if let Some(pkid) = pkid {
-				self.inflight.remove(&pkid);
-			}
 			if let Some(topic) = &newly_aliased
 				&& let Some(a) = self.aliases.as_mut()
 			{
@@ -261,15 +264,17 @@ impl<S: ByteStream> Connection<S> {
 			return Ok(());
 		}
 
-		self.metrics.message_sent(message.payload.len());
-		Ok(())
-	}
+		// The write succeeded: record the QoS > 0 message in the in-flight window for
+		// retransmit-on-resume, moving `message` when no pre-alias copy was made.
+		let payload_len = message.payload.len();
+		if let Some((pkid, state)) = inflight {
+			let publish = retransmit_copy.unwrap_or(message);
+			self.inflight
+				.insert(pkid, InflightMessage { publish, state });
+		}
 
-	/// Records an outbound QoS 1/2 message in the in-flight window, keeping a copy
-	/// of the PUBLISH so it can be retransmitted with the DUP flag on resume.
-	fn track_inflight(&mut self, pkid: u16, message: &mqtt_v5::Publish, state: InflightState) {
-		self.inflight
-			.insert(pkid, InflightMessage { publish: message.clone(), state });
+		self.metrics.message_sent(payload_len);
+		Ok(())
 	}
 
 	/// Allocates the next unused packet id (1..=65535) for an outbound message.
