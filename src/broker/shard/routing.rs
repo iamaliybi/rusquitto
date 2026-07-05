@@ -21,6 +21,22 @@ struct Match {
 	sub_ids: Vec<usize>,
 }
 
+/// Deterministic member index for a shared-group delivery.
+///
+/// Hashes the message content (topic + payload) so every shard — each seeing the
+/// identical forwarded publish and the identical sorted member list — selects
+/// the same member without any coordination. `DefaultHasher::new()` is
+/// fixed-keyed, so the result is consistent across shards (and across processes
+/// of the same build, for future clustering). Fairness is statistical rather
+/// than round-robin, which distributed load-balancing tolerates by design.
+fn shared_pick_index(topic: &str, payload: &[u8], members: usize) -> usize {
+	use std::hash::{DefaultHasher, Hasher};
+	let mut hasher = DefaultHasher::new();
+	hasher.write(topic.as_bytes());
+	hasher.write(payload);
+	(hasher.finish() % members as u64) as usize
+}
+
 impl ShardState {
 	/// Routes one publish on this shard: updates the retain table if the retain
 	/// flag is set, then fans it out to local subscribers. Shared by the local
@@ -114,14 +130,10 @@ impl ShardState {
 		for sub in matches {
 			let bucket = match &sub.share_group {
 				None => &mut best,
-				Some(group) => {
-					// No Local: the publisher is never a load-balance candidate for
-					// its own shared subscription, so it is dropped from the group here.
-					if sub.nolocal && publisher == Some(sub.client_id.as_str()) {
-						continue;
-					}
-					groups.entry(group.clone()).or_default()
-				}
+				// No Local never applies here: it is a protocol error on a shared
+				// subscription (MQTT 5 §3.8.3.1), rejected at SUBSCRIBE — which also
+				// keeps every shard's view of the group's candidates identical.
+				Some(group) => groups.entry(group.clone()).or_default(),
 			};
 			let entry = bucket.entry(sub.client_id.clone()).or_insert(Match {
 				qos: sub.qos,
@@ -154,8 +166,16 @@ impl ShardState {
 			self.deliver_to(&client_id, &publish, qos, retain, m.sub_ids);
 		}
 
-		// Shared groups: one member each, round-robin (preferring connected members
-		// so a message isn't parked in an offline queue while a peer is live).
+		// Shared groups: exactly one member per group receives each message.
+		//
+		// When the group also has members on *other* shards (known via the
+		// replicated membership view), the pick must be globally consistent:
+		// every shard sees this same publish (mesh broadcast) and the same
+		// sorted member list, and applies the same content hash to it — so all
+		// shards agree on the one recipient, and only the shard owning that
+		// member delivers. No coordination round-trip is needed. When the group
+		// is purely local, the original round-robin is kept (better fairness,
+		// and suspended members may still queue QoS > 0 messages).
 		for (group, members) in groups {
 			let mut ids: Vec<String> = members.keys().cloned().collect();
 			if ids.is_empty() {
@@ -167,20 +187,44 @@ impl ShardState {
 				.filter(|id| self.sessions.get(*id).is_some_and(|s| s.mailbox.is_some()))
 				.cloned()
 				.collect();
-			let pool = if online.is_empty() {
-				ids
-			} else {
-				online
+
+			let picked = match self.shared_remote.get(&group).filter(|r| !r.is_empty()) {
+				Some(remote) => {
+					// Global pick over the merged, sorted view of connected members
+					// everywhere. Deterministic: same list + same hash on every shard.
+					let mut all: Vec<&str> = online
+						.iter()
+						.map(String::as_str)
+						.chain(remote.iter().map(String::as_str))
+						.collect();
+					all.sort_unstable();
+					all.dedup();
+					let choice = all[shared_pick_index(&publish.topic, &publish.payload, all.len())];
+					// Deliver only if the chosen member is ours; otherwise the shard
+					// that owns it makes the same choice and delivers there.
+					online.iter().find(|id| id.as_str() == choice).cloned()
+				}
+				None => {
+					// Purely local group: round-robin, preferring connected members
+					// (a suspended member still queues QoS > 0 when it is all we have).
+					let pool = if online.is_empty() {
+						ids
+					} else {
+						online
+					};
+					let cursor = self.shared_cursor.entry(group).or_insert(0);
+					let picked = pool[*cursor % pool.len()].clone();
+					*cursor = cursor.wrapping_add(1);
+					Some(picked)
+				}
 			};
 
-			let cursor = self.shared_cursor.entry(group).or_insert(0);
-			let client_id = pool[*cursor % pool.len()].clone();
-			*cursor = cursor.wrapping_add(1);
-
-			let m = &members[&client_id];
-			let qos = min_qos(publish.qos, m.qos);
-			let retain = was_retained && m.retain_as_published;
-			self.deliver_to(&client_id, &publish, qos, retain, m.sub_ids.clone());
+			if let Some(client_id) = picked {
+				let m = &members[&client_id];
+				let qos = min_qos(publish.qos, m.qos);
+				let retain = was_retained && m.retain_as_published;
+				self.deliver_to(&client_id, &publish, qos, retain, m.sub_ids.clone());
+			}
 		}
 	}
 
@@ -188,6 +232,8 @@ impl ShardState {
 	/// mailbox if connected, otherwise buffered in its offline queue (QoS > 0 only;
 	/// QoS 0 is dropped for a suspended session). `sub_ids` are the Subscription
 	/// Identifiers to echo on the delivered PUBLISH.
+	///
+	/// (See `route` for how shared-group deliveries pick their one recipient.)
 	fn deliver_to(&mut self, client_id: &str, publish: &Rc<Publish>, qos: QoS, retain: bool, sub_ids: Vec<usize>) {
 		let Some(session) = self.sessions.get_mut(client_id) else {
 			return;

@@ -284,6 +284,12 @@ pub struct AuthConfig {
 	pub allow_anonymous: bool,
 	/// Known users. A client that presents a username must match one of these.
 	pub users: Vec<UserConfig>,
+	/// Topic-filter allow-list for *anonymous* publishes. Omitted (the default)
+	/// leaves anonymous clients unrestricted; an empty list denies all publishes.
+	pub anonymous_publish: Option<Vec<String>>,
+	/// Topic-filter allow-list for *anonymous* subscriptions. Omitted (the
+	/// default) leaves anonymous clients unrestricted; an empty list denies all.
+	pub anonymous_subscribe: Option<Vec<String>>,
 }
 
 /// `[sys]` — `$SYS/broker/...` metrics topics. One shard periodically publishes
@@ -347,7 +353,12 @@ impl Default for SysConfig {
 
 impl Default for AuthConfig {
 	fn default() -> Self {
-		Self { allow_anonymous: true, users: Vec::new() }
+		Self {
+			allow_anonymous: true,
+			users: Vec::new(),
+			anonymous_publish: None,
+			anonymous_subscribe: None,
+		}
 	}
 }
 
@@ -543,13 +554,28 @@ impl Config {
 					user.username
 				)));
 			}
-			if let Some(hash) = &user.password_hash
-				&& (hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()))
-			{
-				return Err(ConfigError::Validation(format!(
-					"auth user '{}' password_hash must be a 64-char hex SHA-256",
-					user.username
-				)));
+			// A `password_hash` is either an Argon2 PHC string (recommended: salted,
+			// memory-hard) or a legacy 64-char hex SHA-256.
+			if let Some(hash) = &user.password_hash {
+				if hash.starts_with("$argon2") {
+					// PHC parsing alone is lax (a bare salt parses); a usable
+					// credential needs both its salt and its hash output present.
+					let usable = argon2::password_hash::PasswordHash::new(hash)
+						.map(|h| h.salt.is_some() && h.hash.is_some())
+						.unwrap_or(false);
+					if !usable {
+						return Err(ConfigError::Validation(format!(
+							"auth user '{}' password_hash is not a valid Argon2 PHC string",
+							user.username
+						)));
+					}
+				} else if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+					return Err(ConfigError::Validation(format!(
+						"auth user '{}' password_hash must be a 64-char hex SHA-256 or an \
+						 Argon2 PHC string (`$argon2id$...`)",
+						user.username
+					)));
+				}
 			}
 		}
 		Ok(())
@@ -659,6 +685,22 @@ mod tests {
 		u.password_hash = Some("not-hex".to_string());
 		c.auth.users = vec![u];
 		assert!(c.validate().is_err());
+	}
+
+	#[test]
+	fn password_hash_accepts_argon2_phc_and_rejects_malformed() {
+		let mut c = Config::default();
+		let mut u = user("dave");
+		u.password = None;
+		// A structurally valid Argon2id PHC string (salt/hash are base64).
+		u.password_hash =
+			Some("$argon2id$v=19$m=1024,t=1,p=1$dGVzdHNhbHQwMDE$3XOJivDKrqO2ryjLZ7RTLcLcvfKUmZlCzS36XX2ysVE".into());
+		c.auth.users = vec![u.clone()];
+		assert!(c.validate().is_ok(), "valid PHC accepted");
+
+		u.password_hash = Some("$argon2id$garbage".into());
+		c.auth.users = vec![u];
+		assert!(c.validate().is_err(), "malformed PHC rejected");
 	}
 
 	#[test]

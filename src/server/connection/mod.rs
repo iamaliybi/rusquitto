@@ -187,6 +187,16 @@ pub struct Connection<S: ByteStream> {
 	/// (by sending a PUBLISH with both a topic and an alias) to its topic, so later
 	/// PUBLISHes may carry the alias with an empty topic.
 	inbound_aliases: HashMap<u16, String>,
+	/// The client's Topic Alias Maximum (CONNECT): how many aliases we may assign
+	/// on the publishes we send it. `0` (the default when absent) disables
+	/// outbound aliasing entirely.
+	peer_topic_alias_max: u16,
+	/// Outbound topic-alias table: topics we have registered an alias for on this
+	/// connection. Once a topic is here, its publishes carry the alias with an
+	/// empty topic name, shrinking every repeat on the wire. Lazy — allocates
+	/// nothing for clients that never receive a publish. Bounded by
+	/// `min(peer_topic_alias_max, OUTBOUND_TOPIC_ALIAS_MAX)`.
+	outbound_aliases: HashMap<String, u16>,
 	/// Set once a valid CONNECT has been accepted. Every other packet type is a
 	/// protocol violation before this, and a second CONNECT is a violation after.
 	connected: bool,
@@ -208,6 +218,11 @@ impl<S: ByteStream> Connection<S> {
 	/// Largest inbound topic alias the broker accepts, advertised to clients as the
 	/// CONNACK Topic Alias Maximum.
 	const INBOUND_TOPIC_ALIAS_MAX: u16 = 16;
+
+	/// Ceiling on the outbound aliases we assign per connection, regardless of how
+	/// large a Topic Alias Maximum the client advertises — each assigned alias
+	/// stores its topic string, so this bounds that per-connection memory.
+	const OUTBOUND_TOPIC_ALIAS_MAX: u16 = 32;
 
 	pub fn new(
 		stream: S,
@@ -248,6 +263,8 @@ impl<S: ByteStream> Connection<S> {
 			shutdown,
 			will_delay: 0,
 			inbound_aliases: HashMap::new(),
+			peer_topic_alias_max: 0,
+			outbound_aliases: HashMap::new(),
 			connected: false,
 			// Bound the pre-CONNECT handshake so an idle socket can't hold a slot.
 			deadline: (limits.connect_timeout > 0)

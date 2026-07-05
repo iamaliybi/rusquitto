@@ -47,10 +47,13 @@ See [progress.md](progress.md) for the detailed implementation log, decisions, a
 | Graceful shutdown (SIGTERM/SIGINT)           | ✅ drains conns (DISCONNECT), flushes logs |
 | `$SYS` metrics topics                        | ✅ `src/metrics.rs`, `[sys]` config |
 | Subscription options (No Local, RAP, RH)     | ✅ enforced in trie + routing       |
-| Cross-shard QoS > 0 guarantees               | ⚠️ best-effort (drop-on-full mesh) |
-| Cross-shard session resume                   | ⚠️ shard-local only (see below)    |
-| Will Delay Interval                          | ⚠️ treated as 0 (immediate)        |
-| Hashed passwords                             | ❌ planned (plaintext for now)      |
+| Cross-shard QoS > 0 guarantees               | ✅ awaiting mesh send (backpressure) |
+| Cross-shard session resume                   | ✅ Claim/Handoff migration          |
+| Will Delay Interval                          | ✅ armed on session, sweep publishes |
+| Hashed passwords                             | ✅ Argon2id PHC + legacy SHA-256    |
+| Anonymous-client ACL                         | ✅ `[auth]` anonymous allow-lists   |
+| Outbound topic aliases                       | ✅ per-conn map, client's alias max |
+| Shared subscriptions (cross-shard)           | ✅ globally-coordinated single delivery (mesh membership + deterministic pick) |
 
 ---
 

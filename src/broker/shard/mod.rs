@@ -16,7 +16,7 @@ mod routing;
 mod tests;
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -95,6 +95,12 @@ pub struct ShardState {
 	/// matched filter), advanced each time a message is load-balanced to a member so
 	/// deliveries rotate across the group.
 	shared_cursor: HashMap<String, usize>,
+	/// Replicated view of *remote* shards' connected shared-group members, keyed by
+	/// group name, maintained by [`SharedEvent`](crate::broker::mesh::SharedEvent)
+	/// broadcasts. Sorted (`BTreeSet`) so every shard indexes an identical member
+	/// order when it computes the global delivery pick. Local members are not in
+	/// here — they come from the trie at match time.
+	shared_remote: HashMap<String, BTreeSet<String>>,
 	/// Cap on distinct retained topics stored on this shard (`0` = unlimited). Bounds
 	/// the memory a flood of retained publishes to unique topics can consume.
 	retained_limit: usize,
@@ -139,12 +145,18 @@ impl ShardState {
 			// Reconnecting cancels any armed (delayed) Will Message.
 			existing.pending_will = None;
 			// Hand the durable state back to the resuming connection.
-			return SessionHandle {
+			let handle = SessionHandle {
 				resumed: true,
 				generation,
 				snapshot: std::mem::take(&mut existing.snapshot),
 				offline_queue: std::mem::take(&mut existing.offline_queue),
 			};
+			// The resumed client's shared subscriptions (kept armed in the trie
+			// across the suspension) are connected group members again.
+			for group in self.shared_groups_of(client_id) {
+				self.broadcast_shared(&group, client_id, true);
+			}
+			return handle;
 		}
 
 		self.sessions.insert(
@@ -169,15 +181,50 @@ impl ShardState {
 	/// Subscribes a client to a topic filter with a granted QoS and its options.
 	/// The filter may contain the `+` and `#` wildcards. Re-subscribing replaces
 	/// the prior entry. Returns `true` if the subscription is new (for Retain
-	/// Handling).
+	/// Handling). Callers are live connections, so a new shared subscription is a
+	/// membership Join announced to every peer shard.
 	pub fn subscribe(&mut self, filter: &str, client_id: &str, opts: SubOptions) -> bool {
-		self.trie.insert(filter, client_id, opts)
+		let group = opts.share_group.map(str::to_string);
+		let is_new = self.trie.insert(filter, client_id, opts);
+		if is_new && let Some(group) = group {
+			self.broadcast_shared(&group, client_id, true);
+		}
+		is_new
 	}
 
 	/// Removes a single subscription (used by UNSUBSCRIBE). `share_group` selects
 	/// the ordinary (`None`) or shared entry. Returns whether one was removed.
 	pub fn unsubscribe(&mut self, filter: &str, client_id: &str, share_group: Option<&str>) -> bool {
-		self.trie.remove(filter, client_id, share_group)
+		let removed = self.trie.remove(filter, client_id, share_group);
+		if removed && let Some(group) = share_group {
+			// The client may still hold the same group via another filter; only
+			// announce a Leave once its last subscription in the group is gone.
+			if !self.holds_shared_group(client_id, group) {
+				self.broadcast_shared(group, client_id, false);
+			}
+		}
+		removed
+	}
+
+	/// Whether `client_id` still holds any subscription in shared group `group`.
+	fn holds_shared_group(&self, client_id: &str, group: &str) -> bool {
+		self.trie
+			.client_subscriptions(client_id)
+			.iter()
+			.any(|s| s.share_group.as_deref() == Some(group))
+	}
+
+	/// The distinct shared groups `client_id` currently subscribes to.
+	fn shared_groups_of(&self, client_id: &str) -> Vec<String> {
+		let mut groups: Vec<String> = self
+			.trie
+			.client_subscriptions(client_id)
+			.into_iter()
+			.filter_map(|s| s.share_group)
+			.collect();
+		groups.sort_unstable();
+		groups.dedup();
+		groups
 	}
 
 	/// Ends a connection's hold on its session when the socket closes (clean
@@ -207,6 +254,10 @@ impl ShardState {
 		snapshot: SessionSnapshot,
 		mut pending: VecDeque<Delivery>,
 	) -> bool {
+		// Gathered before the session borrow (and before a destroy clears the
+		// trie); only announced below once we know this connection owned it.
+		let shared_groups = self.shared_groups_of(client_id);
+
 		let Some(session) = self.sessions.get_mut(client_id) else {
 			return false;
 		};
@@ -226,6 +277,11 @@ impl ShardState {
 			session.offline_queue = pending;
 			session.expires_at = (expiry_secs != SESSION_NEVER_EXPIRES)
 				.then(|| Instant::now() + Duration::from_secs(u64::from(expiry_secs)));
+		}
+		// Destroyed or suspended, either way the client is no longer a *connected*
+		// member of its shared groups — tell the peers.
+		for group in &shared_groups {
+			self.broadcast_shared(group, client_id, false);
 		}
 		true
 	}
@@ -306,7 +362,11 @@ impl ShardState {
 					&ps.client_id,
 					SubOptions {
 						qos: sub.qos,
-						nolocal: sub.nolocal,
+						// No Local on a shared subscription is a protocol error
+						// (rejected at SUBSCRIBE); strip it from snapshots that
+						// predate the rule so the global delivery pick stays
+						// consistent across shards.
+						nolocal: sub.nolocal && sub.share_group.is_none(),
 						retain_as_published: sub.retain_as_published,
 						share_group: sub.share_group.as_deref(),
 						sub_id: sub.sub_id,

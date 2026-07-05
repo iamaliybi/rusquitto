@@ -251,3 +251,154 @@ fn subscribe_emits_suback_and_counts_subscription() {
 		}
 	});
 }
+
+/// Decodes every complete MQTT packet sitting in `out`, in order.
+fn decode_all(out: &Rc<RefCell<Vec<u8>>>) -> Vec<Packet> {
+	let mut buf = BytesMut::from(&out.borrow()[..]);
+	let mut packets = Vec::new();
+	while !buf.is_empty() {
+		packets.push(mqtt_v5::read(&mut buf, 1 << 20).expect("decode packet"));
+	}
+	packets
+}
+
+/// A CONNECT advertising a Topic Alias Maximum, so the broker may assign
+/// outbound aliases on the publishes it sends this client.
+fn connect_with_alias_max(id: &str, alias_max: u16) -> Packet {
+	let mut c = mqtt_v5::Connect::new(id);
+	c.clean_session = true;
+	c.properties = Some(mqtt_v5::ConnectProperties {
+		session_expiry_interval: None,
+		receive_maximum: None,
+		max_packet_size: None,
+		topic_alias_max: Some(alias_max),
+		request_response_info: None,
+		request_problem_info: None,
+		user_properties: Vec::new(),
+		authentication_method: None,
+		authentication_data: None,
+	});
+	Packet::Connect(c)
+}
+
+/// A QoS 0 delivery for `topic`, as the routing layer would hand it over.
+fn qos0_delivery(topic: &str) -> Delivery {
+	Delivery {
+		publish: Rc::new(Publish::new(topic, QoS::AtMostOnce, b"x".to_vec())),
+		qos: QoS::AtMostOnce,
+		retain: false,
+		sub_ids: Vec::new(),
+	}
+}
+
+#[test]
+fn outbound_topic_alias_registers_then_substitutes() {
+	block_on(async {
+		let out = Rc::new(RefCell::new(Vec::new()));
+		let mut conn = make_conn(out.clone());
+		drive(&mut conn, connect_with_alias_max("c1", 4))
+			.await
+			.unwrap();
+		out.borrow_mut().clear();
+
+		// Same topic twice, then a second topic.
+		conn.deliver(qos0_delivery("sensors/temp")).unwrap();
+		conn.deliver(qos0_delivery("sensors/temp")).unwrap();
+		conn.deliver(qos0_delivery("sensors/hum")).unwrap();
+		conn.flush().await.unwrap();
+
+		let packets = decode_all(&out);
+		assert_eq!(packets.len(), 3);
+		let publish = |p: &Packet| match p {
+			Packet::Publish(p) => p.clone(),
+			other => panic!("expected PUBLISH, got {other:?}"),
+		};
+
+		// First use registers alias 1 alongside the full topic.
+		let p1 = publish(&packets[0]);
+		assert_eq!(p1.topic, "sensors/temp");
+		assert_eq!(p1.properties.unwrap().topic_alias, Some(1));
+		// Repeat carries only the alias — the topic name is gone from the wire.
+		let p2 = publish(&packets[1]);
+		assert_eq!(p2.topic, "");
+		assert_eq!(p2.properties.unwrap().topic_alias, Some(1));
+		// A different topic gets the next alias.
+		let p3 = publish(&packets[2]);
+		assert_eq!(p3.topic, "sensors/hum");
+		assert_eq!(p3.properties.unwrap().topic_alias, Some(2));
+	});
+}
+
+#[test]
+fn outbound_alias_table_full_falls_back_to_full_topic() {
+	block_on(async {
+		let out = Rc::new(RefCell::new(Vec::new()));
+		let mut conn = make_conn(out.clone());
+		drive(&mut conn, connect_with_alias_max("c1", 1))
+			.await
+			.unwrap();
+		out.borrow_mut().clear();
+
+		conn.deliver(qos0_delivery("a")).unwrap(); // takes the only alias
+		conn.deliver(qos0_delivery("b")).unwrap(); // table full: unaliased
+		conn.flush().await.unwrap();
+
+		let packets = decode_all(&out);
+		let p2 = match &packets[1] {
+			Packet::Publish(p) => p.clone(),
+			other => panic!("expected PUBLISH, got {other:?}"),
+		};
+		assert_eq!(p2.topic, "b");
+		assert_eq!(p2.properties.and_then(|p| p.topic_alias), None);
+	});
+}
+
+#[test]
+fn no_outbound_alias_when_client_does_not_offer() {
+	block_on(async {
+		let out = Rc::new(RefCell::new(Vec::new()));
+		let mut conn = make_conn(out.clone());
+		drive(&mut conn, connect_packet("c1")).await.unwrap(); // no alias max
+		out.borrow_mut().clear();
+
+		conn.deliver(qos0_delivery("t")).unwrap();
+		conn.deliver(qos0_delivery("t")).unwrap();
+		conn.flush().await.unwrap();
+
+		for p in decode_all(&out) {
+			let p = match p {
+				Packet::Publish(p) => p,
+				other => panic!("expected PUBLISH, got {other:?}"),
+			};
+			assert_eq!(p.topic, "t", "full topic on every send");
+			assert_eq!(p.properties.and_then(|p| p.topic_alias), None);
+		}
+	});
+}
+
+#[test]
+fn no_local_on_shared_subscription_is_rejected() {
+	block_on(async {
+		let out = Rc::new(RefCell::new(Vec::new()));
+		let mut conn = make_conn(out.clone());
+		drive(&mut conn, connect_packet("c1")).await.unwrap();
+		out.borrow_mut().clear();
+
+		// No Local on a Shared Subscription is a Protocol Error (MQTT 5 §3.8.3.1).
+		let mut sub = Subscribe::new("$share/g/data/#", QoS::AtLeastOnce);
+		sub.filters[0].nolocal = true;
+		sub.pkid = 3;
+		drive(&mut conn, Packet::Subscribe(sub)).await.unwrap();
+
+		assert_eq!(conn.subscription_count, 0, "filter must not be armed");
+		match decode(&out) {
+			Packet::SubAck(ack) => {
+				assert_eq!(
+					ack.return_codes,
+					vec![mqtt_v5::SubscribeReasonCode::TopicFilterInvalid]
+				);
+			}
+			other => panic!("expected SUBACK, got {other:?}"),
+		}
+	});
+}

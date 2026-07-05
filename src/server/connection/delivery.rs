@@ -14,6 +14,20 @@ use crate::broker::mesh::MeshMsg;
 use crate::broker::session::{Delivery, InflightMessage, InflightState};
 use crate::transport::ByteStream;
 
+/// An all-`None` v5 property set (mqttbytes has no constructor for it).
+fn empty_publish_properties() -> mqtt_v5::PublishProperties {
+	mqtt_v5::PublishProperties {
+		payload_format_indicator: None,
+		message_expiry_interval: None,
+		topic_alias: None,
+		response_topic: None,
+		correlation_data: None,
+		user_properties: Vec::new(),
+		subscription_identifiers: Vec::new(),
+		content_type: None,
+	}
+}
+
 impl<S: ByteStream> Connection<S> {
 	/// The outbound in-flight ceiling: the smaller of the client's Receive Maximum
 	/// and our own configured `max_inflight`, and always at least 1.
@@ -120,22 +134,14 @@ impl<S: ByteStream> Connection<S> {
 		message.retain = retain;
 
 		// Property hygiene for delivery: attach this subscriber's Subscription
-		// Identifiers, and never forward the publisher's Topic Alias (it is scoped to
-		// the publisher's connection; we don't assign outbound aliases). Other v5
-		// properties (message expiry, content type, user properties, …) pass through.
+		// Identifiers, and never forward the publisher's Topic Alias (it is scoped
+		// to the publisher's connection; our own outbound alias is applied below).
+		// Other v5 properties (message expiry, content type, user properties, …)
+		// pass through.
 		if !sub_ids.is_empty() || message.properties.is_some() {
 			let props = message
 				.properties
-				.get_or_insert_with(|| mqtt_v5::PublishProperties {
-					payload_format_indicator: None,
-					message_expiry_interval: None,
-					topic_alias: None,
-					response_topic: None,
-					correlation_data: None,
-					user_properties: Vec::new(),
-					subscription_identifiers: Vec::new(),
-					content_type: None,
-				});
+				.get_or_insert_with(empty_publish_properties);
 			props.topic_alias = None;
 			props.subscription_identifiers = sub_ids.to_vec();
 		}
@@ -159,6 +165,31 @@ impl<S: ByteStream> Connection<S> {
 			}
 		};
 
+		// Outbound topic alias (MQTT 5): when the client accepts aliases, a repeat
+		// of a registered topic goes out as just the alias (empty topic name); the
+		// first use of a topic registers an alias alongside the full name. Applied
+		// *after* the in-flight copy was stored above, so a retransmit on a later
+		// connection (whose alias table starts empty) still carries the full topic.
+		let mut newly_aliased: Option<String> = None;
+		if self.peer_topic_alias_max > 0 {
+			if let Some(&alias) = self.outbound_aliases.get(&message.topic) {
+				message
+					.properties
+					.get_or_insert_with(empty_publish_properties)
+					.topic_alias = Some(alias);
+				message.topic.clear();
+			} else if (self.outbound_aliases.len() as u16) < self.peer_topic_alias_max {
+				let alias = self.outbound_aliases.len() as u16 + 1;
+				self.outbound_aliases.insert(message.topic.clone(), alias);
+				message
+					.properties
+					.get_or_insert_with(empty_publish_properties)
+					.topic_alias = Some(alias);
+				newly_aliased = Some(message.topic.clone());
+			}
+			// Alias table full: send the full topic, unaliased.
+		}
+
 		// Encode straight into the coalesced output buffer; on failure, roll the
 		// partial bytes back so the batch stays well-formed.
 		let start = self.out.len();
@@ -167,12 +198,16 @@ impl<S: ByteStream> Connection<S> {
 			if let Some(pkid) = pkid {
 				self.inflight.remove(&pkid);
 			}
+			if let Some(topic) = &newly_aliased {
+				self.outbound_aliases.remove(topic);
+			}
 			return Err(Error::new(ErrorKind::InvalidData, e.to_string()));
 		}
 
 		// The client's Maximum Packet Size is a hard ceiling: we must not send a
-		// larger packet. Drop it (rolling back the encoded bytes and the in-flight
-		// slot so it doesn't wedge the window) — it can never be delivered.
+		// larger packet. Drop it (rolling back the encoded bytes, the in-flight
+		// slot, and a just-registered alias the client will now never see) — it
+		// can never be delivered.
 		let written = self.out.len() - start;
 		if let Some(max) = self.peer_max_packet_size
 			&& written as u64 > u64::from(max)
@@ -184,6 +219,9 @@ impl<S: ByteStream> Connection<S> {
 			self.out.truncate(start);
 			if let Some(pkid) = pkid {
 				self.inflight.remove(&pkid);
+			}
+			if let Some(topic) = &newly_aliased {
+				self.outbound_aliases.remove(topic);
 			}
 			return Ok(());
 		}

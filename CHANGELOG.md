@@ -5,6 +5,47 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): from 1.0 on, the major
 version bumps for breaking changes, the minor for features, and the patch for fixes.
 
+## [1.5.0] - 2026-07-05
+
+The backlog-clearing release: every remaining item on the Phase-3 hardening
+roadmap (`.agents/next-steps.md`) is done.
+
+### Added
+
+- **Globally-coordinated shared subscriptions** — a `$share/{group}/{filter}`
+  message now reaches **exactly one member cluster-wide**, even when the group's
+  members are spread across shards (previously one member *per shard*).
+  Membership of connected members is replicated to every shard over the channel
+  mesh (`Join`/`Leave` broadcasts on subscribe, unsubscribe, disconnect/suspend,
+  resume, and migration); each shard applies the same deterministic content-hash
+  pick to the same sorted member view, so all shards agree on the recipient with
+  no coordination round-trip. Purely shard-local groups keep round-robin
+  fairness, and suspended members may still queue QoS > 0 there. Membership
+  broadcasts are best-effort under mesh overload (documented). Also enforces
+  MQTT 5 §3.8.3.1: **No Local on a shared subscription is rejected** (it would
+  desynchronize the cluster-wide pick; pre-existing persisted/migrated state is
+  normalized). Verified end-to-end on a 2-shard broker: 6 members straddling
+  both shards, 40 published messages, exactly 40 deliveries with every member
+  receiving a share.
+- **Outbound topic aliases** (MQTT 5) — the broker now assigns aliases on the
+  publishes it *sends*, honouring the client's CONNECT Topic Alias Maximum
+  (capped at 32 per connection to bound memory): the first publish of a topic
+  registers an alias, and every repeat carries just the two-byte alias with an
+  empty topic name. In-flight copies keep the full topic so a retransmit on a
+  fresh connection (empty alias table) stays valid, and an alias registered by
+  a packet that is then dropped (client Maximum Packet Size) is rolled back.
+- **Argon2id password hashing** — `[[auth.users]]` `password_hash` now accepts
+  an Argon2 PHC string (`$argon2id$...`; salted, memory-hard — the recommended
+  form) alongside the legacy hex SHA-256. Parameters ride in the PHC string, so
+  per-user settings work. Unknown-username checks burn the same Argon2 cost as
+  a real verify when any user is Argon2-hashed, keeping the user-enumeration
+  timing oracle closed. Note a verify deliberately costs ~10–50 ms on the
+  accepting core per CONNECT attempt.
+- **Anonymous-client ACL** — new `[auth]` `anonymous_publish` /
+  `anonymous_subscribe` topic-filter allow-lists restrict what anonymous
+  clients may do (omitted = unrestricted, as before; empty list = deny all),
+  closing the "anonymous bypasses ACL" gap.
+
 ## [1.4.0] - 2026-07-05
 
 ### Changed
@@ -308,6 +349,8 @@ All changes are additive; there are no breaking changes to existing behavior.
   SUBSCRIBE/UNSUBSCRIBE, PINGREQ/PINGRESP, DISCONNECT; topic-trie wildcard
   matching (`+` / `#`); retained messages; cross-shard routing over a glommio
   channel mesh; structured `tracing` logging; and TOML configuration with a CLI.
+
+[1.5.0]: https://github.com/iamaliybi/rusquitto/releases/tag/v1.5.0
 
 [1.4.0]: https://github.com/iamaliybi/rusquitto/releases/tag/v1.4.0
 

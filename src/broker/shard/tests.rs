@@ -360,3 +360,101 @@ fn persist_then_load_restores_a_full_suspended_session() {
 		"restored subscription still matches"
 	);
 }
+
+#[test]
+fn shared_events_maintain_the_remote_view() {
+	use crate::broker::mesh::SharedEvent;
+	let mut s = ShardState::default();
+	s.apply_shared_event(SharedEvent::Join { group: "g".into(), client_id: "r1".into() });
+	s.apply_shared_event(SharedEvent::Join { group: "g".into(), client_id: "r2".into() });
+	assert_eq!(s.shared_remote["g"].len(), 2);
+
+	// Idempotent join, then leaves; the empty set is dropped entirely.
+	s.apply_shared_event(SharedEvent::Join { group: "g".into(), client_id: "r1".into() });
+	assert_eq!(s.shared_remote["g"].len(), 2);
+	s.apply_shared_event(SharedEvent::Leave { group: "g".into(), client_id: "r1".into() });
+	s.apply_shared_event(SharedEvent::Leave { group: "g".into(), client_id: "r2".into() });
+	assert!(!s.shared_remote.contains_key("g"));
+}
+
+#[test]
+fn shared_global_pick_skips_local_suspended_when_remote_members_exist() {
+	use crate::broker::mesh::SharedEvent;
+	let mut s = ShardState::default();
+	// A suspended local member of group g...
+	arm(&mut s, "local");
+	s.subscribe(
+		"t",
+		"local",
+		opts(QoS::AtLeastOnce, false, false, Some("g"), None),
+	);
+	// ...and a connected member on another shard.
+	s.apply_shared_event(SharedEvent::Join { group: "g".into(), client_id: "remote".into() });
+
+	s.deliver_local(pubm("t", QoS::AtLeastOnce, b"x", false), None);
+
+	// Globally, only connected members are candidates: the remote shard owns the
+	// pick, so nothing is queued locally (the old per-shard behavior would have
+	// parked the message in the suspended member's offline queue).
+	assert_eq!(offline(&s, "local").len(), 0);
+}
+
+/// Two shards' worth of state, cross-replicated views, one message stream:
+/// every message must be delivered to exactly one member cluster-wide.
+#[test]
+fn shared_global_pick_delivers_exactly_once_across_shards() {
+	use crate::broker::mesh::SharedEvent;
+
+	// Shard A owns alice; shard B owns bob. Each sees the other via its
+	// replicated remote view — exactly what the mesh Join broadcasts build.
+	let mut shard_a = ShardState::default();
+	let (tx_a, _rx_a) = local_channel::new_unbounded::<Delivery>();
+	shard_a.open_session("alice", tx_a, false);
+	shard_a.subscribe(
+		"t",
+		"alice",
+		opts(QoS::AtLeastOnce, false, false, Some("g"), None),
+	);
+	shard_a.apply_shared_event(SharedEvent::Join { group: "g".into(), client_id: "bob".into() });
+
+	let mut shard_b = ShardState::default();
+	let (tx_b, _rx_b) = local_channel::new_unbounded::<Delivery>();
+	shard_b.open_session("bob", tx_b, false);
+	shard_b.subscribe(
+		"t",
+		"bob",
+		opts(QoS::AtLeastOnce, false, false, Some("g"), None),
+	);
+	shard_b.apply_shared_event(SharedEvent::Join { group: "g".into(), client_id: "alice".into() });
+
+	let queued = |s: &ShardState, id: &str| {
+		s.sessions[id]
+			.mailbox
+			.as_ref()
+			.expect("member is connected")
+			.len()
+	};
+
+	let mut alice_total = 0;
+	let mut bob_total = 0;
+	for i in 0..24 {
+		let payload = format!("message-{i}");
+		// The same publish reaches both shards (origin fan-out + mesh broadcast).
+		shard_a.deliver_local(pubm("t", QoS::AtLeastOnce, payload.as_bytes(), false), None);
+		shard_b.deliver_local(pubm("t", QoS::AtLeastOnce, payload.as_bytes(), false), None);
+
+		// Exactly one shard delivered this message.
+		let total = queued(&shard_a, "alice") + queued(&shard_b, "bob");
+		assert_eq!(
+			total,
+			alice_total + bob_total + 1,
+			"message {i} must be delivered exactly once cluster-wide"
+		);
+		alice_total = queued(&shard_a, "alice");
+		bob_total = queued(&shard_b, "bob");
+	}
+	// The content hash spreads work across both members (statistically certain
+	// over 24 distinct payloads).
+	assert!(alice_total > 0, "alice received a share of the messages");
+	assert!(bob_total > 0, "bob received a share of the messages");
+}

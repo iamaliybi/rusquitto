@@ -74,12 +74,21 @@ snapshot_interval = 300    # seconds between snapshots (0 = only on graceful shu
 # Default (anonymous allowed, no users) makes auth a no-op.
 allow_anonymous = true              # allow clients that send no username
 
-# One table per user. Set exactly one of `password` / `password_hash`
-# (hex SHA-256:  printf %s 'pw' | sha256sum). Optional `publish` / `subscribe`
-# topic-filter allow-lists (+/# wildcards); omit a list = unrestricted.
+# Topic-filter allow-lists for ANONYMOUS clients (+/# wildcards). Omit for
+# unrestricted (the default); an empty list denies everything.
+# anonymous_publish = ["public/#"]
+# anonymous_subscribe = ["public/#", "status"]
+
+# One table per user. Set exactly one of `password` / `password_hash`.
+# `password_hash` is either an Argon2 PHC string (RECOMMENDED — salted,
+# memory-hard:  echo -n 'pw' | argon2 "$(openssl rand -base64 16)" -id -e)
+# or a legacy hex SHA-256 (printf %s 'pw' | sha256sum). Note an Argon2 verify
+# deliberately costs ~10-50 ms of CPU on the accepting core per CONNECT.
+# Optional `publish` / `subscribe` topic-filter allow-lists (+/# wildcards);
+# omit a list = unrestricted.
 # [[auth.users]]
 # username = "alice"
-# password = "s3cret"
+# password_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
 # publish = ["sensors/#"]
 # subscribe = ["sensors/#", "cmd/alice"]
 

@@ -443,3 +443,44 @@ warnings, mosquitto v5 QoS2 + retained round-trip on the new event loop.
 GOTCHA: tests drive process_packet directly and now must flush — see
 tests::drive(). GOTCHA: glommio LocalReceiver has no try_recv; non-blocking
 drain uses futures_lite::future::poll_once(recv()).
+
+---
+
+## Phase 6 — Backlog clear (2026-07-05, v1.5.0)
+
+All four remaining next-steps items, low->high priority:
+
+1. Anonymous-client ACL: [auth] anonymous_publish / anonymous_subscribe
+   allow-lists (None = unrestricted, [] = deny all); Authenticator gained
+   anonymous_*_acl fields, authorize_* None-arm checks them.
+2. Argon2id passwords: password_hash accepts * PHC strings (argon2
+   crate; params ride in the string). Config validation requires salt+hash
+   present (bare PHC parsing is lax!). Unknown-user timing dummy upgraded:
+   reuses the first Argon2 user PHC as the dummy verify target when any user
+   is Argon2 (else sha256 dummy). NOTE: verify blocks the accepting core
+   10-50ms + ~19MiB transient per attempt (documented in config).
+3. Outbound topic aliases: peer_topic_alias_max from CONNECT (capped
+   OUTBOUND_TOPIC_ALIAS_MAX=32), per-conn outbound_aliases map. Applied in
+   send_publish AFTER track_inflight so inflight copies keep the full topic
+   (retransmit on a new conn has an empty alias table). Alias rolled back if
+   the registering packet is dropped for peer max-packet-size.
+4. Globally-coordinated shared subscriptions: MeshMsg::Shared(SharedEvent
+   Join/Leave) broadcasts replicate CONNECTED members per group to all shards
+   (hooks: subscribe, unsubscribe-last-filter, close_session suspend/destroy,
+   open_session resume, install_migrated). shared_remote:
+   HashMap<group, BTreeSet<client>>. route(): if a group has remote members,
+   merged sorted view + deterministic content hash (shared_pick_index,
+   fixed-key DefaultHasher over topic+payload) picks ONE member cluster-wide;
+   only the owning shard delivers. Purely-local groups keep round-robin +
+   suspended-member queueing (old tests unchanged). NoLocal on a shared sub =
+   Protocol Error (MQTT5 3.8.3.1) -> SubAck TopicFilterInvalid; also stripped
+   from persisted/migrated snapshots (it would desync the global pick, which
+   was why the old per-publisher exclusion had to go).
+
+Verified: 87 unit tests (incl. two-ShardState exactly-once simulation),
+clippy -D warnings; E2E on a REAL 2-shard broker: 6 members split shards
+1+2 (confirmed via logs), 40 publishes -> exactly 40 deliveries, all members
+hit. Old behavior would have delivered ~80.
+
+GOTCHA: PasswordHash::new() accepts "" (parses as salt-only)
+— require .salt.is_some() && .hash.is_some() for a usable credential.

@@ -7,17 +7,23 @@
 
 use std::collections::HashMap;
 
+use argon2::Argon2;
+use argon2::password_hash::{PasswordHash, PasswordHashString, PasswordVerifier};
 use sha2::{Digest, Sha256};
 
 use crate::broker::topics::filter_matches;
 use crate::config::AuthConfig;
 
-/// A configured user's credential: either a plaintext password or a SHA-256 hash
-/// (lowercase hex) of it. Verification hashes the client-supplied password when
-/// the stored form is a hash, so the plaintext is never kept in that case.
+/// A configured user's credential: a plaintext password, a SHA-256 hash
+/// (lowercase hex) of it, or an Argon2 PHC string (`$argon2id$...` — salted and
+/// memory-hard, the recommended form). Verification hashes the client-supplied
+/// password when the stored form is a hash, so the plaintext is never kept.
 enum Credential {
 	Plain(String),
 	Sha256(String),
+	/// A parsed PHC string; the salt and parameters ride along, so each user may
+	/// use different Argon2 settings.
+	Argon2(PasswordHashString),
 }
 
 impl Credential {
@@ -28,6 +34,9 @@ impl Credential {
 		match self {
 			Credential::Plain(expected) => ct_eq(expected.as_bytes(), provided.as_bytes()),
 			Credential::Sha256(hash) => ct_eq(sha256_hex(provided).as_bytes(), hash.as_bytes()),
+			Credential::Argon2(phc) => Argon2::default()
+				.verify_password(provided.as_bytes(), &phc.password_hash())
+				.is_ok(),
 		}
 	}
 }
@@ -92,17 +101,31 @@ pub struct Authenticator {
 	allow_anonymous: bool,
 	/// Known users, indexed by name.
 	users: HashMap<String, UserEntry>,
+	/// Topic-filter allow-list for anonymous publishes; `None` = unrestricted.
+	anonymous_publish_acl: Option<Vec<String>>,
+	/// Topic-filter allow-list for anonymous subscriptions; `None` = unrestricted.
+	anonymous_subscribe_acl: Option<Vec<String>>,
+	/// A throwaway Argon2 PHC hash, verified against for *unknown* usernames when
+	/// any configured user has an Argon2 credential — so the response time for an
+	/// unknown user matches a known one and doesn't leak which usernames exist.
+	/// `None` when no user uses Argon2 (the cheap SHA-256 dummy suffices then).
+	argon2_dummy: Option<PasswordHashString>,
 }
 
 impl Authenticator {
 	/// Builds an authenticator from configuration, indexing users by name.
 	pub fn from_config(config: &AuthConfig) -> Self {
-		let users = config
+		let users: HashMap<String, UserEntry> = config
 			.users
 			.iter()
 			.map(|u| {
-				// Config validation guarantees exactly one credential is set.
+				// Config validation guarantees exactly one credential is set and
+				// that a `password_hash` is well-formed (hex SHA-256 or Argon2 PHC).
 				let credential = match &u.password_hash {
+					Some(hash) if hash.starts_with("$argon2") => {
+						let phc = PasswordHash::new(hash).expect("validated Argon2 PHC string");
+						Credential::Argon2(phc.into())
+					}
 					Some(hash) => Credential::Sha256(hash.to_ascii_lowercase()),
 					None => Credential::Plain(u.password.clone().unwrap_or_default()),
 				};
@@ -116,7 +139,21 @@ impl Authenticator {
 				)
 			})
 			.collect();
-		Self { allow_anonymous: config.allow_anonymous, users }
+		// If any user is Argon2-hashed, unknown-user checks must burn a comparable
+		// amount of work; reuse the first user's PHC string as the dummy target (the
+		// dummy verify runs with a wrong password, so it always fails — only its
+		// *cost* matters, and matching a real entry's parameters matches its cost).
+		let argon2_dummy = users.values().find_map(|entry| match &entry.credential {
+			Credential::Argon2(phc) => Some(phc.clone()),
+			_ => None,
+		});
+		Self {
+			allow_anonymous: config.allow_anonymous,
+			users,
+			anonymous_publish_acl: config.anonymous_publish.clone(),
+			anonymous_subscribe_acl: config.anonymous_subscribe.clone(),
+			argon2_dummy,
+		}
 	}
 
 	/// Whether authentication is effectively a no-op: anonymous access is allowed
@@ -136,10 +173,19 @@ impl Authenticator {
 			Some(name) => match self.users.get(name) {
 				Some(entry) if entry.credential.verify(password.unwrap_or("")) => AuthResult::Granted,
 				Some(_) => AuthResult::BadUserNamePassword,
-				// Unknown user: run a throwaway hash so the response time doesn't
-				// reveal whether the username exists (user-enumeration timing oracle).
+				// Unknown user: burn the same work a known user would cost, so the
+				// response time doesn't reveal which usernames exist. The verify
+				// result is discarded — this arm always rejects.
 				None => {
-					let _ = sha256_hex(password.unwrap_or(""));
+					match &self.argon2_dummy {
+						Some(phc) => {
+							let _ = Argon2::default()
+								.verify_password(password.unwrap_or("").as_bytes(), &phc.password_hash());
+						}
+						None => {
+							let _ = sha256_hex(password.unwrap_or(""));
+						}
+					}
 					AuthResult::BadUserNamePassword
 				}
 			},
@@ -148,21 +194,23 @@ impl Authenticator {
 		}
 	}
 
-	/// Whether `username` may publish to `topic`. Anonymous clients (no username)
-	/// and users without a `publish` allow-list are unrestricted.
+	/// Whether `username` may publish to `topic`. Users without a `publish`
+	/// allow-list are unrestricted; anonymous clients (no username) are checked
+	/// against the `[auth]` `anonymous_publish` allow-list (absent = unrestricted).
 	pub fn authorize_publish(&self, username: Option<&str>, topic: &str) -> bool {
 		match username.and_then(|u| self.users.get(u)) {
 			Some(entry) => acl_allows(&entry.publish_acl, topic),
-			None => true,
+			None => acl_allows(&self.anonymous_publish_acl, topic),
 		}
 	}
 
-	/// Whether `username` may subscribe to `filter`. Anonymous clients and users
-	/// without a `subscribe` allow-list are unrestricted.
+	/// Whether `username` may subscribe to `filter`. Users without a `subscribe`
+	/// allow-list are unrestricted; anonymous clients are checked against the
+	/// `[auth]` `anonymous_subscribe` allow-list (absent = unrestricted).
 	pub fn authorize_subscribe(&self, username: Option<&str>, filter: &str) -> bool {
 		match username.and_then(|u| self.users.get(u)) {
 			Some(entry) => acl_allows(&entry.subscribe_acl, filter),
-			None => true,
+			None => acl_allows(&self.anonymous_subscribe_acl, filter),
 		}
 	}
 }
@@ -185,6 +233,7 @@ mod tests {
 					subscribe: None,
 				})
 				.collect(),
+			..AuthConfig::default()
 		}
 	}
 
@@ -229,6 +278,7 @@ mod tests {
 				publish: to_vec(publish),
 				subscribe: to_vec(subscribe),
 			}],
+			..AuthConfig::default()
 		}
 	}
 
@@ -279,6 +329,7 @@ mod tests {
 				publish: None,
 				subscribe: None,
 			}],
+			..AuthConfig::default()
 		});
 		assert_eq!(
 			auth.check(Some("alice"), Some("s3cret")),
@@ -288,5 +339,71 @@ mod tests {
 			auth.check(Some("alice"), Some("wrong")),
 			AuthResult::BadUserNamePassword
 		);
+	}
+
+	/// An Argon2id PHC string for `password` with small (fast) test parameters.
+	/// Verification reads the parameters from the string itself, so a hash made
+	/// with reduced cost still verifies through the default `Argon2` instance.
+	fn argon2_phc(password: &str) -> String {
+		use argon2::password_hash::{PasswordHasher, SaltString};
+		use argon2::{Algorithm, Params, Version};
+		let salt = SaltString::from_b64("dGVzdHNhbHQwMDE").unwrap();
+		let params = Params::new(1024, 1, 1, None).unwrap(); // 1 MiB, 1 pass
+		Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+			.hash_password(password.as_bytes(), &salt)
+			.unwrap()
+			.to_string()
+	}
+
+	#[test]
+	fn argon2_hashed_password() {
+		let auth = Authenticator::from_config(&AuthConfig {
+			allow_anonymous: false,
+			users: vec![UserConfig {
+				username: "alice".into(),
+				password: None,
+				password_hash: Some(argon2_phc("s3cret")),
+				publish: None,
+				subscribe: None,
+			}],
+			..AuthConfig::default()
+		});
+		assert_eq!(
+			auth.check(Some("alice"), Some("s3cret")),
+			AuthResult::Granted
+		);
+		assert_eq!(
+			auth.check(Some("alice"), Some("wrong")),
+			AuthResult::BadUserNamePassword
+		);
+		// Unknown user goes through the Argon2 dummy path and still rejects.
+		assert_eq!(
+			auth.check(Some("mallory"), Some("s3cret")),
+			AuthResult::BadUserNamePassword
+		);
+	}
+
+	#[test]
+	fn anonymous_acl_enforced_when_configured() {
+		let auth = Authenticator::from_config(&AuthConfig {
+			allow_anonymous: true,
+			users: Vec::new(),
+			anonymous_publish: Some(vec!["public/#".into()]),
+			anonymous_subscribe: Some(vec!["public/#".into(), "status".into()]),
+		});
+		assert!(auth.authorize_publish(None, "public/chat"));
+		assert!(!auth.authorize_publish(None, "private/secrets"));
+		assert!(auth.authorize_subscribe(None, "public/#"));
+		assert!(auth.authorize_subscribe(None, "status"));
+		assert!(!auth.authorize_subscribe(None, "private/#"));
+		// An empty allow-list denies everything.
+		let deny_all = Authenticator::from_config(&AuthConfig {
+			allow_anonymous: true,
+			users: Vec::new(),
+			anonymous_publish: Some(Vec::new()),
+			anonymous_subscribe: Some(Vec::new()),
+		});
+		assert!(!deny_all.authorize_publish(None, "anything"));
+		assert!(!deny_all.authorize_subscribe(None, "anything"));
 	}
 }

@@ -53,6 +53,12 @@ impl<S: ByteStream> Connection<S> {
 			.unwrap_or(u16::MAX)
 			.max(1);
 		self.peer_max_packet_size = props.and_then(|p| p.max_packet_size);
+		// Topic Alias Maximum: how many aliases we may assign on publishes we send
+		// this client (absent/0 = none). Capped by our own per-connection ceiling.
+		self.peer_topic_alias_max = props
+			.and_then(|p| p.topic_alias_max)
+			.unwrap_or(0)
+			.min(Self::OUTBOUND_TOPIC_ALIAS_MAX);
 
 		// An empty client id has the server assign one, which must then be echoed
 		// back in CONNACK so the client can reconnect to the same session. The

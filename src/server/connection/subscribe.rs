@@ -55,6 +55,16 @@ impl<S: ByteStream> Connection<S> {
 				continue;
 			}
 
+			// No Local on a Shared Subscription is a Protocol Error (MQTT 5
+			// §3.8.3.1). Refusing it also keeps the cluster-wide shared-delivery
+			// pick consistent: every shard must see the same candidate set for a
+			// group, which a per-publisher exclusion would break.
+			if share_group.is_some() && filter.nolocal {
+				warn!(filter = %filter.path, "No Local set on a shared subscription, rejecting");
+				return_codes.push(mqtt_v5::SubscribeReasonCode::TopicFilterInvalid);
+				continue;
+			}
+
 			let granted = min_qos(filter.qos, self.limits.max_qos());
 
 			{

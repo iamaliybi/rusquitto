@@ -9,7 +9,7 @@ use glommio::channels::local_channel::LocalSender;
 use mqttbytes::v5::Publish;
 
 use super::ShardState;
-use crate::broker::mesh::{MeshMsg, MigratedSession, MigratedSub, SessionControl};
+use crate::broker::mesh::{MeshMsg, MigratedSession, MigratedSub, SessionControl, SharedEvent};
 use crate::broker::session::{Delivery, SessionSnapshot};
 use crate::broker::topics::SubOptions;
 
@@ -60,6 +60,49 @@ impl ShardState {
 	fn send_control_to(&self, peer: usize, control: SessionControl) {
 		if let Some(senders) = &self.mesh {
 			let _ = senders.try_send_to(peer, MeshMsg::Control(Box::new(control)));
+		}
+	}
+
+	/// Announces a shared-group membership change to every peer shard (best
+	/// effort, drop-on-full — the same semantics as every other mesh control
+	/// message). Peers fold it into their replicated membership view so all
+	/// shards agree on the group's connected members.
+	pub(super) fn broadcast_shared(&self, group: &str, client_id: &str, join: bool) {
+		let Some(senders) = &self.mesh else {
+			return;
+		};
+		let me = senders.peer_id();
+		for idx in 0..senders.nr_consumers() {
+			if idx == me {
+				continue;
+			}
+			let event = if join {
+				SharedEvent::Join { group: group.to_string(), client_id: client_id.to_string() }
+			} else {
+				SharedEvent::Leave { group: group.to_string(), client_id: client_id.to_string() }
+			};
+			let _ = senders.try_send_to(idx, MeshMsg::Shared(event));
+		}
+	}
+
+	/// Folds a peer's membership announcement into the replicated view used for
+	/// the global shared-subscription delivery pick.
+	pub fn apply_shared_event(&mut self, event: SharedEvent) {
+		match event {
+			SharedEvent::Join { group, client_id } => {
+				self.shared_remote
+					.entry(group)
+					.or_default()
+					.insert(client_id);
+			}
+			SharedEvent::Leave { group, client_id } => {
+				if let Some(members) = self.shared_remote.get_mut(&group) {
+					members.remove(&client_id);
+					if members.is_empty() {
+						self.shared_remote.remove(&group);
+					}
+				}
+			}
 		}
 	}
 
@@ -188,12 +231,21 @@ impl ShardState {
 				client_id,
 				SubOptions {
 					qos: sub.qos,
-					nolocal: sub.nolocal,
+					// No Local on a shared subscription is a protocol error (MQTT 5
+					// §3.8.3.1) and is rejected at SUBSCRIBE; strip it defensively
+					// from state that predates that rule, since it would desync the
+					// cluster-wide membership pick.
+					nolocal: sub.nolocal && sub.share_group.is_none(),
 					retain_as_published: sub.retain_as_published,
 					share_group: sub.share_group.as_deref(),
 					sub_id: sub.sub_id,
 				},
 			);
+		}
+		// The arriving client is connected here: its shared subscriptions are
+		// live group memberships again, announced from their new home shard.
+		for group in self.shared_groups_of(client_id) {
+			self.broadcast_shared(&group, client_id, true);
 		}
 
 		let offline = migrated

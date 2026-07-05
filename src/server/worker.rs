@@ -318,6 +318,7 @@ pub async fn init(
 				match msg {
 					MeshMsg::Publish(publish) => state.borrow_mut().deliver_local(publish, None),
 					MeshMsg::Control(control) => state.borrow_mut().on_control(*control),
+					MeshMsg::Shared(event) => state.borrow_mut().apply_shared_event(event),
 				}
 			}
 		})

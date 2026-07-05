@@ -41,14 +41,17 @@ isolated, shard-local executor — no `Mutex`, no `RwLock`, no work-stealing.
   Maximum QoS, Retain Available, Topic Alias Maximum, and wildcard/shared/subscription-identifier availability.
   The client's **Receive Maximum** (a windowed outbound in-flight limit) and **Maximum Packet Size** (oversized
   outbound publishes are dropped) are enforced; the broker also enforces its **own** inbound Receive Maximum
-  (a client exceeding the concurrent-QoS-2 quota is disconnected with `0x93`), and resolves **inbound topic
-  aliases** so clients can shrink repeated topics.
+  (a client exceeding the concurrent-QoS-2 quota is disconnected with `0x93`), and supports **topic aliases in
+  both directions**: inbound aliases from clients are resolved, and the broker *assigns* outbound aliases (up to
+  the client's advertised Topic Alias Maximum) so repeated topics shrink to two bytes on the wire.
 - **Authentication & ACL** — optional username/password at CONNECT via the `[auth]` config (`allow_anonymous`
-  plus a list of users). Passwords may be stored as plaintext `password` or a SHA-256 `password_hash`. Failures
-  are rejected with the proper CONNACK reason code (`0x86` bad credentials, `0x87` anonymous not allowed). Each
-  user may carry `publish` / `subscribe` topic-filter allow-lists: a denied publish is dropped (QoS 0) or
-  Not-Authorized-acked (QoS 1/2), and a denied subscribe gets a Not Authorized reason code. Defaults are open,
-  so nothing is required until you configure it.
+  plus a list of users). Passwords may be stored as plaintext `password` or a `password_hash` — an **Argon2id
+  PHC string** (salted, memory-hard; recommended) or a legacy hex SHA-256. Failures are rejected with the proper
+  CONNACK reason code (`0x86` bad credentials, `0x87` anonymous not allowed). Each user may carry `publish` /
+  `subscribe` topic-filter allow-lists, and **anonymous clients** get their own optional allow-lists
+  (`anonymous_publish` / `anonymous_subscribe`): a denied publish is dropped (QoS 0) or Not-Authorized-acked
+  (QoS 1/2), and a denied subscribe gets a Not Authorized reason code. Defaults are open, so nothing is
+  required until you configure it.
 - **Resource guards** — bounded read buffers and outbound mailboxes, per-shard and per-IP connection caps, payload
   and subscription/retained caps, plus an optional **per-connection PUBLISH rate limit** (`limits.max_message_rate`).
   The rate limit *throttles* (paces the client to its budget, applying backpressure) rather than dropping, which
@@ -73,10 +76,13 @@ isolated, shard-local executor — no `Mutex`, no `RwLock`, no work-stealing.
 - **Subscription identifiers** — a SUBSCRIBE's Subscription Identifier is stored and echoed on every matching
   PUBLISH so the client can tell which subscription produced a message; all matching identifiers are delivered
   when several of a client's subscriptions match.
-- **Shared subscriptions** — `$share/{group}/{filter}` groups load-balance: each matching message goes to just
-  one member of the group (round-robin, preferring connected members), while ordinary subscribers still each get
-  a copy. Retained messages are not replayed to shared subscriptions. *(Load balancing is per-shard — see
-  [Limitations](#limitations).)*
+- **Shared subscriptions, globally coordinated** — `$share/{group}/{filter}` groups load-balance: each matching
+  message goes to **exactly one member of the group across the whole broker**, even when members are spread over
+  different shards. Group membership is replicated over the channel mesh, and every shard applies the same
+  deterministic pick to the same message — so all shards agree on the recipient without a coordination
+  round-trip (membership updates are best-effort under mesh overload). A purely shard-local group keeps
+  round-robin fairness. Ordinary subscribers still each get a copy; retained messages are not replayed to
+  shared subscriptions.
 - **`$SYS` metrics** — the broker publishes retained `$SYS/broker/...` topics (uptime, connected/total clients,
   messages and bytes in/out) on a configurable interval, so you can monitor it over MQTT by subscribing to
   `$SYS/#`.
@@ -223,17 +229,14 @@ Known edges, deliberately out of scope for 1.0 (tracked in `.agents/progress.md`
   operation this is seamless (verified across a 2-shard broker); it shares the backpressure limitation above.
   A cross-shard *takeover* of a still-live connection drops the old connection without migrating its in-flight
   state.
-- **Shared-subscription load balancing is per-shard.** Each shard picks one of *its* local group members for a
-  matching message, so if a group's members are spread across shards (via `SO_REUSEPORT`), the message reaches
-  one member per shard rather than exactly one across the cluster. Fully single-delivery for `runtime.cores = 1`
-  or when a group's members share a shard; globally-coordinated shared delivery is future work (overlaps the
-  cross-shard items above).
-- **No outbound topic aliases.** The broker accepts *inbound* topic aliases but never assigns aliases on the
-  publishes it sends (CONNACK advertises none outbound). Delayed wills are forwarded to peer shards best-effort
-  (the sweep timer uses a non-blocking mesh send).
-- **Passwords: plaintext or SHA-256.** A `password_hash` avoids storing the secret in the clear, but there is no
-  salting or a slow KDF (Argon2/bcrypt) yet, and no enhanced (SASL-style) authentication. Anonymous clients
-  bypass ACL (they are unrestricted). Protect the config file with restrictive permissions regardless.
+- **Shared-subscription membership sync is best-effort.** The cluster-wide single delivery relies on every
+  shard holding the same replicated view of a group's connected members; membership broadcasts use non-blocking
+  mesh sends (drop-on-full), so under a saturated mesh a Join/Leave can be missed and a shared message may
+  transiently reach zero or two members until membership next changes. Delayed wills are likewise forwarded to
+  peer shards best-effort (the sweep timer uses a non-blocking mesh send).
+- **No enhanced (SASL-style) authentication.** Passwords support Argon2id PHC hashes (salted, memory-hard) —
+  note an Argon2 verify deliberately costs ~10–50 ms of CPU on the accepting core per CONNECT attempt, so
+  prefer it where connect rates are modest. Protect the config file with restrictive permissions regardless.
 - **Persistence is snapshot-based, not a write-ahead log.** With `[persistence] enabled`, both the retained set and
   suspended sessions (subscriptions, in-flight QoS 1/2 state, and offline queue) are snapshotted to disk and restored
   on startup — a graceful restart preserves them fully, and a crash preserves them up to the last snapshot

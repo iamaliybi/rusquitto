@@ -16,6 +16,34 @@ use crate::broker::session::InflightMessage;
 pub enum MeshMsg {
 	Publish(Publish),
 	Control(Box<SessionControl>),
+	Shared(SharedEvent),
+}
+
+/// Shared-subscription membership replication.
+///
+/// Every shard keeps an identical view of each `$share` group's *connected*
+/// members cluster-wide, maintained by these broadcasts: a shard announces
+/// `Join` when a connected client gains a shared subscription (SUBSCRIBE,
+/// session resume, migration arrival) and `Leave` when it loses one
+/// (UNSUBSCRIBE, disconnect/suspend, session destruction). Since every shard
+/// also sees every publish (the existing mesh broadcast), a shared view plus a
+/// deterministic pick lets all shards agree on the one member that receives a
+/// message — the shard owning that member delivers, everyone else skips — with
+/// no extra routing hop. Broadcasts are best-effort (drop-on-full), so a
+/// dropped event can transiently double- or zero-deliver a shared message until
+/// membership next changes; this matches the mesh's existing overload
+/// semantics.
+pub enum SharedEvent {
+	/// A connected client on some shard now holds a subscription in `group`.
+	Join {
+		group: String,
+		client_id: String,
+	},
+	/// The client no longer holds a connected subscription in `group`.
+	Leave {
+		group: String,
+		client_id: String,
+	},
 }
 
 /// Cross-shard session-migration protocol, exchanged over the mesh.
