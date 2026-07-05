@@ -484,3 +484,38 @@ hit. Old behavior would have delivered ~80.
 
 GOTCHA: PasswordHash::new() accepts "" (parses as salt-only)
 — require .salt.is_some() && .hash.is_some() for a usable credential.
+
+---
+
+## Phase 7 — Memory deep-dive + small-host levers (2026-07-05, v1.6.0)
+
+Built examples/allocprobe.rs (histogram global allocator + in-process broker;
+no root needed — heaptrack/valgrind unavailable, no passwordless sudo). It
+attributed the mystery ~13 KiB/conn in ONE allocation: the spawned task future.
+Root causes, in layers: (1) serve()s state machine reserved every transport
+branchs connection future at once; (2) inline Box::pin(fut).await does NOT
+help — temporaries in a statement containing .await live across the suspension
+and keep their frame slot; (3) even moved-from stream bindings (TlsStream,
+WsStream values, ~2 KiB each) kept slots. Fix: box each transport PIPELINE via
+plain-fn seams (boxed_run / boxed_serve_ws / boxed_serve_tls / boxed_serve_wss)
+so the box is constructed on a normal stack frame. Task future 13144 -> 600 B
+(measured via temporary size_of_val probe at the spawn site). Idle RSS 16.1 ->
+7.5 KiB/conn; burst 31.1 -> 22.4. Remaining = run_stream box ~4.5 KiB (the
+connection state machine) + ~1.4 KiB small allocs — fully attributed.
+
+malloc_trim(0) every 30 sweeps on peer 0 (libc dep): post-burst RSS 51.0 ->
+20.3 MB at the first tick (glibc arenas otherwise never return freed pages).
+
+[server] socket_recv_buffer / socket_send_buffer -> SO_RCVBUF/SO_SNDBUF on the
+listeners pre-listen(2); inherited by accepted sockets; verified via ss skmem
+(rb16384/tb16384 for 8192 configured — kernel doubles).
+
+aarch64: no root for apt, so zig 0.13 tarball + cargo-zigbuild; build with
+cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.31 (ring
+compiles under zig cc). Release now ships the arm64 asset (untested on real
+arm hardware — no qemu here; same code, cross-checked by the full x86 suite).
+
+Transports re-verified after the serve() restructure: plain + mqtts (openssl
+self-signed cert) + raw-RFC6455 ws client -> CONNACK. GOTCHA that cost an
+hour: a hand-rolled test CONNECT with a wrong remaining-length byte made the
+WS path look broken; the broker was fine.

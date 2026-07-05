@@ -576,8 +576,12 @@ impl<S: ByteStream> Connection<S> {
 		}
 
 		match packet {
-			// Client -> Server Requests
-			Packet::Connect(connect) => self.handle_connect(connect).await,
+			// Client -> Server Requests. The CONNECT arm is boxed: it is by far
+			// the largest handler future (auth, session claim/migration, resume),
+			// and inlined it would size *every* connection task for its worst
+			// case. Boxed, it costs one transient allocation during the handshake
+			// and the steady-state task stays small.
+			Packet::Connect(connect) => Box::pin(self.handle_connect(connect)).await,
 			Packet::Publish(publish) => self.handle_publish(publish).await,
 			Packet::Subscribe(subscribe) => self.handle_subscribe(subscribe).await,
 			Packet::Unsubscribe(unsubscribe) => self.handle_unsubscribe(unsubscribe).await,

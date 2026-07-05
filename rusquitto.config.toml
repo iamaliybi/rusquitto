@@ -8,6 +8,8 @@ port = 1883               # native MQTT TCP port
 websocket = true          # also accept MQTT-over-WebSocket (browser clients)
 websocket_port = 1884     # WebSocket listener port (must differ from `port`)
 listen_backlog = 1024     # per-shard listen(2) backlog (> 0)
+socket_recv_buffer = 0    # SO_RCVBUF cap per client socket, bytes (0 = kernel default); bounds kernel-side memory
+socket_send_buffer = 0    # SO_SNDBUF cap per client socket, bytes (0 = kernel default)
 
 [tls]
 # TLS termination (rustls). Disabled by default. Only TLS 1.3 and 1.2 are offered,

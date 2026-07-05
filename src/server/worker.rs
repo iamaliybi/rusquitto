@@ -29,6 +29,11 @@ use tracing::Instrument;
 /// How often each shard reclaims suspended sessions past their expiry deadline.
 const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Ask glibc to return freed arena pages to the kernel once per this many
+/// session sweeps (i.e. every 30 s with the 1 s sweep interval). Cheap when
+/// there is nothing to release; bounds post-burst RSS retention.
+const MALLOC_TRIM_EVERY: u32 = 30;
+
 /// How often the accept loop wakes to check the shutdown flag while `accept()` is
 /// otherwise blocked. Bounds shutdown latency; coarse so it barely touches the hot path.
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -187,7 +192,11 @@ pub async fn init(
 	};
 
 	let tcp_addr = SocketAddr::new(config.server.bind, config.server.port);
-	let tcp_listener = match bind_listener(tcp_addr, config.server.listen_backlog) {
+	let (recv_buf, send_buf) = (
+		config.server.socket_recv_buffer,
+		config.server.socket_send_buffer,
+	);
+	let tcp_listener = match bind_listener(tcp_addr, config.server.listen_backlog, recv_buf, send_buf) {
 		Ok(l) => l,
 		Err(e) => {
 			tracing::error!(shard = shard_id, error = %e, "failed to bind TCP listener");
@@ -202,7 +211,7 @@ pub async fn init(
 			return Ok(None);
 		};
 		let addr = SocketAddr::new(config.server.bind, port);
-		match bind_listener(addr, config.server.listen_backlog) {
+		match bind_listener(addr, config.server.listen_backlog, recv_buf, send_buf) {
 			Ok(l) => Ok(Some(l)),
 			Err(e) => {
 				tracing::error!(shard = shard_id, error = %e, "failed to bind {what} listener");
@@ -327,10 +336,16 @@ pub async fn init(
 
 	// Periodically reclaim suspended sessions whose expiry has lapsed and publish any
 	// delayed wills that have now come due (best-effort mesh forward, like `$SYS`).
+	// Every `MALLOC_TRIM_EVERY` sweeps, peer 0 also asks glibc to return freed
+	// arena pages to the kernel: a burst's worth of small allocations otherwise
+	// stays resident in the arena indefinitely (measured ~50 MB retained after a
+	// 2000-connection burst fully disconnected), which reads as a leak on
+	// memory-tight hosts. `malloc_trim` walks all arenas, so one shard suffices.
 	{
 		let state = state.clone();
 		glommio::spawn_local_into(
 			async move {
+				let mut sweeps: u32 = 0;
 				loop {
 					glommio::timer::sleep(SESSION_SWEEP_INTERVAL).await;
 					let wills = state.borrow_mut().sweep_expired();
@@ -338,6 +353,12 @@ pub async fn init(
 						let mut shard_state = state.borrow_mut();
 						shard_state.broadcast(&will);
 						shard_state.deliver_local(will, None);
+					}
+					sweeps = sweeps.wrapping_add(1);
+					if mesh_peer_id == 0 && sweeps.is_multiple_of(MALLOC_TRIM_EVERY) {
+						// SAFETY: glibc `malloc_trim` is thread-safe and touches no
+						// Rust-visible state; it only releases free arena memory.
+						unsafe { libc::malloc_trim(0) };
 					}
 				}
 			},
@@ -616,6 +637,9 @@ pub async fn init(
 			websocket = is_websocket,
 			client_id = tracing::field::Empty,
 		);
+		// NOTE: keep this task future small — it lives for the whole connection.
+		// The heavy per-transport state machines are boxed inside `serve` (see
+		// the comments there); this wrapper measures ~600 bytes.
 		glommio::spawn_local(
 			async move {
 				let _slot = slot;
@@ -711,34 +735,134 @@ async fn serve(
 	let timeout = Duration::from_secs(u64::from(limits.connect_timeout));
 	let max_frame = limits.max_payload_size;
 
+	// Every connection future is boxed *via `boxed_run`*. Without this, the
+	// spawned task's state machine reserves space for the connection future of
+	// every transport branch at once — and because temporaries in a statement
+	// containing `.await` live across the suspension, even `Box::pin(fut).await`
+	// written inline keeps the unboxed future's slot in the frame. Measured:
+	// ~13 KiB per connection task, even for plain TCP with TLS disabled.
+	// Constructing the box inside a separate non-async function builds the
+	// future on an ordinary stack frame, so the task holds only the 8-byte
+	// pointer and the heap carries one allocation sized to the transport
+	// actually in use (~4.5 KiB for plain TCP).
 	match transport {
-		Transport::Plain => run_stream(stream, shard_id, state, limits, auth, metrics, shutdown).await,
-		Transport::WebSocket => match WsStream::accept(stream, max_frame, timeout).await {
-			Ok(ws) => run_stream(ws, shard_id, state, limits, auth, metrics, shutdown).await,
-			Err(e) => tracing::warn!(error = %e, "WebSocket handshake failed"),
-		},
+		Transport::Plain => boxed_run(stream, shard_id, state, limits, auth, metrics, shutdown).await,
+		Transport::WebSocket => {
+			boxed_serve_ws(
+				stream, max_frame, timeout, shard_id, state, limits, auth, metrics, shutdown,
+			)
+			.await
+		}
 		Transport::Mqtts => {
 			let Some(acceptor) = tls_acceptor else {
 				return; // Unreachable: an mqtts listener only exists with an acceptor.
 			};
-			match tls::accept(&acceptor, stream, timeout).await {
-				Ok(tls) => run_stream(tls, shard_id, state, limits, auth, metrics, shutdown).await,
-				Err(e) => tracing::warn!(error = %e, "TLS handshake failed"),
-			}
+			boxed_serve_tls(
+				acceptor, stream, timeout, shard_id, state, limits, auth, metrics, shutdown,
+			)
+			.await
 		}
 		Transport::Wss => {
 			let Some(acceptor) = tls_acceptor else {
 				return;
 			};
-			match tls::accept(&acceptor, stream, timeout).await {
-				Ok(tls) => match WsStream::accept(tls, max_frame, timeout).await {
-					Ok(ws) => run_stream(ws, shard_id, state, limits, auth, metrics, shutdown).await,
-					Err(e) => tracing::warn!(error = %e, "WebSocket handshake over TLS failed"),
-				},
-				Err(e) => tracing::warn!(error = %e, "TLS handshake failed"),
-			}
+			boxed_serve_wss(
+				acceptor, stream, max_frame, timeout, shard_id, state, limits, auth, metrics, shutdown,
+			)
+			.await
 		}
 	}
+}
+
+/// Boxes a transport's connection future on a plain (non-async) stack frame.
+///
+/// Deliberately not `async` and deliberately a separate function: see the
+/// comment in [`serve`]. The multi-KiB `run_stream` state machine must never
+/// exist as a temporary — or a moved-from binding — inside an async frame, or
+/// it gets a permanent slot in the enclosing task's allocation.
+#[allow(clippy::too_many_arguments)]
+fn boxed_run<S: ByteStream>(
+	stream: S,
+	shard_id: usize,
+	state: Rc<std::cell::RefCell<ShardState>>,
+	limits: crate::config::LimitsConfig,
+	auth: Rc<Authenticator>,
+	metrics: Arc<Metrics>,
+	shutdown: Arc<AtomicBool>,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = ()>>> {
+	Box::pin(run_stream(
+		stream, shard_id, state, limits, auth, metrics, shutdown,
+	))
+}
+
+/// The whole WebSocket pipeline (handshake, then the connection) in one box —
+/// same rationale as [`boxed_run`]: intermediate stream values (`WsStream`,
+/// `TlsStream`) are multi-KiB and must not occupy slots in `serve`'s frame.
+#[allow(clippy::too_many_arguments)]
+fn boxed_serve_ws(
+	stream: TcpStream,
+	max_frame: usize,
+	timeout: Duration,
+	shard_id: usize,
+	state: Rc<std::cell::RefCell<ShardState>>,
+	limits: crate::config::LimitsConfig,
+	auth: Rc<Authenticator>,
+	metrics: Arc<Metrics>,
+	shutdown: Arc<AtomicBool>,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = ()>>> {
+	Box::pin(async move {
+		match WsStream::accept(stream, max_frame, timeout).await {
+			Ok(ws) => run_stream(ws, shard_id, state, limits, auth, metrics, shutdown).await,
+			Err(e) => tracing::warn!(error = %e, "WebSocket handshake failed"),
+		}
+	})
+}
+
+/// The whole `mqtts` pipeline (TLS handshake, then the connection) in one box.
+#[allow(clippy::too_many_arguments)]
+fn boxed_serve_tls(
+	acceptor: TlsAcceptor,
+	stream: TcpStream,
+	timeout: Duration,
+	shard_id: usize,
+	state: Rc<std::cell::RefCell<ShardState>>,
+	limits: crate::config::LimitsConfig,
+	auth: Rc<Authenticator>,
+	metrics: Arc<Metrics>,
+	shutdown: Arc<AtomicBool>,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = ()>>> {
+	Box::pin(async move {
+		match tls::accept(&acceptor, stream, timeout).await {
+			Ok(tls) => run_stream(tls, shard_id, state, limits, auth, metrics, shutdown).await,
+			Err(e) => tracing::warn!(error = %e, "TLS handshake failed"),
+		}
+	})
+}
+
+/// The whole `wss` pipeline (TLS, then the WebSocket upgrade over it, then the
+/// connection) in one box.
+#[allow(clippy::too_many_arguments)]
+fn boxed_serve_wss(
+	acceptor: TlsAcceptor,
+	stream: TcpStream,
+	max_frame: usize,
+	timeout: Duration,
+	shard_id: usize,
+	state: Rc<std::cell::RefCell<ShardState>>,
+	limits: crate::config::LimitsConfig,
+	auth: Rc<Authenticator>,
+	metrics: Arc<Metrics>,
+	shutdown: Arc<AtomicBool>,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = ()>>> {
+	Box::pin(async move {
+		match tls::accept(&acceptor, stream, timeout).await {
+			Ok(tls) => match WsStream::accept(tls, max_frame, timeout).await {
+				Ok(ws) => run_stream(ws, shard_id, state, limits, auth, metrics, shutdown).await,
+				Err(e) => tracing::warn!(error = %e, "WebSocket handshake over TLS failed"),
+			},
+			Err(e) => tracing::warn!(error = %e, "TLS handshake failed"),
+		}
+	})
 }
 
 /// Drives the MQTT state machine over an established stream to completion. Generic

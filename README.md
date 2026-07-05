@@ -255,6 +255,19 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all        # format to the repo's rustfmt.toml
 ```
 
+Cross-compiling for arm64 (AWS Graviton / t4g) needs no system toolchain — releases use
+[`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild) (zig provides the cross linker and C
+compiler for `ring`):
+
+```sh
+rustup target add aarch64-unknown-linux-gnu
+cargo install cargo-zigbuild            # plus a zig toolchain on PATH
+cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.31   # glibc >= 2.31
+```
+
+`examples/allocprobe.rs` measures live heap per idle connection by size class (the tool behind the
+per-connection memory numbers in the changelog): `cargo run --release --example allocprobe -- 2000`.
+
 The connection state machine is unit-tested over an in-memory `ByteStream` mock, so the full MQTT handshake
 and packet handling run without sockets (see `src/server/connection/tests.rs`).
 

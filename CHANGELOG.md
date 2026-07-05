@@ -5,6 +5,45 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): from 1.0 on, the major
 version bumps for breaking changes, the minor for features, and the patch for fixes.
 
+## [1.6.0] - 2026-07-05
+
+Small-host hardening: less memory per connection (process *and* kernel side),
+post-burst memory returned to the OS, and an aarch64 binary for Graviton/t4g
+deployment.
+
+### Changed
+
+- **Idle memory: 16.1 → 7.5 KiB per connection.** A heap-decomposition pass
+  (the new `allocprobe` example — a size-class histogram allocator around an
+  in-process broker) attributed ~13 KiB of every connection to its spawned
+  task: the task future reserved space for the connection state machine of
+  *every* transport branch at once (and, because temporaries in a statement
+  containing `.await` live across the suspension, inline `Box::pin(fut).await`
+  didn't help). Each transport pipeline is now boxed via a plain-function seam,
+  so the long-lived task measures ~600 bytes and each connection heap-allocates
+  only its own transport's state (~4.5 KiB for plain TCP). Adversarial
+  stalled-subscriber burst: 31.1 → 22.4 KiB/conn. The remaining footprint is
+  fully attributed (connection state machine + session/channel bookkeeping).
+- **Post-burst memory is returned to the kernel.** glibc kept a burst's freed
+  allocations resident in its arenas indefinitely (measured ~30–50 MB after a
+  2000-connection burst fully disconnected). The maintenance tick now calls
+  `malloc_trim` every 30 s (peer 0 only — it walks all arenas); verified: RSS
+  fell from 51.0 MB to 20.3 MB at the first tick after a burst.
+
+### Added
+
+- **Kernel socket-buffer caps** — `[server] socket_recv_buffer` /
+  `socket_send_buffer` (bytes, `0` = kernel default) set `SO_RCVBUF` /
+  `SO_SNDBUF` on the listeners, inherited by every accepted socket. On
+  memory-tight hosts this bounds *kernel-side* per-connection memory — which
+  lives outside the broker's RSS — and caps the advertised TCP window.
+  Verified via `ss` skmem on an accepted socket.
+- **aarch64 builds** — releases now ship a `rusquitto-aarch64-unknown-linux-gnu`
+  binary (glibc ≥ 2.31) for Graviton/t4g-class hosts, cross-compiled with
+  `cargo zigbuild`; see the README's cross-compiling note.
+- **`examples/allocprobe.rs`** — the reusable heap-decomposition probe behind
+  the numbers above (no root or external profiler needed).
+
 ## [1.5.0] - 2026-07-05
 
 The backlog-clearing release: every remaining item on the Phase-3 hardening
@@ -349,6 +388,8 @@ All changes are additive; there are no breaking changes to existing behavior.
   SUBSCRIBE/UNSUBSCRIBE, PINGREQ/PINGRESP, DISCONNECT; topic-trie wildcard
   matching (`+` / `#`); retained messages; cross-shard routing over a glommio
   channel mesh; structured `tracing` logging; and TOML configuration with a CLI.
+
+[1.6.0]: https://github.com/iamaliybi/rusquitto/releases/tag/v1.6.0
 
 [1.5.0]: https://github.com/iamaliybi/rusquitto/releases/tag/v1.5.0
 

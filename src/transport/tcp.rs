@@ -13,7 +13,17 @@ use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 /// `SO_REUSEPORT` lets every shard bind the same address; the kernel load-balances
 /// incoming connections across them, so there is no shared accept socket and no
 /// cross-core contention on the listener.
-pub fn bind_listener(address: SocketAddr, backlog: i32) -> std::io::Result<TcpListener> {
+///
+/// `recv_buffer` / `send_buffer` (bytes; `0` = kernel default) cap `SO_RCVBUF` /
+/// `SO_SNDBUF`. Set on the listener *before* `listen(2)`, they are inherited by
+/// every accepted socket — the lever for bounding kernel-side socket memory on
+/// small hosts, since that memory lives outside the process's RSS.
+pub fn bind_listener(
+	address: SocketAddr,
+	backlog: i32,
+	recv_buffer: usize,
+	send_buffer: usize,
+) -> std::io::Result<TcpListener> {
 	let domain = if address.is_ipv4() {
 		Domain::IPV4
 	} else {
@@ -29,6 +39,12 @@ pub fn bind_listener(address: SocketAddr, backlog: i32) -> std::io::Result<TcpLi
 	socket.set_tcp_nodelay(true)?;
 	socket.set_nonblocking(true)?;
 	socket.set_tcp_keepalive(&TcpKeepalive::new().with_time(Duration::from_secs(60)))?;
+	if recv_buffer > 0 {
+		socket.set_recv_buffer_size(recv_buffer)?;
+	}
+	if send_buffer > 0 {
+		socket.set_send_buffer_size(send_buffer)?;
+	}
 
 	socket.bind(&address.into())?;
 	socket.listen(backlog)?;

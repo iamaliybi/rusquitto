@@ -68,6 +68,16 @@ pub struct ServerConfig {
 	pub websocket_port: u16,
 	/// `listen(2)` backlog passed to each shard's socket.
 	pub listen_backlog: i32,
+	/// `SO_RCVBUF` cap for client sockets, in bytes (`0` = kernel default).
+	/// Set on the listeners, so accepted sockets inherit it. On memory-tight
+	/// hosts this bounds *kernel-side* socket memory — which lives outside the
+	/// broker's RSS — at high connection counts, and also caps the advertised
+	/// TCP receive window. The kernel doubles the value it is given and
+	/// enforces its own minimum (see `socket(7)`).
+	pub socket_recv_buffer: usize,
+	/// `SO_SNDBUF` cap for client sockets, in bytes (`0` = kernel default).
+	/// Same inheritance and doubling semantics as `socket_recv_buffer`.
+	pub socket_send_buffer: usize,
 }
 
 impl ServerConfig {
@@ -370,6 +380,8 @@ impl Default for ServerConfig {
 			websocket: true,
 			websocket_port: 1884,
 			listen_backlog: 1024,
+			socket_recv_buffer: 0,
+			socket_send_buffer: 0,
 		}
 	}
 }
