@@ -1,6 +1,6 @@
 [package]
 name = "rusquitto"
-version = "1.5.0"
+version = "1.6.0"
 edition = "2024"
 default-run = "rusquitto"
 
@@ -23,6 +23,10 @@ toml = "1.1"
 
 # Process signals (graceful shutdown on SIGTERM / SIGINT)
 signal-hook = "0.4"
+
+# `malloc_trim` on the maintenance tick: return freed arena pages to the kernel
+# after connection bursts (already in the tree via glommio).
+libc = "0.2"
 
 # Password hashing for `[[auth.users]]` password_hash: legacy SHA-256 hex, plus
 # Argon2id PHC strings (salted, memory-hard — the recommended form).

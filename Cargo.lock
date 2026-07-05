@@ -1053,7 +1053,7 @@ dependencies = [
 
 [[package]]
 name = "rusquitto"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "argon2",
  "base64",
@@ -1062,6 +1062,7 @@ dependencies = [
  "futures-lite 2.6.1",
  "futures-rustls",
  "glommio",
+ "libc",
  "mqttbytes",
  "rcgen",
  "rustls-pemfile",
