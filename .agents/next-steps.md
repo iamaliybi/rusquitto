@@ -122,12 +122,18 @@ From the v1.7.0 audit + benchmark:
    alloc per publish — and that box is what keeps idle memory low, so removing it
    would regress §1. v1.9.0 cut a `Publish` clone from the *delivery* path (helps
    fan-out, not the pure-ack bench). What remains is a parser + memory/CPU
-   trade-off, not a clear win.
+   trade-off, not a clear win. **Measured at floor (v1.9.1):** single-shard QoS 1
+   request-response is **55 µs p50 / 76 µs p90**, and `TCP_NODELAY` is already
+   effective (now set explicitly per-connection) — the per-request cost is
+   `mqttbytes` parse + the socket round-trip, at parity with a mature C broker. No
+   application-level headroom.
 3. **Cross-shard single-message latency (~50 µs p50) — residual.** v1.9.0's
    batch-drain cut the CPU and tail latency of cross-shard *bursts*, but a single
-   forwarded message's p50 is still bounded by the cross-thread reactor wake
-   (glommio-internal). A faster mesh wakeup or topology-aware subscriber placement
-   would trim it further.
+   forwarded message's p50 is bounded by one cross-thread reactor wake
+   (glommio-internal). v1.9.1 made `TCP_NODELAY` explicit so the delivery write
+   isn't Nagle-exposed, but the mesh-hop delta itself has no application-level
+   lever — trimming it needs a faster mesh wakeup (below glommio) or
+   topology-aware subscriber placement.
 
 The audit found **no race conditions and no memory leaks** — the shared-nothing
 model makes intra-shard data races structurally impossible, and RSS returns to
