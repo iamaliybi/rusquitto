@@ -669,3 +669,23 @@ Three audit follow-ups (user explicitly deferred the memory-density/parking item
   373k, no regression). GOTCHA: mqttwire.read_packet RAISES socket.timeout (not
   None) — catch it when draining. The QoS1 publisher-ack microbench doesn't touch
   send_publish (no delivery), so Task-2's clone win shows on fan-out, not that bench.
+
+## Phase 11 — ack/latency measured at floor + explicit TCP_NODELAY (2026-07-06, v1.9.1)
+
+Investigated the audit's two remaining perf items (per-core ack-bound parity;
+cross-shard single-message latency). KEY RESULT: BOTH AT FLOOR, no app-level
+headroom — measured, not guessed.
+
+- Diagnostic (`/tmp/lat/ping.py`, synchronous 1-in-flight PUBLISH→PUBACK RTT):
+  single-shard QoS1 p50=55µs / p90=76µs / p99=128µs, NO Nagle artifacts (tight
+  tail) => `TCP_NODELAY` already effective. Per-request cost = mqttbytes parse +
+  socket round-trip, at C-broker parity. Cross-shard delta = 1 cross-thread
+  reactor wake (glommio-internal). Only way lower = the below-glommio parking /
+  faster-mesh-wakeup tier (next-steps §1).
+- Shipped two GENUINE-BUT-PERF-NEUTRAL changes: (1) `stream.set_nodelay(true)`
+  EXPLICITLY per accepted socket in accept.rs (robustness/portability — the
+  listener's option is inherited on Linux but that isn't contractual); (2)
+  `fan_out` skips the mesh path (no senders clone, no self-only loop) when
+  `mesh_peers()==0` (single-shard). A/B: new RTT p50=56µs (within noise).
+- Told the user honestly: robustness/cleanup, NOT a throughput/latency win.
+  CHANGELOG + next-steps say so. 94 tests, clippy/fmt clean.

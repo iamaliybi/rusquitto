@@ -148,6 +148,9 @@ edit it. Sections: `[server]`, `[runtime]` (`cores`, `placement`, `mesh_capacity
 ## Working notes
 
 `.agents/` holds the detailed engineering log: `overview.md` (feature matrix), `architecture.md` (with a
-current Key Files table), `dependencies.md`, `next-steps.md` (roadmap), and `progress.md` (full
-implementation history + gotchas). When in doubt, trust the actual tree and `src/lib.rs` for module
-structure. Version history is in `CHANGELOG.md`.
+current Key Files table), `dependencies.md`, `scope.md` (settled product decisions — what the broker is
+and is deliberately not), `next-steps.md` (a strict TODO list — open work only, phased, with
+priority/risk/status badges), and `progress.md` (full implementation history + gotchas). Keep the split
+clean: completed work belongs in `progress.md`, not `next-steps.md`; scope decisions in `scope.md`, not
+`next-steps.md`. When in doubt, trust the actual tree and `src/lib.rs` for module structure. Version
+history is in `CHANGELOG.md`.
