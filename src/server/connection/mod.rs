@@ -58,9 +58,27 @@ static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(0);
 /// resolves as soon as every peer has answered).
 const SESSION_CLAIM_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// Stack scratch buffer for each socket read. The growable assembly buffer is
-/// `buffer` (sized from config); a fixed size keeps this one on the stack.
-const READ_BUFFER_SIZE: usize = 2048;
+/// Smallest per-read reservation in the assembly buffer. Each socket read lands
+/// directly in the buffer's tail (no intermediate copy); the reservation adapts
+/// between these bounds — an idle connection reserves only [`READ_CHUNK_MIN`],
+/// a connection streaming large packets grows toward [`READ_CHUNK_MAX`] so bulk
+/// transfers need fewer reads.
+const READ_CHUNK_MIN: usize = 512;
+
+/// Largest per-read reservation in the assembly buffer.
+const READ_CHUNK_MAX: usize = 8192;
+
+/// Flush the coalesced output buffer once it grows past this many bytes, even
+/// mid-drain. This is also the elastic-memory ceiling for a consumer whose
+/// socket has stalled (its task parks on the blocked write with the buffer
+/// full), so keep it modest: 16 KiB is still far past the point of diminishing
+/// batching returns, while a thousand stuck consumers pin ≤ 16 MiB.
+const FLUSH_THRESHOLD: usize = 16 * 1024;
+
+/// Read/output buffers whose capacity exceeds this are released once empty, so
+/// a burst (one large packet, one deep fan-out) doesn't pin its high-water
+/// allocation on an idle connection forever.
+const BUFFER_RETAIN_MAX: usize = 16 * 1024;
 
 /// Longest client identifier the broker accepts (the spec only mandates support
 /// for 23; we allow generously more but bound it to reject abuse).
@@ -71,19 +89,23 @@ const MAX_CLIENT_ID_LEN: usize = 256;
 /// that stops acknowledging can't force unbounded broker memory growth.
 const PENDING_OUTBOUND_LIMIT: usize = 4096;
 
-/// Capacity of a connection's outbound mailbox. Bounding it is a hard DoS guard:
-/// if a subscriber stops reading its socket, its connection task parks on the
-/// blocked write and stops draining the mailbox — an *unbounded* mailbox would
-/// then grow without limit as other clients keep publishing to it. A full mailbox
-/// drops further deliveries for that stuck consumer instead of exhausting memory.
-const MAILBOX_CAPACITY: usize = 8192;
+// NOTE: the outbound mailbox is deliberately an *unbounded* channel: glommio's
+// bounded variant pre-allocates its whole ring per connection (`VecDeque::
+// with_capacity`), while the unbounded one allocates nothing until a delivery
+// is actually queued — the right trade for tens of thousands of mostly-idle
+// connections. The drop-on-full DoS bound a bounded channel would provide is
+// enforced instead at the routing site via [`MAILBOX_LIMIT`]
+// (crate::broker::session::MAILBOX_LIMIT).
 
-/// One iteration of the connection event loop resolves to exactly one of these:
-/// either the client sent us bytes, or the broker routed a message to us.
+/// One blocking turn of the connection event loop resolves to exactly one of
+/// these: bytes from the client socket, a routed delivery, or the idle deadline.
+/// Packets are parsed *outside* the race (synchronously, from the assembly
+/// buffer), so this enum stays small.
 enum Event {
-	/// A parsed packet (or EOF) arrived from the client socket. Boxed because a
-	/// `Packet` (its `Connect` variant especially) is much larger than a `Delivery`.
-	Incoming(Result<Option<Box<Packet>>>),
+	/// The socket read appended this many bytes to the assembly buffer (0 = EOF).
+	Bytes(usize),
+	/// The socket read failed.
+	ReadErr(Error),
 	/// A message was routed into this connection's mailbox for delivery.
 	/// `None` means the channel closed (all senders dropped).
 	Outgoing(Option<Delivery>),
@@ -94,6 +116,14 @@ enum Event {
 pub struct Connection<S: ByteStream> {
 	stream: S,
 	buffer: BytesMut,
+	/// Coalesced output: every outbound packet is encoded here and the whole
+	/// batch is written with one `write_all` per event-loop wakeup (one io_uring
+	/// op — and one TLS record / WebSocket frame — instead of one per packet).
+	out: BytesMut,
+	/// Adaptive per-read reservation in `buffer`, between [`READ_CHUNK_MIN`] and
+	/// [`READ_CHUNK_MAX`]: doubles when reads come back full, halves when they
+	/// come back nearly empty, so idle connections hold small buffers.
+	read_chunk: usize,
 	shard_id: usize,
 	client_id: String,
 	/// Shard-local broker state, shared with every other connection on this core.
@@ -188,10 +218,14 @@ impl<S: ByteStream> Connection<S> {
 		metrics: Arc<Metrics>,
 		shutdown: Arc<AtomicBool>,
 	) -> Self {
-		let (mailbox_tx, mailbox_rx) = local_channel::new_bounded(MAILBOX_CAPACITY);
+		let (mailbox_tx, mailbox_rx) = local_channel::new_unbounded();
 		Self {
 			stream,
+			// `with_capacity(0)` (the default) allocates nothing; the buffer grows
+			// on demand from the first read and is trimmed when it empties.
 			buffer: BytesMut::with_capacity(limits.initial_read_buffer),
+			out: BytesMut::new(),
+			read_chunk: READ_CHUNK_MIN,
 			shard_id,
 			client_id: String::new(),
 			state,
@@ -225,29 +259,60 @@ impl<S: ByteStream> Connection<S> {
 		}
 	}
 
-	/// Encodes a single MQTT packet and writes it to the socket, mapping any
-	/// serialization failure to an I/O error. Centralizes the encode-then-write
-	/// boilerplate shared by every acknowledgement path.
-	async fn send<F>(&mut self, encode: F) -> Result<()>
+	/// Encodes a single MQTT packet into the coalesced output buffer, mapping any
+	/// serialization failure to an I/O error. Nothing touches the socket here:
+	/// the buffered batch goes out in one write at the next [`flush`](Self::flush)
+	/// (the event loop flushes before every blocking wait, so ordering and
+	/// promptness are preserved while syscalls, TLS records, and WebSocket frames
+	/// are amortized across the whole wakeup).
+	fn send<F>(&mut self, encode: F) -> Result<()>
 	where
 		F: FnOnce(&mut BytesMut) -> std::result::Result<usize, MqttError>,
 	{
-		let mut buf = BytesMut::new();
-		encode(&mut buf).map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
-		self.stream.write_all(&buf).await
+		encode(&mut self.out)
+			.map(|_| ())
+			.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))
 	}
 
-	/// Sends a server-initiated DISCONNECT with the given reason (best effort).
-	async fn send_disconnect(&mut self, reason: mqtt_v5::DisconnectReasonCode) -> Result<()> {
+	/// Writes the coalesced output buffer to the socket in one `write_all`.
+	async fn flush(&mut self) -> Result<()> {
+		if self.out.is_empty() {
+			return Ok(());
+		}
+		self.stream.write_all(&self.out).await?;
+		self.out.clear();
+		Ok(())
+	}
+
+	/// Queues a server-initiated DISCONNECT with the given reason; it reaches the
+	/// wire at the next flush (every exit path flushes best-effort).
+	fn send_disconnect(&mut self, reason: mqtt_v5::DisconnectReasonCode) -> Result<()> {
 		let mut disconnect = mqtt_v5::Disconnect::new();
 		disconnect.reason_code = reason;
-		self.send(|buf| disconnect.write(buf)).await
+		self.send(|buf| disconnect.write(buf))
+	}
+
+	/// Releases oversized buffer allocations once they empty, so one burst (a
+	/// large packet in, a deep fan-out out) doesn't pin its high-water memory on
+	/// an idle connection. The next use re-grows on demand.
+	fn shrink_buffers(&mut self) {
+		if self.buffer.is_empty() && self.buffer.capacity() > BUFFER_RETAIN_MAX {
+			self.buffer = BytesMut::new();
+		}
+		if self.out.is_empty() && self.out.capacity() > BUFFER_RETAIN_MAX {
+			self.out = BytesMut::new();
+		}
 	}
 
 	pub async fn run(&mut self) -> Result<()> {
 		debug!("connection opened");
 
 		let result = self.event_loop().await;
+
+		// Best-effort: put any still-buffered output (a reject CONNACK, a final
+		// DISCONNECT) on the wire before tearing the session down. The connection
+		// is closing either way, so a write failure here is not an error.
+		let _ = self.flush().await;
 
 		// Release our hold on the session, whichever way the loop exited. Depending
 		// on the negotiated expiry this either destroys the session (and its
@@ -303,20 +368,78 @@ impl<S: ByteStream> Connection<S> {
 		result
 	}
 
-	/// Bidirectional event loop: race an inbound socket read against an outbound
-	/// mailbox delivery and an idle-deadline timer, handling whichever fires first.
+	/// Bidirectional event loop, structured as *drain → flush → block*:
+	///
+	/// 1. Process every complete packet already in the assembly buffer and every
+	///    delivery already queued in the mailbox (both synchronous — responses
+	///    accumulate in the coalesced output buffer).
+	/// 2. Flush the whole batch in one write, then trim oversized idle buffers.
+	/// 3. Block: race a socket read against a mailbox delivery and the idle
+	///    deadline, then loop.
+	///
+	/// Everything one wakeup produces — acks for a burst of PUBLISHes, a fan-out
+	/// of deliveries — thus leaves in a single io_uring op instead of one per
+	/// packet.
 	async fn event_loop(&mut self) -> Result<()> {
 		let max_packet = self.limits.max_payload_size;
 		loop {
-			// Borrow disjoint fields so the futures don't all need `&mut self`.
+			// Drain: every complete packet already buffered.
+			while let Some(packet) = Self::parse_packet(&mut self.buffer, max_packet)? {
+				if let Err(e) = self.process_packet(packet).await {
+					warn!(error = %e, "protocol/io error, closing connection");
+					return Ok(());
+				}
+				// Any inbound packet refreshes the keep-alive deadline.
+				if let Some(window) = self.keepalive {
+					self.deadline = Some(Instant::now() + window);
+				}
+				// A large ack burst shouldn't balloon the output buffer.
+				if self.out.len() >= FLUSH_THRESHOLD {
+					self.flush().await?;
+				}
+			}
+
+			// Drain: every delivery already queued in the mailbox (without
+			// blocking — `poll_once` returns `None` the moment it would park).
+			loop {
+				match futures_lite::future::poll_once(self.mailbox_rx.recv()).await {
+					Some(Some(delivery)) => {
+						if let Err(e) = self.deliver(delivery) {
+							warn!(error = %e, "delivery error, closing connection");
+							return Err(e);
+						}
+						if self.out.len() >= FLUSH_THRESHOLD {
+							self.flush().await?;
+						}
+					}
+					Some(None) => return self.mailbox_closed(),
+					None => break,
+				}
+			}
+
+			// Flush the coalesced batch, then trim what the burst grew.
+			self.flush().await?;
+			self.shrink_buffers();
+
+			// Block until bytes arrive, a delivery lands, or the deadline lapses.
+			// The read reserves `read_chunk` bytes in the assembly buffer and reads
+			// directly into it (no intermediate copy). `valid` marks the real data
+			// length so a cancelled read's zeroed reservation is always dropped.
+			let valid = self.buffer.len();
 			let deadline = self.deadline;
+			let chunk = self.read_chunk;
 			let event = {
+				let stream = &mut self.stream;
+				let buffer = &mut self.buffer;
 				let read = async {
-					Event::Incoming(
-						Self::read_packet(&mut self.stream, &mut self.buffer, max_packet)
-							.await
-							.map(|opt| opt.map(Box::new)),
-					)
+					buffer.resize(valid + chunk, 0);
+					match stream.read(&mut buffer[valid..]).await {
+						Ok(n) => {
+							buffer.truncate(valid + n);
+							Event::Bytes(n)
+						}
+						Err(e) => Event::ReadErr(e),
+					}
 				};
 				let recv = async { Event::Outgoing(self.mailbox_rx.recv().await) };
 				let idle = async {
@@ -333,48 +456,42 @@ impl<S: ByteStream> Connection<S> {
 			};
 
 			match event {
-				Event::Incoming(Ok(Some(packet))) => {
-					if let Err(e) = self.process_packet(*packet).await {
-						warn!(error = %e, "protocol/io error, closing connection");
-						return Ok(());
-					}
-					// Any inbound packet refreshes the keep-alive deadline.
-					if let Some(window) = self.keepalive {
-						self.deadline = Some(Instant::now() + window);
+				Event::Bytes(0) => break, // Client closed (EOF)
+				Event::Bytes(n) => {
+					// Adapt the next reservation: a full read suggests more is
+					// coming (grow); a nearly-empty one suggests idling (shrink).
+					if n == chunk {
+						self.read_chunk = (chunk * 2).min(READ_CHUNK_MAX);
+					} else if n < chunk / 4 {
+						self.read_chunk = (chunk / 2).max(READ_CHUNK_MIN);
 					}
 				}
-				Event::Incoming(Ok(None)) => break, // Client closed (EOF)
-				Event::Incoming(Err(e)) => {
+				Event::ReadErr(e) => {
+					self.buffer.truncate(valid);
 					warn!(error = %e, "network error, closing connection");
 					return Err(e);
 				}
-				Event::Outgoing(Some(delivery)) => {
-					if let Err(e) = self.deliver(delivery).await {
-						warn!(error = %e, "delivery error, closing connection");
-						return Err(e);
+				Event::Outgoing(delivery) => {
+					// The read lost the race: drop its zeroed reservation.
+					self.buffer.truncate(valid);
+					match delivery {
+						Some(delivery) => {
+							if let Err(e) = self.deliver(delivery) {
+								warn!(error = %e, "delivery error, closing connection");
+								return Err(e);
+							}
+						}
+						None => return self.mailbox_closed(),
 					}
-				}
-				// The mailbox sender was dropped — either the server is shutting down
-				// (tell the client and suppress the will) or a new connection took
-				// over our client id (just close).
-				Event::Outgoing(None) => {
-					if self.shutdown.load(Ordering::Relaxed) {
-						self.will = None;
-						let _ = self
-							.send_disconnect(mqtt_v5::DisconnectReasonCode::ServerShuttingDown)
-							.await;
-					}
-					break;
 				}
 				// The idle deadline lapsed: no valid CONNECT in time, or no traffic
 				// within the keep-alive window. Either way, drop the connection (an
 				// abnormal close, so a keep-alive timeout still fires the will).
 				Event::Timeout => {
+					self.buffer.truncate(valid);
 					if self.connected {
 						warn!("keep-alive timeout, closing connection");
-						let _ = self
-							.send_disconnect(mqtt_v5::DisconnectReasonCode::KeepAliveTimeout)
-							.await;
+						let _ = self.send_disconnect(mqtt_v5::DisconnectReasonCode::KeepAliveTimeout);
 					} else {
 						warn!("CONNECT not received within handshake timeout, closing");
 					}
@@ -386,44 +503,43 @@ impl<S: ByteStream> Connection<S> {
 		Ok(())
 	}
 
-	/// Reads from `stream` into `buffer` until a complete MQTT packet can be
-	/// framed. Takes the fields directly (not `&mut self`) so it can race against
-	/// the mailbox receiver, which borrows a different field.
-	async fn read_packet(stream: &mut S, buffer: &mut BytesMut, max_packet: usize) -> Result<Option<Packet>> {
-		let mut temp_buf = [0u8; READ_BUFFER_SIZE];
+	/// The mailbox sender was dropped — either the server is shutting down (tell
+	/// the client and suppress the will) or a new connection took over our client
+	/// id (just close). `run()` flushes the DISCONNECT on the way out.
+	fn mailbox_closed(&mut self) -> Result<()> {
+		if self.shutdown.load(Ordering::Relaxed) {
+			self.will = None;
+			let _ = self.send_disconnect(mqtt_v5::DisconnectReasonCode::ServerShuttingDown);
+		}
+		Ok(())
+	}
 
-		// One read may carry several MQTT packets; frame as many as are complete.
-		loop {
-			// First byte (fixed header) before `read` consumes the frame; used to
-			// recognise the zero-length DISCONNECT that mqttbytes can't parse.
-			let first_byte = buffer.first().copied();
-			match mqtt_v5::read(buffer, max_packet) {
-				Ok(packet) => return Ok(Some(packet)),
-				Err(MqttError::InsufficientBytes(_)) => {
-					// Need more bytes.
-				}
-				// mqttbytes rejects any zero-length packet other than PING as
-				// `PayloadRequired`, but a bare `E0 00` DISCONNECT is a valid MQTT 5
-				// normal disconnect. Synthesize one so it flows through
-				// `handle_disconnect` (which suppresses the will) instead of being
-				// mistaken for an abrupt EOF, which would wrongly fire the will.
-				Err(MqttError::PayloadRequired) if first_byte.map(|b| b >> 4) == Some(14) => {
-					return Ok(Some(Packet::Disconnect(mqtt_v5::Disconnect::new())));
-				}
-				Err(e) => {
-					return Err(Error::new(
-						ErrorKind::InvalidData,
-						format!("MQTT Parse Error: {:?}", e),
-					));
-				}
+	/// Frames one complete MQTT packet out of `buffer`, or `None` if more bytes
+	/// are needed. Synchronous: never touches the socket.
+	fn parse_packet(buffer: &mut BytesMut, max_packet: usize) -> Result<Option<Packet>> {
+		if buffer.is_empty() {
+			return Ok(None);
+		}
+		// First byte (fixed header) before `read` consumes the frame; used to
+		// recognise the zero-length DISCONNECT that mqttbytes can't parse.
+		let first_byte = buffer.first().copied();
+		match mqtt_v5::read(buffer, max_packet) {
+			Ok(packet) => Ok(Some(packet)),
+			Err(MqttError::InsufficientBytes(_)) => Ok(None),
+			// mqttbytes rejects any zero-length packet other than PING as
+			// `PayloadRequired`, but a bare `E0 00` DISCONNECT is a valid MQTT 5
+			// normal disconnect. Synthesize one so it flows through
+			// `handle_disconnect` (which suppresses the will) instead of being
+			// mistaken for an abrupt EOF, which would wrongly fire the will.
+			// Nothing after a DISCONNECT matters, so drop the remaining bytes.
+			Err(MqttError::PayloadRequired) if first_byte.map(|b| b >> 4) == Some(14) => {
+				buffer.clear();
+				Ok(Some(Packet::Disconnect(mqtt_v5::Disconnect::new())))
 			}
-
-			let n = stream.read(&mut temp_buf).await?;
-			if n == 0 {
-				return Ok(None);
-			}
-
-			buffer.extend_from_slice(&temp_buf[..n]);
+			Err(e) => Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("MQTT Parse Error: {:?}", e),
+			)),
 		}
 	}
 
@@ -434,8 +550,7 @@ impl<S: ByteStream> Connection<S> {
 		let is_connect = matches!(packet, Packet::Connect(_));
 		if self.connected && is_connect {
 			warn!("second CONNECT received, closing connection");
-			self.send_disconnect(mqtt_v5::DisconnectReasonCode::ProtocolError)
-				.await?;
+			self.send_disconnect(mqtt_v5::DisconnectReasonCode::ProtocolError)?;
 			return Err(Error::new(ErrorKind::InvalidData, "duplicate CONNECT"));
 		}
 		if !self.connected && !is_connect {

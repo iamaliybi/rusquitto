@@ -36,8 +36,7 @@ impl<S: ByteStream> Connection<S> {
 		if let Some(alias) = publish.properties.as_ref().and_then(|p| p.topic_alias) {
 			if alias == 0 || alias > Self::INBOUND_TOPIC_ALIAS_MAX {
 				warn!(alias, "topic alias out of range, disconnecting");
-				self.send_disconnect(mqtt_v5::DisconnectReasonCode::TopicAliasInvalid)
-					.await?;
+				self.send_disconnect(mqtt_v5::DisconnectReasonCode::TopicAliasInvalid)?;
 				return Err(Error::new(ErrorKind::InvalidData, "topic alias invalid"));
 			}
 			if publish.topic.is_empty() {
@@ -45,8 +44,7 @@ impl<S: ByteStream> Connection<S> {
 					Some(topic) => publish.topic = topic.clone(),
 					None => {
 						warn!(alias, "unknown topic alias, disconnecting");
-						self.send_disconnect(mqtt_v5::DisconnectReasonCode::TopicAliasInvalid)
-							.await?;
+						self.send_disconnect(mqtt_v5::DisconnectReasonCode::TopicAliasInvalid)?;
 						return Err(Error::new(ErrorKind::InvalidData, "unknown topic alias"));
 					}
 				}
@@ -60,8 +58,7 @@ impl<S: ByteStream> Connection<S> {
 		// `$SYS`). Anything else is a protocol violation — disconnect.
 		if !valid_publish_topic(&publish.topic) {
 			warn!(topic = %publish.topic, "invalid publish topic, disconnecting");
-			self.send_disconnect(mqtt_v5::DisconnectReasonCode::TopicNameInvalid)
-				.await?;
+			self.send_disconnect(mqtt_v5::DisconnectReasonCode::TopicNameInvalid)?;
 			return Err(Error::new(ErrorKind::InvalidData, "invalid publish topic"));
 		}
 
@@ -89,12 +86,12 @@ impl<S: ByteStream> Connection<S> {
 				QoS::AtLeastOnce => {
 					let mut ack = mqtt_v5::PubAck::new(publish.pkid);
 					ack.reason = mqtt_v5::PubAckReason::NotAuthorized;
-					self.send(|buf| ack.write(buf)).await
+					self.send(|buf| ack.write(buf))
 				}
 				QoS::ExactlyOnce => {
 					let mut rec = mqtt_v5::PubRec::new(publish.pkid);
 					rec.reason = mqtt_v5::PubRecReason::NotAuthorized;
-					self.send(|buf| rec.write(buf)).await
+					self.send(|buf| rec.write(buf))
 				}
 			};
 		}
@@ -119,7 +116,7 @@ impl<S: ByteStream> Connection<S> {
 			QoS::AtLeastOnce => {
 				self.fan_out(msg, Some(&self.client_id)).await;
 				let pkid = publish.pkid;
-				self.send(|buf| mqtt_v5::PubAck::new(pkid).write(buf)).await
+				self.send(|buf| mqtt_v5::PubAck::new(pkid).write(buf))
 			}
 			// Exactly once: store the message and acknowledge receipt with PubRec.
 			// Actual delivery is deferred to PUBREL so it happens exactly once even
@@ -136,8 +133,7 @@ impl<S: ByteStream> Connection<S> {
 						quota = self.limits.max_inflight,
 						"inbound receive maximum exceeded, disconnecting"
 					);
-					self.send_disconnect(mqtt_v5::DisconnectReasonCode::ReceiveMaximumExceeded)
-						.await?;
+					self.send_disconnect(mqtt_v5::DisconnectReasonCode::ReceiveMaximumExceeded)?;
 					return Err(Error::new(
 						ErrorKind::InvalidData,
 						"receive maximum exceeded",
@@ -145,7 +141,7 @@ impl<S: ByteStream> Connection<S> {
 				}
 				let pkid = publish.pkid;
 				self.incoming_qos2.insert(pkid, msg);
-				self.send(|buf| mqtt_v5::PubRec::new(pkid).write(buf)).await
+				self.send(|buf| mqtt_v5::PubRec::new(pkid).write(buf))
 			}
 		}
 	}

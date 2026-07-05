@@ -78,6 +78,16 @@ fn connect_packet(id: &str) -> Packet {
 	Packet::Connect(c)
 }
 
+/// Processes one packet and flushes the coalesced output buffer, exactly as one
+/// event-loop wakeup would, so tests can assert on the emitted wire bytes.
+/// Flushes even when processing errors — mirroring the connection's best-effort
+/// flush on its exit path — so reject responses reach the mock stream too.
+async fn drive(conn: &mut Connection<MockStream>, packet: Packet) -> Result<()> {
+	let result = conn.process_packet(packet).await;
+	conn.flush().await.expect("flush mock stream");
+	result
+}
+
 /// Decodes the single MQTT packet currently sitting in `out`.
 fn decode(out: &Rc<RefCell<Vec<u8>>>) -> Packet {
 	let mut buf = BytesMut::from(&out.borrow()[..]);
@@ -101,7 +111,7 @@ fn connect_handshake_emits_success_connack() {
 		let out = Rc::new(RefCell::new(Vec::new()));
 		let mut conn = make_conn(out.clone());
 
-		conn.process_packet(connect_packet("c1")).await.unwrap();
+		drive(&mut conn, connect_packet("c1")).await.unwrap();
 
 		assert!(conn.connected, "connection marked connected after CONNECT");
 		match decode(&out) {
@@ -119,7 +129,7 @@ fn first_packet_must_be_connect() {
 
 		// A PUBLISH before CONNECT is a protocol violation — the pre-auth bypass guard.
 		let publish = Packet::Publish(Publish::new("a/b", QoS::AtMostOnce, b"x".to_vec()));
-		assert!(conn.process_packet(publish).await.is_err());
+		assert!(drive(&mut conn, publish).await.is_err());
 		assert!(!conn.connected);
 	});
 }
@@ -129,7 +139,7 @@ fn ping_before_connect_is_rejected() {
 	block_on(async {
 		let out = Rc::new(RefCell::new(Vec::new()));
 		let mut conn = make_conn(out.clone());
-		assert!(conn.process_packet(Packet::PingReq).await.is_err());
+		assert!(drive(&mut conn, Packet::PingReq).await.is_err());
 	});
 }
 
@@ -138,11 +148,11 @@ fn second_connect_is_a_protocol_error() {
 	block_on(async {
 		let out = Rc::new(RefCell::new(Vec::new()));
 		let mut conn = make_conn(out.clone());
-		conn.process_packet(connect_packet("c1")).await.unwrap();
+		drive(&mut conn, connect_packet("c1")).await.unwrap();
 		out.borrow_mut().clear();
 
 		// A second CONNECT after a successful one must be refused with DISCONNECT.
-		let err = conn.process_packet(connect_packet("c1")).await;
+		let err = drive(&mut conn, connect_packet("c1")).await;
 		assert!(err.is_err());
 		assert_eq!(
 			disconnect_reason(&out),
@@ -156,10 +166,10 @@ fn ping_after_connect_emits_pingresp() {
 	block_on(async {
 		let out = Rc::new(RefCell::new(Vec::new()));
 		let mut conn = make_conn(out.clone());
-		conn.process_packet(connect_packet("c1")).await.unwrap();
+		drive(&mut conn, connect_packet("c1")).await.unwrap();
 		out.borrow_mut().clear();
 
-		conn.process_packet(Packet::PingReq).await.unwrap();
+		drive(&mut conn, Packet::PingReq).await.unwrap();
 		assert!(matches!(decode(&out), Packet::PingResp));
 	});
 }
@@ -169,12 +179,12 @@ fn reserved_publish_topic_triggers_disconnect() {
 	block_on(async {
 		let out = Rc::new(RefCell::new(Vec::new()));
 		let mut conn = make_conn(out.clone());
-		conn.process_packet(connect_packet("c1")).await.unwrap();
+		drive(&mut conn, connect_packet("c1")).await.unwrap();
 		out.borrow_mut().clear();
 
 		// `$`-prefixed topics are broker-reserved; a client publish to one is invalid.
 		let publish = Packet::Publish(Publish::new("$SYS/hack", QoS::AtMostOnce, b"x".to_vec()));
-		assert!(conn.process_packet(publish).await.is_err());
+		assert!(drive(&mut conn, publish).await.is_err());
 		assert_eq!(
 			disconnect_reason(&out),
 			DisconnectReasonCode::TopicNameInvalid as u8
@@ -187,12 +197,12 @@ fn publish_qos1_is_acknowledged() {
 	block_on(async {
 		let out = Rc::new(RefCell::new(Vec::new()));
 		let mut conn = make_conn(out.clone());
-		conn.process_packet(connect_packet("c1")).await.unwrap();
+		drive(&mut conn, connect_packet("c1")).await.unwrap();
 		out.borrow_mut().clear();
 
 		let mut publish = Publish::new("a/b", QoS::AtLeastOnce, b"hi".to_vec());
 		publish.pkid = 42;
-		conn.process_packet(Packet::Publish(publish)).await.unwrap();
+		drive(&mut conn, Packet::Publish(publish)).await.unwrap();
 
 		match decode(&out) {
 			Packet::PubAck(ack) => assert_eq!(ack.pkid, 42),
@@ -208,12 +218,12 @@ fn rate_limited_publish_still_delivers_within_burst() {
 		// A generous rate: the first publish is within the burst, so no throttle sleep.
 		let limits = LimitsConfig { max_message_rate: 1000, ..LimitsConfig::default() };
 		let mut conn = make_conn_with(out.clone(), limits);
-		conn.process_packet(connect_packet("c1")).await.unwrap();
+		drive(&mut conn, connect_packet("c1")).await.unwrap();
 		out.borrow_mut().clear();
 
 		let mut publish = Publish::new("a/b", QoS::AtLeastOnce, b"hi".to_vec());
 		publish.pkid = 9;
-		conn.process_packet(Packet::Publish(publish)).await.unwrap();
+		drive(&mut conn, Packet::Publish(publish)).await.unwrap();
 
 		match decode(&out) {
 			Packet::PubAck(ack) => assert_eq!(ack.pkid, 9),
@@ -227,12 +237,12 @@ fn subscribe_emits_suback_and_counts_subscription() {
 	block_on(async {
 		let out = Rc::new(RefCell::new(Vec::new()));
 		let mut conn = make_conn(out.clone());
-		conn.process_packet(connect_packet("c1")).await.unwrap();
+		drive(&mut conn, connect_packet("c1")).await.unwrap();
 		out.borrow_mut().clear();
 
 		let mut sub = Subscribe::new("home/+/temp", QoS::AtLeastOnce);
 		sub.pkid = 7;
-		conn.process_packet(Packet::Subscribe(sub)).await.unwrap();
+		drive(&mut conn, Packet::Subscribe(sub)).await.unwrap();
 
 		assert_eq!(conn.subscription_count, 1);
 		match decode(&out) {

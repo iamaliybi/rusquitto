@@ -1,7 +1,6 @@
 //! The outbound delivery path: in-flight window control, cross-shard fan-out,
 //! packet-id allocation, and resend-on-resume.
 
-use bytes::BytesMut;
 use mqttbytes::{
 	QoS,
 	v5::{self as mqtt_v5},
@@ -22,11 +21,11 @@ impl<S: ByteStream> Connection<S> {
 		usize::from(self.peer_receive_max.min(self.limits.max_inflight)).max(1)
 	}
 
-	/// Sends a delivery now if the in-flight window has room (QoS 0 always sends),
-	/// otherwise holds it in the pending queue for later draining. The pending queue
-	/// is bounded: a client that stalls its acks drops its oldest held messages
-	/// rather than growing broker memory without limit.
-	pub(super) async fn deliver(&mut self, delivery: Delivery) -> Result<()> {
+	/// Queues a delivery for the wire now if the in-flight window has room (QoS 0
+	/// always sends), otherwise holds it in the pending queue for later draining.
+	/// The pending queue is bounded: a client that stalls its acks drops its
+	/// oldest held messages rather than growing broker memory without limit.
+	pub(super) fn deliver(&mut self, delivery: Delivery) -> Result<()> {
 		if delivery.qos == QoS::AtMostOnce || self.inflight.len() < self.outbound_window() {
 			self.send_publish(
 				&delivery.publish,
@@ -34,7 +33,6 @@ impl<S: ByteStream> Connection<S> {
 				delivery.retain,
 				&delivery.sub_ids,
 			)
-			.await
 		} else {
 			if self.pending_outbound.len() >= PENDING_OUTBOUND_LIMIT {
 				self.pending_outbound.pop_front();
@@ -46,7 +44,7 @@ impl<S: ByteStream> Connection<S> {
 
 	/// Releases held-back messages up to the in-flight window; called after an
 	/// acknowledgement frees a slot.
-	pub(super) async fn drain_pending(&mut self) -> Result<()> {
+	pub(super) fn drain_pending(&mut self) -> Result<()> {
 		while self.inflight.len() < self.outbound_window() {
 			let Some(delivery) = self.pending_outbound.pop_front() else {
 				break;
@@ -56,8 +54,12 @@ impl<S: ByteStream> Connection<S> {
 				delivery.qos,
 				delivery.retain,
 				&delivery.sub_ids,
-			)
-			.await?;
+			)?;
+		}
+		// A fully drained hold queue releases its burst-sized ring, so a client
+		// that once stalled behind a deep backlog doesn't pin that memory forever.
+		if self.pending_outbound.is_empty() && self.pending_outbound.capacity() > 64 {
+			self.pending_outbound = VecDeque::new();
 		}
 		Ok(())
 	}
@@ -95,8 +97,9 @@ impl<S: ByteStream> Connection<S> {
 		self.state.borrow_mut().deliver_local(message, publisher);
 	}
 
-	/// Delivers a routed message to this client at the given effective QoS and
-	/// retain flag.
+	/// Queues a routed message for this client at the given effective QoS and
+	/// retain flag (the coalesced output buffer reaches the wire at the next
+	/// event-loop flush).
 	///
 	/// QoS 0 is fire-and-forget. QoS 1/2 are assigned a fresh packet id, recorded
 	/// in the in-flight window, and delivered with their QoS set; the rest of the
@@ -104,7 +107,7 @@ impl<S: ByteStream> Connection<S> {
 	/// `retain` is decided by the caller (set for a retained replay or a
 	/// Retain-As-Published subscriber, cleared for ordinary live fan-out). `sub_ids`
 	/// are the Subscription Identifiers to echo to the client.
-	pub(super) async fn send_publish(
+	pub(super) fn send_publish(
 		&mut self,
 		publish: &mqtt_v5::Publish,
 		qos: QoS,
@@ -156,21 +159,29 @@ impl<S: ByteStream> Connection<S> {
 			}
 		};
 
-		let mut buf = BytesMut::new();
-		message
-			.write(&mut buf)
-			.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+		// Encode straight into the coalesced output buffer; on failure, roll the
+		// partial bytes back so the batch stays well-formed.
+		let start = self.out.len();
+		if let Err(e) = message.write(&mut self.out) {
+			self.out.truncate(start);
+			if let Some(pkid) = pkid {
+				self.inflight.remove(&pkid);
+			}
+			return Err(Error::new(ErrorKind::InvalidData, e.to_string()));
+		}
 
 		// The client's Maximum Packet Size is a hard ceiling: we must not send a
-		// larger packet. Drop it (rolling back the in-flight slot so it doesn't
-		// wedge the window) — it can never be delivered to this client.
+		// larger packet. Drop it (rolling back the encoded bytes and the in-flight
+		// slot so it doesn't wedge the window) — it can never be delivered.
+		let written = self.out.len() - start;
 		if let Some(max) = self.peer_max_packet_size
-			&& buf.len() as u64 > u64::from(max)
+			&& written as u64 > u64::from(max)
 		{
 			warn!(
-				size = buf.len(),
+				size = written,
 				max, "outbound publish exceeds client max packet size, dropping"
 			);
+			self.out.truncate(start);
 			if let Some(pkid) = pkid {
 				self.inflight.remove(&pkid);
 			}
@@ -178,7 +189,7 @@ impl<S: ByteStream> Connection<S> {
 		}
 
 		self.metrics.message_sent(message.payload.len());
-		self.stream.write_all(&buf).await
+		Ok(())
 	}
 
 	/// Records an outbound QoS 1/2 message in the in-flight window, keeping a copy
@@ -204,13 +215,20 @@ impl<S: ByteStream> Connection<S> {
 
 	/// Restores message flow on a resumed session: first retransmit the unacked
 	/// in-flight QoS 1/2 messages (with the DUP flag, reusing their packet ids),
-	/// then deliver everything buffered while the client was offline.
+	/// then deliver everything buffered while the client was offline. Everything
+	/// is encoded into the coalesced output buffer, flushing periodically so a
+	/// deep backlog can't balloon it.
 	pub(super) async fn resume_delivery(&mut self, offline_queue: VecDeque<Delivery>) -> Result<()> {
-		// Encode the retransmissions before writing, so we don't hold a borrow of
-		// `self.inflight` across the await points.
-		let mut packets: Vec<BytesMut> = Vec::with_capacity(self.inflight.len());
+		if !self.inflight.is_empty() {
+			debug!(
+				count = self.inflight.len(),
+				"retransmitting in-flight messages"
+			);
+		}
+		// Direct field borrows keep `self.inflight` (shared) and `self.out`
+		// (mutable) disjoint, so no intermediate per-packet buffers are needed.
+		let out = &mut self.out;
 		for (pkid, entry) in &self.inflight {
-			let mut buf = BytesMut::new();
 			match entry.state {
 				// Message not yet acknowledged: resend the PUBLISH marked DUP.
 				InflightState::Qos1 | InflightState::Qos2Pending => {
@@ -218,24 +236,19 @@ impl<S: ByteStream> Connection<S> {
 					publish.pkid = *pkid;
 					publish.dup = true;
 					publish
-						.write(&mut buf)
+						.write(out)
 						.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
 				}
 				// PUBLISH already acknowledged via PUBREC: resume at PUBREL.
 				InflightState::Qos2Released => {
 					mqtt_v5::PubRel::new(*pkid)
-						.write(&mut buf)
+						.write(out)
 						.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
 				}
 			}
-			packets.push(buf);
 		}
-
-		if !packets.is_empty() {
-			debug!(count = packets.len(), "retransmitting in-flight messages");
-			for buf in packets {
-				self.stream.write_all(&buf).await?;
-			}
+		if self.out.len() >= super::FLUSH_THRESHOLD {
+			self.flush().await?;
 		}
 
 		// Deliver messages that arrived while the session was suspended; each gets
@@ -243,7 +256,10 @@ impl<S: ByteStream> Connection<S> {
 		if !offline_queue.is_empty() {
 			debug!(count = offline_queue.len(), "flushing offline queue");
 			for delivery in offline_queue {
-				self.deliver(delivery).await?;
+				self.deliver(delivery)?;
+				if self.out.len() >= super::FLUSH_THRESHOLD {
+					self.flush().await?;
+				}
 			}
 		}
 
