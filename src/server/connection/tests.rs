@@ -2,9 +2,10 @@
 //!
 //! These drive a [`Connection`] over an in-memory [`MockStream`] — the payoff of
 //! the [`ByteStream`] abstraction: the full MQTT logic is exercised with no
-//! sockets. Being a child module, the tests reach the private `process_packet`
-//! entry point directly and assert on both the emitted wire bytes and internal
-//! state, without standing up the racing event loop.
+//! sockets. Being a child module, the tests reach the private `process_one`
+//! entry point directly (via `drive`, which encodes the packet into the
+//! assembly buffer like a socket would) and assert on both the emitted wire
+//! bytes and internal state, without standing up the racing event loop.
 
 use super::*;
 use crate::auth::Authenticator;
@@ -78,14 +79,39 @@ fn connect_packet(id: &str) -> Packet {
 	Packet::Connect(c)
 }
 
-/// Processes one packet and flushes the coalesced output buffer, exactly as one
-/// event-loop wakeup would, so tests can assert on the emitted wire bytes.
-/// Flushes even when processing errors — mirroring the connection's best-effort
-/// flush on its exit path — so reject responses reach the mock stream too.
+/// Serializes any v5 packet to its wire bytes (the parse/dispatch seam is one
+/// function now, so tests feed the assembly buffer exactly like a socket would).
+fn encode_packet(packet: &Packet, buf: &mut BytesMut) {
+	let r = match packet {
+		Packet::Connect(p) => p.write(buf),
+		Packet::ConnAck(p) => p.write(buf),
+		Packet::Publish(p) => p.write(buf),
+		Packet::PubAck(p) => p.write(buf),
+		Packet::PubRec(p) => p.write(buf),
+		Packet::PubRel(p) => p.write(buf),
+		Packet::PubComp(p) => p.write(buf),
+		Packet::Subscribe(p) => p.write(buf),
+		Packet::SubAck(p) => p.write(buf),
+		Packet::Unsubscribe(p) => p.write(buf),
+		Packet::UnsubAck(p) => p.write(buf),
+		Packet::PingReq => mqtt_v5::PingReq.write(buf),
+		Packet::PingResp => mqtt_v5::PingResp.write(buf),
+		Packet::Disconnect(p) => p.write(buf),
+	};
+	r.expect("encode test packet");
+}
+
+/// Feeds one packet through the parse-and-process seam and flushes the
+/// coalesced output buffer, exactly as one event-loop wakeup would, so tests
+/// can assert on the emitted wire bytes. Flushes even when processing errors —
+/// mirroring the connection's best-effort flush on its exit path — so reject
+/// responses reach the mock stream too.
 async fn drive(conn: &mut Connection<MockStream>, packet: Packet) -> Result<()> {
-	let result = conn.process_packet(packet).await;
+	let max_packet = conn.limits.max_payload_size;
+	encode_packet(&packet, &mut conn.buffer);
+	let result = conn.process_one(max_packet).await;
 	conn.flush().await.expect("flush mock stream");
-	result
+	result.map(|processed| assert!(processed, "test packet must parse completely"))
 }
 
 /// Decodes the single MQTT packet currently sitting in `out`.
@@ -405,12 +431,16 @@ fn no_local_on_shared_subscription_is_rejected() {
 
 /// Diagnostic, not a regression test (hence ignored): prints the size of every
 /// future in the connection state machine — the numbers behind the memory work
-/// in v1.6.0. Run with `cargo test probe_future_tree -- --ignored --nocapture`.
-/// Findings as of 1.6.x: run() ≈ 3.3 KiB, dominated by process_packet (2.4 KiB)
-/// → handle_publish (1.6 KiB) → fan_out (1.2 KiB), which hold several
+/// in 1.6.x. Run with `cargo test probe_future_tree -- --ignored --nocapture`.
+///
+/// History: pre-diet, run() was ≈ 3.3 KiB via process_packet (2.4 KiB) →
+/// handle_publish (1.6 KiB) → fan_out (1.2 KiB), holding several
 /// `Publish`-sized (208 B) slots. Source-level slot elimination (in-place
-/// transforms, by-ref passing) does NOT shrink the machine — rustc allocates
-/// slots conservatively — so further reduction needs structural change.
+/// transforms, by-ref passing) did NOT shrink the machine — rustc allocates
+/// await-spanning slots conservatively. What worked was *boxing through
+/// plain-fn seams*: the cold mesh-backpressure send, the throttle sleep, and
+/// the PUBLISH/PUBREL/CONNECT handler arms — bringing run() to ≈ 0.6 KiB.
+/// Watch these numbers when touching the event loop or handlers.
 #[test]
 #[ignore]
 fn probe_future_tree() {
@@ -430,8 +460,8 @@ fn probe_future_tree() {
 		let f = conn.event_loop();
 		println!("event_loop():           {}", size_of_val(&f));
 		drop(f);
-		let f = conn.process_packet(Packet::PingReq);
-		println!("process_packet():       {}", size_of_val(&f));
+		let f = conn.process_one(1 << 20);
+		println!("process_one():          {}", size_of_val(&f));
 		drop(f);
 		let publish = Publish::new("t", QoS::AtLeastOnce, b"x".to_vec());
 		let f = conn.handle_publish(publish.clone());

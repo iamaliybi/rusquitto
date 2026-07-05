@@ -198,6 +198,8 @@ impl ShardState {
 			.sessions
 			.remove(client_id)
 			.expect("extract_session called for a client without a session");
+		// Suspended sessions carry their durable state boxed; absent means empty.
+		let snapshot = session.snapshot.map(|b| *b).unwrap_or_default();
 		let offline = session
 			.offline_queue
 			.into_iter()
@@ -206,9 +208,9 @@ impl ShardState {
 
 		MigratedSession {
 			subscriptions,
-			inflight: session.snapshot.inflight,
-			incoming_qos2: session.snapshot.incoming_qos2,
-			next_pkid: session.snapshot.next_pkid,
+			inflight: snapshot.inflight,
+			incoming_qos2: snapshot.incoming_qos2,
+			next_pkid: snapshot.next_pkid,
 			offline,
 		}
 	}

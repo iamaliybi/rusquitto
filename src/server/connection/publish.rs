@@ -14,6 +14,12 @@ use crate::protocol::valid_publish_topic;
 use crate::telemetry::logging::redact;
 use crate::transport::ByteStream;
 
+/// Boxes a throttle sleep on a plain stack frame (see the call site): the timer
+/// future is heap-allocated only while a publisher is actually being paced.
+fn boxed_sleep(wait: Duration) -> std::pin::Pin<Box<impl std::future::Future<Output = ()>>> {
+	Box::pin(glommio::timer::sleep(wait))
+}
+
 impl<S: ByteStream> Connection<S> {
 	pub(super) async fn handle_publish(&mut self, mut publish: mqtt_v5::Publish) -> Result<()> {
 		// Per-connection PUBLISH throttle: reserve a token before doing any routing
@@ -27,7 +33,9 @@ impl<S: ByteStream> Connection<S> {
 			None => Duration::ZERO,
 		};
 		if !wait.is_zero() {
-			glommio::timer::sleep(wait).await;
+			// Throttled — the cold path. Boxed so the timer future doesn't hold a
+			// permanent slot in every connection's state machine.
+			boxed_sleep(wait).await;
 		}
 
 		// Resolve an inbound topic alias (MQTT 5) before anything else reads the

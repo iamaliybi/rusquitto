@@ -155,7 +155,9 @@ pub struct Connection<S: ByteStream> {
 	/// The client's Will Message (from CONNECT), pre-built as a `Publish` ready
 	/// to fan out. Published when the connection ends abnormally; cleared by a
 	/// normal DISCONNECT so it is suppressed. `None` when no will was set.
-	will: Option<mqtt_v5::Publish>,
+	/// Boxed: a will is rare, and inline it would put a `Publish`-sized
+	/// (~208 B) field in every connection.
+	will: Option<Box<mqtt_v5::Publish>>,
 	/// The client's Receive Maximum (CONNECT): the most unacknowledged QoS 1/2
 	/// PUBLISHes we may have in flight to it at once. Defaults to 65535.
 	peer_receive_max: u16,
@@ -365,12 +367,12 @@ impl<S: ByteStream> Connection<S> {
 					debug!(topic = %will.topic, "publishing will message");
 					// Broker-originated, so no publisher for No Local. Reuses the
 					// reliable forward path (QoS > 0 wills apply mesh backpressure).
-					self.fan_out(will, None).await;
+					self.fan_out(*will, None).await;
 				} else {
 					debug!(topic = %will.topic, delay, "arming delayed will message");
 					self.state
 						.borrow_mut()
-						.arm_will(&self.client_id, self.session_generation, will, delay);
+						.arm_will(&self.client_id, self.session_generation, *will, delay);
 				}
 			}
 		}
@@ -400,11 +402,17 @@ impl<S: ByteStream> Connection<S> {
 	async fn event_loop(&mut self) -> Result<()> {
 		let max_packet = self.limits.max_payload_size;
 		loop {
-			// Drain: every complete packet already buffered.
-			while let Some(packet) = Self::parse_packet(&mut self.buffer, max_packet)? {
-				if let Err(e) = self.process_packet(packet).await {
-					warn!(error = %e, "protocol/io error, closing connection");
-					return Ok(());
+			// Drain: every complete packet already buffered. Parsing and dispatch
+			// share one function (and thus one `Packet`-sized slot, ~384 bytes) —
+			// a separate parse-here-dispatch-there split would hold two.
+			loop {
+				match self.process_one(max_packet).await {
+					Ok(true) => {}
+					Ok(false) => break, // need more bytes
+					Err(e) => {
+						warn!(error = %e, "protocol/io error, closing connection");
+						return Ok(());
+					}
 				}
 				// Any inbound packet refreshes the keep-alive deadline.
 				if let Some(window) = self.keepalive {
@@ -560,7 +568,21 @@ impl<S: ByteStream> Connection<S> {
 		}
 	}
 
-	async fn process_packet(&mut self, packet: Packet) -> Result<()> {
+	/// Parses one complete packet from the assembly buffer and processes it.
+	/// `Ok(false)` means the buffer needs more bytes for a complete packet.
+	///
+	/// Parse and dispatch live in one function so a packet occupies one
+	/// `Packet`-sized slot in the connection's state machine, and the handler
+	/// futures large enough to matter — CONNECT (auth, claim/migration, resume),
+	/// PUBLISH (fan-out), and PUBREL (the deferred QoS 2 fan-out) — are boxed
+	/// through plain-fn seams: one small allocation per such packet buys those
+	/// kilobytes out of every connection's *resident* memory. The remaining
+	/// inline arms are tiny (acks and pings are effectively synchronous).
+	async fn process_one(&mut self, max_packet: usize) -> Result<bool> {
+		let Some(packet) = Self::parse_packet(&mut self.buffer, max_packet)? else {
+			return Ok(false);
+		};
+
 		// Enforce the CONNECT handshake ordering: the first packet must be a CONNECT,
 		// and exactly one CONNECT is allowed. This closes the pre-auth bypass where a
 		// client could PUBLISH/SUBSCRIBE before (or without) authenticating.
@@ -576,13 +598,9 @@ impl<S: ByteStream> Connection<S> {
 		}
 
 		match packet {
-			// Client -> Server Requests. The CONNECT arm is boxed: it is by far
-			// the largest handler future (auth, session claim/migration, resume),
-			// and inlined it would size *every* connection task for its worst
-			// case. Boxed, it costs one transient allocation during the handshake
-			// and the steady-state task stays small.
-			Packet::Connect(connect) => Box::pin(self.handle_connect(connect)).await,
-			Packet::Publish(publish) => self.handle_publish(publish).await,
+			// Client -> Server Requests
+			Packet::Connect(connect) => self.boxed_handle_connect(connect).await,
+			Packet::Publish(publish) => self.boxed_handle_publish(publish).await,
 			Packet::Subscribe(subscribe) => self.handle_subscribe(subscribe).await,
 			Packet::Unsubscribe(unsubscribe) => self.handle_unsubscribe(unsubscribe).await,
 			Packet::PingReq => self.handle_ping().await,
@@ -591,7 +609,7 @@ impl<S: ByteStream> Connection<S> {
 			// QoS 1 & 2 Flows (Client Responses)
 			Packet::PubAck(puback) => self.handle_puback(puback).await,
 			Packet::PubRec(pubrec) => self.handle_pubrec(pubrec).await,
-			Packet::PubRel(pubrel) => self.handle_pubrel(pubrel).await,
+			Packet::PubRel(pubrel) => self.boxed_handle_pubrel(pubrel).await,
 			Packet::PubComp(pubcomp) => self.handle_pubcomp(pubcomp).await,
 
 			// Server-only packets — a client must never send these.
@@ -600,5 +618,30 @@ impl<S: ByteStream> Connection<S> {
 				Ok(())
 			}
 		}
+		.map(|()| true)
+	}
+
+	/// Boxes the CONNECT handler on a plain stack frame (see [`process_one`]).
+	fn boxed_handle_connect(
+		&mut self,
+		connect: mqtt_v5::Connect,
+	) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<()>> + '_>> {
+		Box::pin(self.handle_connect(connect))
+	}
+
+	/// Boxes the PUBLISH handler on a plain stack frame (see [`process_one`]).
+	fn boxed_handle_publish(
+		&mut self,
+		publish: mqtt_v5::Publish,
+	) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<()>> + '_>> {
+		Box::pin(self.handle_publish(publish))
+	}
+
+	/// Boxes the PUBREL handler on a plain stack frame (see [`process_one`]).
+	fn boxed_handle_pubrel(
+		&mut self,
+		pubrel: mqtt_v5::PubRel,
+	) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<()>> + '_>> {
+		Box::pin(self.handle_pubrel(pubrel))
 	}
 }

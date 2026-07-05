@@ -15,18 +15,16 @@ via boxed transport pipelines), `malloc_trim` on the maintenance tick,
 `[server] socket_recv_buffer`/`socket_send_buffer`, and a
 `rusquitto-aarch64-unknown-linux-gnu` release asset via `cargo zigbuild`.
 
+**Sub-4-KiB idle connections: DONE** (2026-07-05, on the
+`feat/connection-future-diet` branch): 3.9 KiB RSS/conn, via cold-path and
+hot-arm boxing of the connection state machine (`run()` 3312 → 624 B) plus
+boxing rare/suspended-only data out of `Connection` and the sessions table.
+The remaining floor is glommio per-connection internals (~1.7 KiB task +
+stream/source allocations) — going lower means changes inside glommio.
+
 ## Candidate future work (nothing committed)
 
 Ideas noted along the way, in rough value order — none is planned or promised:
-
-- **Sub-4-KiB idle connections** — the remaining footprint is the connection
-  state machine (~4.5 KiB boxed: `run()` 3.3 KiB + `Connection` 880 B) plus
-  session/channel bookkeeping. **Probed and found resistant to source-level
-  surgery** (see `probe_future_tree` in `connection/tests.rs`): eliminating
-  `Publish` slots at the source did not shrink the machine — rustc allocates
-  await-spanning slots conservatively. A real reduction means a hand-rolled
-  (non-async) state machine for the hot loop, or waiting on rustc layout
-  improvements. `examples/allocprobe.rs` + the probe test measure it.
 - **Session/queued-message WAL** — persistence is snapshot-based; a
   write-ahead log would close the crash window (`snapshot_interval`).
 - **mTLS** (client-certificate authentication) and certificate hot-reload.

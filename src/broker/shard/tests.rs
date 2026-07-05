@@ -27,7 +27,7 @@ fn arm(state: &mut ShardState, client: &str) {
 			mailbox: None,
 			expires_at: None,
 			generation: 1,
-			snapshot: SessionSnapshot::default(),
+			snapshot: None,
 			offline_queue: VecDeque::new(),
 			pending_will: None,
 		},
@@ -241,10 +241,10 @@ fn shed_connections_respects_the_batch_size() {
 fn sweep_fires_due_delayed_will_and_reaps_expired_session() {
 	let mut s = ShardState::default();
 	arm(&mut s, "willed");
-	s.sessions.get_mut("willed").unwrap().pending_will = Some((
+	s.sessions.get_mut("willed").unwrap().pending_will = Some(Box::new((
 		pubm("will/topic", QoS::AtLeastOnce, b"bye", false),
 		Instant::now(),
-	));
+	)));
 
 	arm(&mut s, "gone");
 	s.subscribe(
@@ -282,7 +282,7 @@ fn persist_then_load_restores_a_full_suspended_session() {
 			mailbox: None,
 			expires_at: Some(now + Duration::from_secs(3600)),
 			generation: 7,
-			snapshot: SessionSnapshot {
+			snapshot: Some(Box::new(SessionSnapshot {
 				inflight: HashMap::from([(
 					5,
 					InflightMessage {
@@ -292,7 +292,7 @@ fn persist_then_load_restores_a_full_suspended_session() {
 				)]),
 				incoming_qos2: HashMap::from([(9, pubm("in/9", QoS::ExactlyOnce, b"i9", false))]),
 				next_pkid: 42,
-			},
+			})),
 			offline_queue: VecDeque::new(),
 			pending_will: None,
 		},
@@ -324,14 +324,15 @@ fn persist_then_load_restores_a_full_suspended_session() {
 	assert!(session.mailbox.is_none(), "restored session is suspended");
 	assert!(session.expires_at.is_some(), "finite expiry restored");
 
-	// Durable QoS state round-trips exactly.
-	assert_eq!(session.snapshot.next_pkid, 42);
-	assert!(matches!(
-		session.snapshot.inflight[&5].state,
-		InflightState::Qos1
-	));
-	assert_eq!(session.snapshot.inflight[&5].publish.topic, "out/5");
-	assert_eq!(session.snapshot.incoming_qos2[&9].topic, "in/9");
+	// Durable QoS state round-trips exactly (boxed while suspended).
+	let snapshot = session
+		.snapshot
+		.as_ref()
+		.expect("suspended snapshot present");
+	assert_eq!(snapshot.next_pkid, 42);
+	assert!(matches!(snapshot.inflight[&5].state, InflightState::Qos1));
+	assert_eq!(snapshot.inflight[&5].publish.topic, "out/5");
+	assert_eq!(snapshot.incoming_qos2[&9].topic, "in/9");
 
 	// Offline queue round-trips (payload + sub ids preserved).
 	let q = offline(&dst, "psess");
