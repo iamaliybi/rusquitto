@@ -47,6 +47,10 @@ rustls-pemfile = "2"
 [dev-dependencies]
 # Self-signed certificate generation for the TLS handshake tests.
 rcgen = "0.14.8"
+# Raw io_uring for the `park_probe` example only: measures the memory floor of an
+# idle connection parked on a shared readiness ring (no per-connection task), the
+# feasibility spike for connection-density work. Not used by the broker itself.
+io-uring = "0.7"
 
 # The stress hammer lives under stress/ (dependency-free, also builds with a bare
 # `rustc`), but is registered as an example so `cargo clippy`/`fmt`/CI cover it.

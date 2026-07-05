@@ -48,8 +48,15 @@ impl<S: ByteStream> Connection<S> {
 				return Err(Error::new(ErrorKind::InvalidData, "topic alias invalid"));
 			}
 			if publish.topic.is_empty() {
-				match self.inbound_aliases.get(&alias) {
-					Some(topic) => publish.topic = topic.clone(),
+				// Resolve to an owned topic first so the alias-table borrow ends before
+				// the error path touches `self` (send_disconnect).
+				match self
+					.aliases
+					.as_ref()
+					.and_then(|a| a.inbound.get(&alias))
+					.cloned()
+				{
+					Some(topic) => publish.topic = topic,
 					None => {
 						warn!(alias, "unknown topic alias, disconnecting");
 						self.send_disconnect(mqtt_v5::DisconnectReasonCode::TopicAliasInvalid)?;
@@ -57,7 +64,9 @@ impl<S: ByteStream> Connection<S> {
 					}
 				}
 			} else {
-				self.inbound_aliases.insert(alias, publish.topic.clone());
+				self.aliases_mut()
+					.inbound
+					.insert(alias, publish.topic.clone());
 			}
 		}
 

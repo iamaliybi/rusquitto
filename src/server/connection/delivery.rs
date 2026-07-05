@@ -195,15 +195,23 @@ impl<S: ByteStream> Connection<S> {
 		// connection (whose alias table starts empty) still carries the full topic.
 		let mut newly_aliased: Option<String> = None;
 		if self.peer_topic_alias_max > 0 {
-			if let Some(&alias) = self.outbound_aliases.get(&message.topic) {
+			let existing = self
+				.aliases
+				.as_ref()
+				.and_then(|a| a.outbound.get(&message.topic))
+				.copied();
+			let assigned = self.aliases.as_ref().map_or(0, |a| a.outbound.len()) as u16;
+			if let Some(alias) = existing {
 				message
 					.properties
 					.get_or_insert_with(empty_publish_properties)
 					.topic_alias = Some(alias);
 				message.topic.clear();
-			} else if (self.outbound_aliases.len() as u16) < self.peer_topic_alias_max {
-				let alias = self.outbound_aliases.len() as u16 + 1;
-				self.outbound_aliases.insert(message.topic.clone(), alias);
+			} else if assigned < self.peer_topic_alias_max {
+				let alias = assigned + 1;
+				self.aliases_mut()
+					.outbound
+					.insert(message.topic.clone(), alias);
 				message
 					.properties
 					.get_or_insert_with(empty_publish_properties)
@@ -221,8 +229,10 @@ impl<S: ByteStream> Connection<S> {
 			if let Some(pkid) = pkid {
 				self.inflight.remove(&pkid);
 			}
-			if let Some(topic) = &newly_aliased {
-				self.outbound_aliases.remove(topic);
+			if let Some(topic) = &newly_aliased
+				&& let Some(a) = self.aliases.as_mut()
+			{
+				a.outbound.remove(topic);
 			}
 			return Err(Error::new(ErrorKind::InvalidData, e.to_string()));
 		}
@@ -243,8 +253,10 @@ impl<S: ByteStream> Connection<S> {
 			if let Some(pkid) = pkid {
 				self.inflight.remove(&pkid);
 			}
-			if let Some(topic) = &newly_aliased {
-				self.outbound_aliases.remove(topic);
+			if let Some(topic) = &newly_aliased
+				&& let Some(a) = self.aliases.as_mut()
+			{
+				a.outbound.remove(topic);
 			}
 			return Ok(());
 		}

@@ -109,6 +109,17 @@ enum Event {
 	Timeout,
 }
 
+/// Lazily-allocated inbound and outbound topic-alias tables (MQTT 5). Kept behind
+/// an `Option<Box<…>>` on the connection so the idle/non-aliasing common case
+/// holds no `HashMap`s — see the `aliases` field.
+#[derive(Default)]
+struct AliasTables {
+	/// Alias → topic, for aliases the client registered on its inbound PUBLISHes.
+	inbound: HashMap<u16, String>,
+	/// Topic → alias, for aliases we assigned on the PUBLISHes we send this client.
+	outbound: HashMap<String, u16>,
+}
+
 pub struct Connection<S: ByteStream> {
 	stream: S,
 	inbound: BytesMut,
@@ -181,20 +192,16 @@ pub struct Connection<S: ByteStream> {
 	/// seconds after an abnormal disconnect (capped by the session expiry), or
 	/// immediately when 0. See [`ShardState::arm_will`].
 	will_delay: u32,
-	/// Inbound topic-alias table (MQTT 5): maps an alias the client has registered
-	/// (by sending a PUBLISH with both a topic and an alias) to its topic, so later
-	/// PUBLISHes may carry the alias with an empty topic.
-	inbound_aliases: HashMap<u16, String>,
 	/// The client's Topic Alias Maximum (CONNECT): how many aliases we may assign
 	/// on the publishes we send it. `0` (the default when absent) disables
 	/// outbound aliasing entirely.
 	peer_topic_alias_max: u16,
-	/// Outbound topic-alias table: topics we have registered an alias for on this
-	/// connection. Once a topic is here, its publishes carry the alias with an
-	/// empty topic name, shrinking every repeat on the wire. Lazy — allocates
-	/// nothing for clients that never receive a publish. Bounded by
-	/// `min(peer_topic_alias_max, OUTBOUND_TOPIC_ALIAS_MAX)`.
-	outbound_aliases: HashMap<String, u16>,
+	/// Inbound + outbound topic-alias tables (MQTT 5), boxed and **absent until the
+	/// connection actually uses aliasing**: a client that never registers an inbound
+	/// alias and is never assigned an outbound one pays 8 bytes here, not two
+	/// `HashMap`s. Topic aliasing is a wire-size optimization, so this lazy path
+	/// costs the idle/non-aliasing common case nothing. See [`AliasTables`].
+	aliases: Option<Box<AliasTables>>,
 	/// Set once a valid CONNECT has been accepted. Every other packet type is a
 	/// protocol violation before this, and a second CONNECT is a violation after.
 	connected: bool,
@@ -284,9 +291,8 @@ impl<S: ByteStream> Connection<S> {
 			counted: false,
 			shutdown,
 			will_delay: 0,
-			inbound_aliases: HashMap::new(),
 			peer_topic_alias_max: 0,
-			outbound_aliases: HashMap::new(),
+			aliases: None,
 			connected: false,
 			tls_verified,
 			// Bound the pre-CONNECT handshake so an idle socket can't hold a slot.
@@ -331,6 +337,12 @@ impl<S: ByteStream> Connection<S> {
 		let mut disconnect = mqtt_v5::Disconnect::new();
 		disconnect.reason_code = reason;
 		self.send(|buf| disconnect.write(buf))
+	}
+
+	/// Mutable access to the topic-alias tables, allocating the box on first use
+	/// (the first alias this connection registers or is assigned).
+	fn aliases_mut(&mut self) -> &mut AliasTables {
+		self.aliases.get_or_insert_with(Box::default)
 	}
 
 	/// Releases oversized buffer allocations once they empty, so one burst (a
