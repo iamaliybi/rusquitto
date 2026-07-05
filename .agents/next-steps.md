@@ -60,6 +60,18 @@ These are settled product decisions, not backlog:
   is taken only when outbound aliasing could clear the topic; otherwise the
   message is moved into the in-flight table after a successful write.
 
+## Shipped in v1.9.1
+
+Investigated the two remaining audit *performance* items and **measured both at
+their floor** — no application-level headroom (see the closed items below). The
+release ships the genuine robustness/cleanup the investigation surfaced:
+
+- **`TCP_NODELAY` explicit per accepted socket** — a portability guarantee for the
+  latency-critical option instead of relying on kernel inheritance from the
+  listener.
+- **Single-shard fan-out skip** — `fan_out` no longer clones the (absent)
+  peer-senders handle or runs the self-only loop when there are no peers.
+
 ## Open weaknesses & review targets
 
 None is committed; this is the honest list of where we are weak, in rough value
@@ -100,7 +112,7 @@ From the v1.7.0 audit + benchmark:
    delivered a readiness completion naming their connection, and glommio streams
    expose `IntoRawFd`/`FromRawFd` so the fd hand-off works.
 
-   **Staged build (the real project, ~v1.9.0):**
+   **Staged build (the real project — a dedicated future minor):**
    - *Phase 1* — per-shard readiness ring: a raw io_uring for parked fds (glommio
      doesn't expose its `POLL_ADD`), driven by one glommio task awaiting the
      ring's eventfd. Plain-TCP only at first (TLS/WS carry mid-stream state).
@@ -116,24 +128,19 @@ From the v1.7.0 audit + benchmark:
 
    Risk: high (a second io_uring ring cooperating with glommio's reactor, plus the
    egress-wake correctness). Gate each phase on the `alloc_probe`/battery numbers.
-2. **Per-core parity on the ack-bound path — low headroom.** Single-shard QoS 1 is
-   ~76k msg/s vs Mosquitto's ~83k. The audit's gap is the *publisher-ack*
-   microbench (no delivery): parse-bound (`mqttbytes`) plus one boxed handler
-   alloc per publish — and that box is what keeps idle memory low, so removing it
-   would regress §1. v1.9.0 cut a `Publish` clone from the *delivery* path (helps
-   fan-out, not the pure-ack bench). What remains is a parser + memory/CPU
-   trade-off, not a clear win. **Measured at floor (v1.9.1):** single-shard QoS 1
-   request-response is **55 µs p50 / 76 µs p90**, and `TCP_NODELAY` is already
-   effective (now set explicitly per-connection) — the per-request cost is
-   `mqttbytes` parse + the socket round-trip, at parity with a mature C broker. No
-   application-level headroom.
-3. **Cross-shard single-message latency (~50 µs p50) — residual.** v1.9.0's
-   batch-drain cut the CPU and tail latency of cross-shard *bursts*, but a single
-   forwarded message's p50 is bounded by one cross-thread reactor wake
-   (glommio-internal). v1.9.1 made `TCP_NODELAY` explicit so the delivery write
-   isn't Nagle-exposed, but the mesh-hop delta itself has no application-level
-   lever — trimming it needs a faster mesh wakeup (below glommio) or
-   topology-aware subscriber placement.
+
+**§1 is the only open performance weakness with headroom.** The audit's other two
+— per-core ack-bound parity and cross-shard single-message latency — are **closed
+as measured-at-floor** (v1.9.1):
+
+- *Ack-bound path:* single-shard QoS 1 request-response is **55 µs p50 / 76 µs
+  p90**, `TCP_NODELAY` confirmed effective — the per-request cost is `mqttbytes`
+  parse + the socket round-trip, at parity with a mature C broker.
+- *Cross-shard single-message latency:* the ~50 µs tax is one glommio-internal
+  cross-thread reactor wake.
+
+Neither has an application-level lever; both fold into §1's below-glommio work (a
+faster mesh wakeup / the parked-connection tier) if ever pursued.
 
 The audit found **no race conditions and no memory leaks** — the shared-nothing
 model makes intra-shard data races structurally impossible, and RSS returns to
