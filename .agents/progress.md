@@ -584,3 +584,50 @@ GOTCHA reconfirmed hard this session: backticks inside a double-quoted
 wsl bash -lc "..." get command-substituted even around a single-quoted heredoc
 delimiter. Use the Write/Edit tools for any content with backticks, never inline
 python heredocs with backtick-containing strings.
+
+## Phase 9 — Session WAL + mutual TLS (2026-07-05, v1.8.0)
+
+Durability + transport-security release. 96 tests, clippy -D warnings clean;
+three features validated with live brokers, not just unit tests.
+
+- **Partial-frame stall guard** (the audit's 15th adversarial case). The 15th
+  was a header-only truncated CONNECT (`0x10 0x0A`): a complete fixed header
+  claiming 10 body bytes, then silence. Not a crash — reaped by connect_timeout —
+  but its post-CONNECT sibling (keep_alive=0 => idle deadline None) was an
+  UNBOUNDED slow-loris. Fix: track `partial_since` (when the current incomplete
+  frame first appeared); `framing_deadline()` bounds it by connect_timeout even
+  with keep-alive off; `earlier(deadline, framing_deadline)` folds the two.
+  `partial_since` reset on each complete packet. Tested via a new StallStream
+  (yields bytes once, then parks — a live-but-silent socket, unlike MockStream's
+  EOF) driving the real event_loop with connect_timeout=1s.
+- **Session WAL** (`persistence/wal.rs`, `[persistence] wal_flush_ms`, default
+  200). Group-commit, NOT per-mutation: ShardState keeps a dirty/removed client-id
+  set (cheap `HashSet::insert` on the hot path); the persistence task drains it
+  each flush (`take_wal_batch`), serializes Upsert/Remove records, appends +
+  fdatasyncs. Hooks: close_session (suspend=>dirty / expiry0=>removed),
+  open_session (clean-start + resume => removed), sweep_expired (=>removed),
+  routing deliver_to offline-enqueue (=>dirty), mesh handle_claim (=>removed).
+  Replay is last-writer-wins per client id over the snapshot-seeded map; framed
+  `[u32 len][kind][payload]` so a torn tail from a crash mid-append is skipped
+  (idempotent => an un-truncated WAL replays harmlessly). A periodic checkpoint
+  (full snapshot) truncates the log; when snapshot_interval=0, a 60s fallback
+  bounds growth. GOTCHA: `if let Some(b)=state.borrow_mut().take_wal_batch()` in
+  an if-let holds the RefMut across the append .await — bind in a `let` first.
+  Verified: kill -9 between snapshots (snapshot_interval=3600), restart replayed
+  2 WAL records, session_present=1, queued QoS1 message redelivered.
+- **Mutual TLS + hot-reload** (`[tls] client_ca_file`, `require_client_cert`,
+  `reload_interval`). Verifier: `WebPkiClientVerifier::builder_with_provider`
+  (required, or `.allow_unauthenticated()` for optional). A cert-verified client
+  with no MQTT username is granted via a threaded `tls_verified` bool
+  (serve.rs `client_cert_present` => run_stream => Connection::new => connect.rs).
+  Hot-reload is SHARD-LOCAL: acceptor is `Rc<RefCell<Option<TlsAcceptor>>>` (not
+  the cross-thread shared Arc), a per-shard maintenance task watches cert/key/CA
+  mtimes and swaps in a rebuilt acceptor; accept loop clones the current one per
+  connection. Fits thread-per-core with no lock. GOTCHAs: `.build()` returns
+  `Arc<dyn ClientCertVerifier>` not `Arc<WebPkiClientVerifier>`; rustls rejects
+  X.509 v1 client certs (`UnsupportedCertVersion`) — openssl needs `-extfile`
+  with an extension to emit v3. Verified live with an openssl CA: cert client
+  accepted under allow_anonymous=false, certless client rejected at handshake,
+  rotated server cert served to new handshakes after reload_interval.
+- DEFERRED (=> next-steps): cert-CN => username ACL mapping (needs an X.509
+  parsing dep; rustls verifies but doesn't expose the parsed subject).

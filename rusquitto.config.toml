@@ -20,9 +20,17 @@ websocket = true          # also serve MQTT-over-WebSocket-over-TLS (wss) for br
 websocket_port = 8884     # wss listener port (used only when enabled and websocket)
 # cert_file = "certs/server.pem"  # PEM certificate chain, leaf first (required when enabled)
 # key_file  = "certs/server.key"  # PEM private key: PKCS#8, PKCS#1, or SEC1 (required when enabled)
+# --- mutual TLS (client-certificate authentication) ---
+# client_ca_file = "certs/ca.pem"  # PEM bundle of trusted client CAs; set to enable mTLS
+# require_client_cert = false       # true => a client with no cert trusted by the CA fails the
+#                                   #   handshake. A cert-verified client that sends no MQTT
+#                                   #   username is authenticated by the certificate alone.
+# reload_interval = 0               # seconds between checking the cert/key/CA files and hot-reloading
+#                                   #   a rotated cert into new handshakes (0 = off; existing
+#                                   #   connections keep the cert they handshook with)
 # For mqtts:// / wss:// in production, front rusquitto with a trusted certificate
-# (e.g. from your CA or Let's Encrypt). No client-certificate auth: clients
-# authenticate at the MQTT layer (username/password) over the encrypted link.
+# (e.g. from your CA or Let's Encrypt), or use mutual TLS above so only clients
+# holding a CA-signed certificate can connect.
 
 [runtime]
 # cores = 8               # CPU cores to run on (one shard/executor per core). Default: all online; over-count is clamped.
@@ -70,7 +78,12 @@ shed_batch = 8             # max connections shed per second per shard while she
 enabled = false            # master switch
 dir = "data"               # directory for snapshot files (created if missing)
 retained_file = "retained.mqtt"  # retained-message snapshot filename
-snapshot_interval = 300    # seconds between snapshots (0 = only on graceful shutdown); a crash loses updates since the last snapshot
+snapshot_interval = 300    # seconds between snapshots (0 = only on graceful shutdown); a crash loses retained updates since the last snapshot
+wal_flush_ms = 200         # session write-ahead log flush interval, ms (0 = disabled, snapshot-only).
+                           #   When set, session suspensions and offline-queue growth are logged (fdatasync'd)
+                           #   at this cadence and replayed over the snapshot on startup, so a crash loses at
+                           #   most this window of durable *session* state instead of a whole snapshot_interval.
+                           #   Retained messages are snapshot-only (not WAL'd).
 
 [auth]
 # Default (anonymous allowed, no users) makes auth a no-op.

@@ -149,6 +149,12 @@ impl<'a> Reader<'a> {
 		Ok(slice)
 	}
 
+	/// Bytes not yet consumed. Used by the WAL replay to detect a torn trailing
+	/// record (a crash mid-append) before trying to parse it.
+	pub fn remaining(&self) -> usize {
+		self.data.len() - self.pos
+	}
+
 	pub fn expect_magic(&mut self, magic: &[u8]) -> Result<()> {
 		if self.take(magic.len())? == magic {
 			Ok(())

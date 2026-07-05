@@ -114,8 +114,11 @@ retain). Modules are **file-based** (`foo.rs` beside `foo/`), not `mod.rs`.
 - **`persistence`** (`src/persistence/`) snapshots durable state to disk (atomic write + `fdatasync` via
   io_uring `BufferedFile`) and restores it on startup, when `[persistence]` is enabled: the **retained set**
   (one shared file, all shards hold identical copies) and **suspended sessions** (one `sessions-<n>.mqtt`
-  per shard — subs, in-flight QoS state, offline queue). Snapshot-based (periodic + on graceful shutdown),
-  not a WAL, so a crash loses updates since the last snapshot.
+  per shard — subs, in-flight QoS state, offline queue). Retained is snapshot-based (periodic + on graceful
+  shutdown), so a crash loses retained updates since the last snapshot. Sessions additionally have a
+  per-shard **write-ahead log** (`persistence/wal.rs`, `sessions-<n>.wal`): an append-only, group-committed
+  (`wal_flush_ms`) record of session suspensions and offline-queue growth, replayed over the snapshot on
+  startup and truncated at each checkpoint — so a crash loses at most one flush window of session state.
 
 ## Configuration
 

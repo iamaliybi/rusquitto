@@ -7,17 +7,20 @@
 //! the low-priority maintenance queue so they yield to client-serving work.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures_rustls::TlsAcceptor;
 use glommio::TaskQueueHandle;
 use glommio::channels::channel_mesh::Receivers;
 use mqttbytes::{QoS, v5::Publish};
 
 use super::{LOAD_PROBE_INTERVAL, MALLOC_TRIM_EVERY, SESSION_SWEEP_INTERVAL, SHED_INTERVAL};
 use crate::broker::messages::MeshMsg;
+use crate::broker::session::PersistedSession;
 use crate::broker::shard::ShardState;
 use crate::config::Config;
 use crate::persistence;
@@ -69,6 +72,12 @@ pub(super) async fn restore_from_disk(state: &Shard, config: &Config, ids: Shard
 		return;
 	}
 
+	// Start tracking session mutations for the WAL before the shard serves, so no
+	// suspension between now and the first flush is missed.
+	if config.persistence.wal_enabled() {
+		state.borrow_mut().enable_wal();
+	}
+
 	// Retained set: every shard loads the same snapshot into its own table
 	// (retained is replicated across shards), so no cross-shard coordination.
 	let path = config.persistence.retained_path();
@@ -100,19 +109,38 @@ pub(super) async fn restore_from_disk(state: &Shard, config: &Config, ids: Shard
 	if mesh_peer_id == 0 {
 		paths.extend(orphan_session_files(&config.persistence.dir, shard_count));
 	}
-	let mut restored = 0;
+	let wal_on = config.persistence.wal_enabled();
+	// Merge every snapshot (+ its sibling WAL) into one client-keyed view so a WAL
+	// record supersedes the snapshot entry it updates. The WAL is replayed *after*
+	// its snapshot, so its records — newer by construction — win.
+	let mut merged: HashMap<String, PersistedSession> = HashMap::new();
 	for path in paths {
 		match persistence::load_sessions(&path).await {
 			Ok(sessions) => {
-				restored += sessions.len();
-				state.borrow_mut().load_sessions(sessions, now);
+				for ps in sessions {
+					merged.insert(ps.client_id.clone(), ps);
+				}
 			}
 			Err(e) => {
 				tracing::error!(shard = shard_id, error = %e, path = %path.display(), "failed to load session snapshot");
 			}
 		}
+		if wal_on {
+			let wal_path = path.with_extension("wal");
+			match persistence::wal::replay(&wal_path, &mut merged).await {
+				Ok(n) if n > 0 => tracing::info!(shard = shard_id, records = n, "replayed session WAL"),
+				Ok(_) => {}
+				Err(e) => {
+					tracing::error!(shard = shard_id, error = %e, path = %wal_path.display(), "failed to replay session WAL");
+				}
+			}
+		}
 	}
+	let restored = merged.len();
 	if restored > 0 {
+		state
+			.borrow_mut()
+			.load_sessions(merged.into_values().collect(), now);
 		tracing::info!(
 			shard = shard_id,
 			sessions = restored,
@@ -275,9 +303,16 @@ fn spawn_load_shedding(
 	.detach();
 }
 
-/// Periodic persistence snapshots: peer 0 writes the (replicated) retained set;
-/// every shard writes its own (shard-local) sessions. No-ops when persistence is
-/// disabled or `snapshot_interval` is 0 (snapshot only on graceful shutdown).
+/// Checkpoint cadence for the session WAL when periodic snapshots are off
+/// (`snapshot_interval = 0`): a full snapshot + WAL truncate still runs this
+/// often so the log can't grow without bound over a long run.
+const WAL_CHECKPOINT_FALLBACK: Duration = Duration::from_secs(60);
+
+/// Spawns the persistence tasks: peer 0's periodic retained snapshot, and each
+/// shard's session persistence — the WAL flush/checkpoint loop when the WAL is
+/// enabled, otherwise the plain periodic session snapshot. No-ops when
+/// persistence is disabled; with both `snapshot_interval = 0` and the WAL off,
+/// sessions are snapshotted only on graceful shutdown.
 fn spawn_snapshotters(state: &Shard, config: &Config, tq: TaskQueueHandle, mesh_peer_id: usize) {
 	if !config.persistence.enabled {
 		return;
@@ -288,12 +323,10 @@ fn spawn_snapshotters(state: &Shard, config: &Config, tq: TaskQueueHandle, mesh_
 		tracing::error!(error = %e, dir = %config.persistence.dir.display(), "failed to create persistence dir");
 	}
 	let snapshot_secs = config.persistence.snapshot_interval;
-	if snapshot_secs == 0 {
-		return;
-	}
 
-	// Retained snapshot (peer 0 only — it is replicated across shards).
-	if mesh_peer_id == 0 {
+	// Retained snapshot (peer 0 only — it is replicated across shards). Retained is
+	// snapshot-only, so this needs a non-zero interval.
+	if mesh_peer_id == 0 && snapshot_secs > 0 {
 		let state = state.clone();
 		let path = config.persistence.retained_path();
 		glommio::spawn_local_into(
@@ -313,24 +346,147 @@ fn spawn_snapshotters(state: &Shard, config: &Config, tq: TaskQueueHandle, mesh_
 		.detach();
 	}
 
-	// Session snapshot (every shard writes its own file).
+	// Session persistence (every shard writes its own file).
+	if config.persistence.wal_enabled() {
+		spawn_session_wal(state, config, tq, mesh_peer_id);
+	} else if snapshot_secs > 0 {
+		let state = state.clone();
+		let path = config.persistence.session_path(mesh_peer_id);
+		glommio::spawn_local_into(
+			async move {
+				loop {
+					glommio::timer::sleep(Duration::from_secs(snapshot_secs)).await;
+					let sessions = state.borrow().persist_sessions(Instant::now());
+					match persistence::save_sessions(&path, &sessions).await {
+						Ok(()) => tracing::debug!(sessions = sessions.len(), "session snapshot written"),
+						Err(e) => tracing::error!(error = %e, "session snapshot failed"),
+					}
+				}
+			},
+			tq,
+		)
+		.expect("spawn session-snapshot task")
+		.detach();
+	}
+}
+
+/// The session WAL task: every `wal_flush_ms` it appends the batch of session
+/// mutations since the last flush and `fdatasync`s it; every `snapshot_interval`
+/// (or [`WAL_CHECKPOINT_FALLBACK`] when that is 0) it writes a full session
+/// snapshot and truncates the now-subsumed log.
+fn spawn_session_wal(state: &Shard, config: &Config, tq: TaskQueueHandle, mesh_peer_id: usize) {
 	let state = state.clone();
-	let path = config.persistence.session_path(mesh_peer_id);
+	let session_path = config.persistence.session_path(mesh_peer_id);
+	let wal_path = config.persistence.wal_path(mesh_peer_id);
+	let flush = Duration::from_millis(config.persistence.wal_flush_ms);
+	let checkpoint = if config.persistence.snapshot_interval > 0 {
+		Duration::from_secs(config.persistence.snapshot_interval)
+	} else {
+		WAL_CHECKPOINT_FALLBACK
+	};
 	glommio::spawn_local_into(
 		async move {
+			let mut wal = match persistence::Wal::open(&wal_path).await {
+				Ok(w) => w,
+				Err(e) => {
+					tracing::error!(error = %e, path = %wal_path.display(), "failed to open session WAL; sessions persist on checkpoint/shutdown only");
+					return;
+				}
+			};
+			let mut since_checkpoint = Duration::ZERO;
 			loop {
-				glommio::timer::sleep(Duration::from_secs(snapshot_secs)).await;
-				let sessions = state.borrow().persist_sessions(Instant::now());
-				match persistence::save_sessions(&path, &sessions).await {
-					Ok(()) => tracing::debug!(sessions = sessions.len(), "session snapshot written"),
-					Err(e) => tracing::error!(error = %e, "session snapshot failed"),
+				glommio::timer::sleep(flush).await;
+				// 1. Flush the batch of session mutations since the last flush. Bind
+				// the batch in a `let` first so the shard borrow is released before the
+				// append `.await` (never hold a `RefCell` borrow across a yield).
+				let batch = state.borrow_mut().take_wal_batch(Instant::now());
+				if let Some(batch) = batch
+					&& let Err(e) = wal.append(batch).await
+				{
+					tracing::error!(error = %e, "session WAL append failed");
+				}
+				// 2. Periodic checkpoint: a full snapshot subsumes the log, so truncate it.
+				since_checkpoint += flush;
+				if since_checkpoint >= checkpoint {
+					since_checkpoint = Duration::ZERO;
+					let sessions = state.borrow().persist_sessions(Instant::now());
+					match persistence::save_sessions(&session_path, &sessions).await {
+						Ok(()) => {
+							if let Err(e) = wal.truncate().await {
+								tracing::error!(error = %e, "session WAL truncate failed");
+							}
+							tracing::debug!(sessions = sessions.len(), "session checkpoint written, WAL truncated");
+						}
+						Err(e) => tracing::error!(error = %e, "session checkpoint failed"),
+					}
 				}
 			}
 		},
 		tq,
 	)
-	.expect("spawn session-snapshot task")
+	.expect("spawn session WAL task")
 	.detach();
+}
+
+/// Watches the TLS certificate / key / client-CA files and hot-reloads them into
+/// this shard's acceptor when any changes, so a rotated certificate reaches new
+/// handshakes without a restart. Connections already established keep the
+/// certificate they handshook with. Shard-local: each shard reloads its own
+/// acceptor, so no cross-core coordination is involved. A no-op when TLS is off or
+/// `reload_interval` is 0. If the new files fail to load, the previous certificate
+/// is kept and the reload is retried next tick.
+pub(super) fn spawn_tls_reload(
+	acceptor: &Rc<RefCell<Option<TlsAcceptor>>>,
+	config: &Config,
+	tq: TaskQueueHandle,
+	shard_id: usize,
+) {
+	if !config.tls.enabled || config.tls.reload_interval == 0 {
+		return;
+	}
+	let (Some(cert_path), Some(key_path)) = (config.tls.cert_file.clone(), config.tls.key_file.clone()) else {
+		return;
+	};
+	let ca_path = config.tls.client_ca_file.clone();
+	let require = config.tls.require_client_cert;
+	let interval = Duration::from_secs(config.tls.reload_interval);
+	let acceptor = acceptor.clone();
+	glommio::spawn_local_into(
+		async move {
+			let mut seen = file_mtimes(&cert_path, &key_path, ca_path.as_deref());
+			loop {
+				glommio::timer::sleep(interval).await;
+				let current = file_mtimes(&cert_path, &key_path, ca_path.as_deref());
+				if current == seen {
+					continue;
+				}
+				match crate::transport::tls::load_server_config(&cert_path, &key_path, ca_path.as_deref(), require) {
+					Ok(new_config) => {
+						*acceptor.borrow_mut() = Some(TlsAcceptor::from(new_config));
+						seen = current;
+						tracing::info!(shard = shard_id, "reloaded TLS certificate");
+					}
+					// Keep the old acceptor and don't advance `seen`, so a corrected file
+					// is picked up on a later tick.
+					Err(e) => tracing::error!(
+						shard = shard_id,
+						error = %e,
+						"TLS certificate reload failed; keeping the previous certificate"
+					),
+				}
+			}
+		},
+		tq,
+	)
+	.expect("spawn TLS reload task")
+	.detach();
+}
+
+/// Last-modified times of the certificate, key, and (optional) client-CA files —
+/// the change signal the reload watcher compares tick to tick.
+fn file_mtimes(cert: &Path, key: &Path, ca: Option<&Path>) -> [Option<std::time::SystemTime>; 3] {
+	let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+	[mtime(cert), mtime(key), ca.and_then(mtime)]
 }
 
 /// Peer 0 publishes broker-wide `$SYS` metrics as retained messages, broadcast to

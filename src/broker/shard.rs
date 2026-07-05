@@ -16,7 +16,7 @@ mod routing;
 mod tests;
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -114,6 +114,19 @@ pub struct ShardState {
 	/// generated id string, so per-shard counters stay broker-unique without any
 	/// cross-core atomic on the CONNECT path.
 	next_assigned_id: u64,
+	/// Session mutations awaiting the next write-ahead-log flush. `None` when the
+	/// WAL is disabled, so a broker without persistence tracks nothing.
+	wal: Option<WalPending>,
+}
+
+/// Pending durable-session mutations for the write-ahead log: client ids whose
+/// suspended state changed (`dirty`, re-logged as Upserts) and client ids whose
+/// session ended (`removed`, logged as tombstones). Drained each flush by
+/// [`ShardState::take_wal_batch`]. A client id is in at most one set at a time.
+#[derive(Default)]
+struct WalPending {
+	dirty: HashSet<String>,
+	removed: HashSet<String>,
 }
 
 impl ShardState {
@@ -155,6 +168,8 @@ impl ShardState {
 		if clean_start {
 			if self.sessions.remove(client_id).is_some() {
 				self.trie.remove_client(client_id);
+				// A prior durable session is discarded: tombstone it in the WAL.
+				self.wal_removed(client_id);
 			}
 		} else if let Some(existing) = self.sessions.get_mut(client_id) {
 			existing.mailbox = Some(mailbox);
@@ -174,6 +189,10 @@ impl ShardState {
 			for group in self.shared_groups_of(client_id) {
 				self.broadcast_shared(&group, client_id, true);
 			}
+			// The session is online again; its durable copy is now held by the
+			// connection, so tombstone the suspended record (a fresh one is written
+			// when it next disconnects).
+			self.wal_removed(client_id);
 			return handle;
 		}
 
@@ -296,6 +315,13 @@ impl ShardState {
 			session.expires_at = (expiry_secs != SESSION_NEVER_EXPIRES)
 				.then(|| Instant::now() + Duration::from_secs(u64::from(expiry_secs)));
 		}
+		// Record the durable outcome in the WAL: a tombstone when destroyed, or an
+		// Upsert of the freshly-suspended state (its offline queue included).
+		if expiry_secs == 0 {
+			self.wal_removed(client_id);
+		} else {
+			self.wal_dirty(client_id);
+		}
 		// Destroyed or suspended, either way the client is no longer a *connected*
 		// member of its shared groups — tell the peers.
 		for group in &shared_groups {
@@ -319,53 +345,116 @@ impl ShardState {
 	/// QoS state lives in the connection, not here, and their expiry interval isn't
 	/// known to the shard. A session already at its expiry deadline is skipped too.
 	pub fn persist_sessions(&self, now: Instant) -> Vec<PersistedSession> {
-		let mut out = Vec::new();
-		for (client_id, session) in &self.sessions {
-			if session.mailbox.is_some() {
-				continue; // connected — not durable here
-			}
-			let expiry_secs = match session.expires_at {
-				None => u32::MAX, // never expires
-				Some(deadline) => {
-					let remaining = deadline.saturating_duration_since(now).as_secs();
-					if remaining == 0 {
-						continue; // about to expire; not worth persisting
-					}
-					u32::try_from(remaining).unwrap_or(u32::MAX)
-				}
-			};
-			let subscriptions = self
-				.trie
-				.client_subscriptions(client_id)
-				.into_iter()
-				.map(|f| MigratedSub {
-					filter: f.filter,
-					qos: f.qos,
-					nolocal: f.nolocal,
-					retain_as_published: f.retain_as_published,
-					share_group: f.share_group,
-					sub_id: f.sub_id,
-				})
-				.collect();
-			let snapshot = session.snapshot.as_deref().cloned().unwrap_or_default();
-			let offline = session
-				.offline_queue
-				.iter()
-				.map(|d| ((*d.publish).clone(), d.qos, d.retain, d.sub_ids.clone()))
-				.collect();
-			out.push(PersistedSession {
-				client_id: client_id.clone(),
-				expiry_secs,
-				session: MigratedSession {
-					subscriptions,
-					inflight: snapshot.inflight,
-					incoming_qos2: snapshot.incoming_qos2,
-					next_pkid: snapshot.next_pkid,
-					offline,
-				},
-			});
+		self.sessions
+			.keys()
+			.filter_map(|id| self.persist_one(id, now))
+			.collect()
+	}
+
+	/// Builds the durable snapshot of a single *suspended* session, or `None` if it
+	/// is connected, missing, or already at its expiry deadline. Backs both
+	/// [`persist_sessions`](Self::persist_sessions) and the WAL batch.
+	fn persist_one(&self, client_id: &str, now: Instant) -> Option<PersistedSession> {
+		let session = self.sessions.get(client_id)?;
+		if session.mailbox.is_some() {
+			return None; // connected — not durable here
 		}
-		out
+		let expiry_secs = match session.expires_at {
+			None => u32::MAX, // never expires
+			Some(deadline) => {
+				let remaining = deadline.saturating_duration_since(now).as_secs();
+				if remaining == 0 {
+					return None; // about to expire; not worth persisting
+				}
+				u32::try_from(remaining).unwrap_or(u32::MAX)
+			}
+		};
+		let subscriptions = self
+			.trie
+			.client_subscriptions(client_id)
+			.into_iter()
+			.map(|f| MigratedSub {
+				filter: f.filter,
+				qos: f.qos,
+				nolocal: f.nolocal,
+				retain_as_published: f.retain_as_published,
+				share_group: f.share_group,
+				sub_id: f.sub_id,
+			})
+			.collect();
+		let snapshot = session.snapshot.as_deref().cloned().unwrap_or_default();
+		let offline = session
+			.offline_queue
+			.iter()
+			.map(|d| ((*d.publish).clone(), d.qos, d.retain, d.sub_ids.clone()))
+			.collect();
+		Some(PersistedSession {
+			client_id: client_id.to_string(),
+			expiry_secs,
+			session: MigratedSession {
+				subscriptions,
+				inflight: snapshot.inflight,
+				incoming_qos2: snapshot.incoming_qos2,
+				next_pkid: snapshot.next_pkid,
+				offline,
+			},
+		})
+	}
+
+	// --- write-ahead log ----------------------------------------------------
+
+	/// Enables WAL tracking on this shard (called at startup when persistence and a
+	/// non-zero flush interval are configured). Idempotent.
+	pub fn enable_wal(&mut self) {
+		self.wal.get_or_insert_with(WalPending::default);
+	}
+
+	/// Marks a suspended session's durable state as changed, to be re-logged as an
+	/// Upsert at the next WAL flush. No-op when the WAL is disabled.
+	fn wal_dirty(&mut self, client_id: &str) {
+		if let Some(w) = self.wal.as_mut() {
+			w.removed.remove(client_id);
+			if !w.dirty.contains(client_id) {
+				w.dirty.insert(client_id.to_string());
+			}
+		}
+	}
+
+	/// Marks a session as ended, to be logged as a tombstone at the next WAL flush
+	/// (supersedes any pending dirty mark). No-op when the WAL is disabled.
+	fn wal_removed(&mut self, client_id: &str) {
+		if let Some(w) = self.wal.as_mut() {
+			w.dirty.remove(client_id);
+			w.removed.insert(client_id.to_string());
+		}
+	}
+
+	/// Drains the pending WAL mutations into one group-committed batch: tombstones
+	/// for removed sessions, then Upserts for the current state of dirty (still
+	/// suspended) ones. `None` when the WAL is disabled or nothing changed.
+	pub fn take_wal_batch(&mut self, now: Instant) -> Option<Vec<u8>> {
+		let (dirty, removed) = {
+			let w = self.wal.as_mut()?;
+			if w.dirty.is_empty() && w.removed.is_empty() {
+				return None;
+			}
+			(
+				w.dirty.drain().collect::<Vec<_>>(),
+				w.removed.drain().collect::<Vec<_>>(),
+			)
+		};
+		let mut buf = Vec::new();
+		for id in &removed {
+			crate::persistence::wal::encode_remove(&mut buf, id);
+		}
+		for id in &dirty {
+			// A dirty session that is no longer suspended (reconnected, expired) has a
+			// matching tombstone queued elsewhere or already flushed; just skip it.
+			if let Some(ps) = self.persist_one(id, now) {
+				let _ = crate::persistence::wal::encode_upsert(&mut buf, &ps);
+			}
+		}
+		(!buf.is_empty()).then_some(buf)
 	}
 
 	/// Installs persisted sessions as *suspended* sessions at startup: re-arms their
@@ -496,6 +585,8 @@ impl ShardState {
 					wills.push(will);
 				}
 				self.trie.remove_client(&id);
+				// Its durable record is gone: tombstone it in the WAL.
+				self.wal_removed(&id);
 			}
 		}
 		wills

@@ -147,7 +147,7 @@ async fn accept_on(listener: Option<&TcpListener>, transport: Transport, shard_i
 pub(super) async fn accept_loop(
 	ctx: &ConnCtx,
 	listeners: &Listeners,
-	tls_acceptor: &Option<TlsAcceptor>,
+	tls_acceptor: &Rc<RefCell<Option<TlsAcceptor>>>,
 	load: &Rc<LoadMonitor>,
 	config: &Config,
 	counts: &Rc<ConnCounts>,
@@ -235,7 +235,9 @@ pub(super) async fn accept_loop(
 		let slot = ConnSlot::acquire(counts.clone(), peer_ip);
 
 		let ctx = ctx.clone();
-		let tls_acceptor = tls_acceptor.clone();
+		// Snapshot the acceptor current at accept time; a concurrent hot-reload swaps
+		// the shared cell but never disturbs a connection already handed its clone.
+		let tls_acceptor = tls_acceptor.borrow().clone();
 		let (is_tls, is_websocket) = transport.flags();
 		let span = tracing::info_span!(
 			"connection",

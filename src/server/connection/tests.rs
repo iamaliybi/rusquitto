@@ -69,6 +69,7 @@ fn make_conn_with(out: Rc<RefCell<Vec<u8>>>, limits: LimitsConfig) -> Connection
 		Rc::new(Authenticator::from_config(&AuthConfig::default())),
 		Arc::new(Metrics::default()),
 		Arc::new(AtomicBool::new(false)),
+		false,
 	)
 }
 
@@ -479,5 +480,114 @@ fn probe_future_tree() {
 		drop(f);
 		let f = conn.flush();
 		println!("flush():                {}", size_of_val(&f));
+	});
+}
+
+// --- partial-frame stall guard (the 15th adversarial case) -------------------
+
+/// A `ByteStream` that replays its queued inbound bytes once, then *parks
+/// forever* on the next read instead of returning EOF — a live socket that has
+/// gone silent mid-frame. This lets a test observe the event loop's own idle /
+/// framing deadline fire (a plain EOF would close the connection immediately and
+/// prove nothing about the timeout).
+struct StallStream {
+	inbound: VecDeque<u8>,
+	outbound: Rc<RefCell<Vec<u8>>>,
+}
+
+impl ByteStream for StallStream {
+	async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+		if self.inbound.is_empty() {
+			// No more bytes will ever arrive, and we do NOT signal EOF: park so the
+			// read can never win the race against the deadline.
+			std::future::pending::<()>().await;
+		}
+		let mut n = 0;
+		while n < buf.len() {
+			match self.inbound.pop_front() {
+				Some(b) => {
+					buf[n] = b;
+					n += 1;
+				}
+				None => break,
+			}
+		}
+		Ok(n)
+	}
+
+	async fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+		self.outbound.borrow_mut().extend_from_slice(buf);
+		Ok(())
+	}
+}
+
+fn stall_conn(out: Rc<RefCell<Vec<u8>>>, inbound: VecDeque<u8>, limits: LimitsConfig) -> Connection<StallStream> {
+	let stream = StallStream { inbound, outbound: out };
+	Connection::new(
+		stream,
+		0,
+		ShardState::new(),
+		limits,
+		Rc::new(Authenticator::from_config(&AuthConfig::default())),
+		Arc::new(Metrics::default()),
+		Arc::new(AtomicBool::new(false)),
+		false,
+	)
+}
+
+/// Runs the connection's event loop against a stalling stream and asserts it
+/// returns within the framing window; a generous watchdog turns a regression
+/// (the loop hanging on a never-completing read) into a fast test failure.
+async fn run_until_reaped(conn: &mut Connection<StallStream>) {
+	use futures_lite::FutureExt;
+	let watchdog = async {
+		glommio::timer::sleep(std::time::Duration::from_secs(5)).await;
+		panic!("event loop did not reap the stalled connection within the framing window");
+	};
+	conn.event_loop()
+		.or(watchdog)
+		.await
+		.expect("event loop exits cleanly on timeout");
+}
+
+#[test]
+fn truncated_connect_header_is_reaped_by_the_handshake_timeout() {
+	// The 15th adversarial case: a complete CONNECT fixed header claiming 10 body
+	// bytes, then silence. Bounded by `connect_timeout`, even pre-CONNECT.
+	block_on(async {
+		let limits = LimitsConfig { connect_timeout: 1, ..LimitsConfig::default() };
+		let inbound = VecDeque::from(vec![0x10, 0x0A]); // CONNECT, remaining length 10, no body
+		let out = Rc::new(RefCell::new(Vec::new()));
+		let mut conn = stall_conn(out, inbound, limits);
+
+		run_until_reaped(&mut conn).await;
+		assert!(!conn.connected, "never completed the CONNECT");
+	});
+}
+
+#[test]
+fn stalled_partial_frame_is_reaped_even_without_keepalive() {
+	// The dangerous post-CONNECT sibling: keep-alive disabled on BOTH ends (so the
+	// idle deadline is `None`), a completed CONNECT, then a partial PUBLISH header
+	// that never finishes. Only the partial-frame guard can close this.
+	block_on(async {
+		let limits = LimitsConfig { keep_alive: 0, connect_timeout: 1, ..LimitsConfig::default() };
+
+		let mut buf = BytesMut::new();
+		let mut connect = mqtt_v5::Connect::new("stall");
+		connect.clean_session = true;
+		connect.keep_alive = 0;
+		connect.write(&mut buf).expect("encode CONNECT");
+		buf.extend_from_slice(&[0x30, 0x0A]); // PUBLISH, remaining length 10, no body
+		let inbound = VecDeque::from(buf.to_vec());
+
+		let out = Rc::new(RefCell::new(Vec::new()));
+		let mut conn = stall_conn(out, inbound, limits);
+
+		run_until_reaped(&mut conn).await;
+		assert!(
+			conn.connected,
+			"CONNECT completed before the mid-frame stall"
+		);
 	});
 }

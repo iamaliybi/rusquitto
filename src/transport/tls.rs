@@ -25,7 +25,8 @@ use std::time::Duration;
 use futures_lite::{AsyncReadExt, AsyncWriteExt, FutureExt};
 use futures_rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use futures_rustls::rustls::crypto::{CryptoProvider, ring};
-use futures_rustls::rustls::{self, ServerConfig, SupportedCipherSuite, SupportedProtocolVersion};
+use futures_rustls::rustls::server::WebPkiClientVerifier;
+use futures_rustls::rustls::{self, RootCertStore, ServerConfig, SupportedCipherSuite, SupportedProtocolVersion};
 use futures_rustls::{TlsAcceptor, server};
 use glommio::net::TcpStream;
 
@@ -71,13 +72,42 @@ impl ByteStream for TlsStream {
 	}
 }
 
-/// Loads the certificate chain and private key from PEM files and builds the
-/// hardened [`ServerConfig`]. Called once at startup; the resulting config is
-/// immutable and shared (via `Arc`) across every shard.
-pub fn load_server_config(cert_path: &Path, key_path: &Path) -> Result<Arc<ServerConfig>> {
+/// Client-certificate authentication policy (mutual TLS): the trusted client-CA
+/// certificates and whether presenting a valid one is mandatory.
+struct ClientAuth {
+	ca: Vec<CertificateDer<'static>>,
+	require: bool,
+}
+
+/// Loads the certificate chain and private key (and, for mutual TLS, the trusted
+/// client-CA bundle) from PEM files and builds the hardened [`ServerConfig`].
+/// Called at startup and again on each hot-reload; the resulting config is
+/// immutable and shared (via `Arc`) for the connections that handshake under it.
+pub fn load_server_config(
+	cert_path: &Path,
+	key_path: &Path,
+	client_ca_path: Option<&Path>,
+	require_client_cert: bool,
+) -> Result<Arc<ServerConfig>> {
 	let certs = load_certs(cert_path)?;
 	let key = load_private_key(key_path)?;
-	build_server_config(certs, key).map(Arc::new)
+	let client_auth = match client_ca_path {
+		Some(path) => Some(ClientAuth { ca: load_certs(path)?, require: require_client_cert }),
+		None => None,
+	};
+	build_server_config(certs, key, client_auth).map(Arc::new)
+}
+
+/// Whether the peer presented a client certificate that passed verification — the
+/// signal a connection uses to treat itself as authenticated by mutual TLS. After
+/// a completed handshake against a client-cert verifier, a present peer chain
+/// means the certificate was trusted.
+pub fn client_cert_present(stream: &TlsStream) -> bool {
+	stream
+		.get_ref()
+		.1
+		.peer_certificates()
+		.is_some_and(|chain| !chain.is_empty())
 }
 
 /// Completes the TLS handshake on an accepted TCP connection, bounded by `timeout`
@@ -96,9 +126,15 @@ pub async fn accept(acceptor: &TlsAcceptor, tcp: TcpStream, timeout: Duration) -
 }
 
 /// Builds a [`ServerConfig`] pinned to [`PROTOCOL_VERSIONS`] and
-/// [`STRONG_CIPHER_SUITES`], with no client-certificate authentication (clients
-/// authenticate at the MQTT layer via username/password over the encrypted link).
-fn build_server_config(certs: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> Result<ServerConfig> {
+/// [`STRONG_CIPHER_SUITES`]. Without `client_auth`, clients authenticate at the
+/// MQTT layer (username/password over the encrypted link); with it, mutual TLS is
+/// enforced — a presented client certificate is verified against the configured
+/// CA, and (when `require`) one is demanded of every client.
+fn build_server_config(
+	certs: Vec<CertificateDer<'static>>,
+	key: PrivateKeyDer<'static>,
+	client_auth: Option<ClientAuth>,
+) -> Result<ServerConfig> {
 	// Start from the ring provider but replace its suite list with our curated one,
 	// so the security posture is explicit and auditable rather than default-derived.
 	let provider = CryptoProvider {
@@ -106,12 +142,40 @@ fn build_server_config(certs: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'
 		..ring::default_provider()
 	};
 
-	ServerConfig::builder_with_provider(Arc::new(provider))
+	let builder = ServerConfig::builder_with_provider(Arc::new(provider))
 		.with_protocol_versions(PROTOCOL_VERSIONS)
-		.map_err(|e| invalid(format!("configuring TLS versions: {e}")))?
-		.with_no_client_auth()
+		.map_err(|e| invalid(format!("configuring TLS versions: {e}")))?;
+	let builder = match client_auth {
+		Some(auth) => builder.with_client_cert_verifier(build_client_verifier(auth)?),
+		None => builder.with_no_client_auth(),
+	};
+	builder
 		.with_single_cert(certs, key)
 		.map_err(|e| invalid(format!("loading server certificate/key: {e}")))
+}
+
+/// Builds the client-certificate verifier from the trusted client-CA bundle.
+/// `require = false` verifies a certificate when offered but tolerates its
+/// absence (`allow_unauthenticated`); `true` rejects any client that presents no
+/// trusted certificate during the handshake.
+fn build_client_verifier(auth: ClientAuth) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>> {
+	let mut roots = RootCertStore::empty();
+	for cert in auth.ca {
+		roots
+			.add(cert)
+			.map_err(|e| invalid(format!("adding client CA certificate: {e}")))?;
+	}
+	// Use a stock ring provider for signature verification (all algorithms present);
+	// the curated suite list only governs the negotiated record-protection cipher.
+	let builder = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), Arc::new(ring::default_provider()));
+	let builder = if auth.require {
+		builder
+	} else {
+		builder.allow_unauthenticated()
+	};
+	builder
+		.build()
+		.map_err(|e| invalid(format!("building client-certificate verifier: {e}")))
 }
 
 /// Reads and parses a PEM certificate chain from `path`.
@@ -169,7 +233,7 @@ mod tests {
 		let (cert_pem, key_pem) = self_signed();
 		let certs = parse_certs(&cert_pem).unwrap();
 		let key = parse_private_key(&key_pem).unwrap();
-		Arc::new(build_server_config(certs, key).unwrap())
+		Arc::new(build_server_config(certs, key, None).unwrap())
 	}
 
 	/// A test-only verifier that trusts any server certificate. This is confined to
@@ -272,6 +336,23 @@ mod tests {
 		for suite in config.crypto_provider().cipher_suites.iter() {
 			let name = format!("{:?}", suite.suite());
 			assert!(!name.contains("CBC"), "weak CBC suite offered: {name}");
+		}
+	}
+
+	#[test]
+	fn builds_config_with_client_cert_verifier() {
+		// Reuse a self-signed cert as both the server identity and the trusted client
+		// CA; both the mandatory and optional (`allow_unauthenticated`) verifier paths
+		// must build into a ServerConfig.
+		let (cert_pem, key_pem) = self_signed();
+		for require in [true, false] {
+			let certs = parse_certs(&cert_pem).unwrap();
+			let key = parse_private_key(&key_pem).unwrap();
+			let ca = parse_certs(&cert_pem).unwrap();
+			assert!(
+				build_server_config(certs, key, Some(ClientAuth { ca, require })).is_ok(),
+				"mutual-TLS config builds (require={require})"
+			);
 		}
 	}
 

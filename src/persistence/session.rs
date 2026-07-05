@@ -49,7 +49,7 @@ fn serialize(sessions: &[PersistedSession]) -> Result<Vec<u8>> {
 	Ok(buf)
 }
 
-fn encode_session(buf: &mut Vec<u8>, ps: &PersistedSession) -> Result<()> {
+pub(super) fn encode_session(buf: &mut Vec<u8>, ps: &PersistedSession) -> Result<()> {
 	put_str(buf, &ps.client_id);
 	put_u32(buf, ps.expiry_secs);
 
@@ -105,7 +105,7 @@ fn parse(data: &[u8]) -> Result<Vec<PersistedSession>> {
 	Ok(out)
 }
 
-fn decode_session(r: &mut Reader) -> Result<PersistedSession> {
+pub(super) fn decode_session(r: &mut Reader) -> Result<PersistedSession> {
 	let client_id = r.get_str()?;
 	let expiry_secs = r.get_u32()?;
 

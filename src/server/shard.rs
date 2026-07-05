@@ -143,7 +143,10 @@ pub async fn run_shard(
 	let Some(listeners) = Listeners::bind(&config, shard_id) else {
 		return; // a configured-but-unbindable port is a fatal misconfiguration
 	};
-	let tls_acceptor = tls_config.map(TlsAcceptor::from);
+	// Shard-local, swappable acceptor: the reload task replaces it in place when the
+	// certificate files change, so a rotated cert reaches new handshakes without a
+	// restart. Single-threaded `RefCell` — no cross-core sharing, no lock.
+	let tls_acceptor = Rc::new(RefCell::new(tls_config.map(TlsAcceptor::from)));
 
 	// Mesh peer id is 0-based and unique per shard (glommio executor ids are
 	// 1-based). Peer 0 owns broker-wide duties: `$SYS`, the retained snapshot.
@@ -185,6 +188,7 @@ pub async fn run_shard(
 		tq_maintenance,
 		receivers,
 	);
+	maintenance::spawn_tls_reload(&tls_acceptor, &config, tq_maintenance, shard_id);
 
 	tracing::info!(
 		shard = shard_id,

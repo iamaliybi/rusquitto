@@ -157,6 +157,56 @@ fn retained_is_stored_matched_and_cleared() {
 }
 
 #[test]
+fn wal_batch_tracks_suspend_offline_and_resume() {
+	use crate::broker::session::PersistedSession;
+	use std::collections::HashMap;
+
+	let mut s = ShardState::default();
+	s.enable_wal();
+	let now = Instant::now();
+
+	// Connect, subscribe, then suspend with a non-zero expiry → durable.
+	let (tx, _rx) = local_channel::new_unbounded::<Delivery>();
+	let h = s.open_session("c1", tx, false);
+	s.subscribe(
+		"home/#",
+		"c1",
+		opts(QoS::AtLeastOnce, false, false, None, None),
+	);
+	assert!(s.close_session(
+		"c1",
+		h.generation,
+		3600,
+		SessionSnapshot::default(),
+		VecDeque::new()
+	));
+
+	// A message routed to the now-suspended session queues offline (and re-dirties it).
+	s.deliver_local(pubm("home/kitchen", QoS::AtLeastOnce, b"hot", false), None);
+	assert_eq!(offline(&s, "c1").len(), 1);
+
+	// The batch upserts c1; replaying it rebuilds the session with its queued message.
+	let batch = s
+		.take_wal_batch(now)
+		.expect("a WAL batch after suspend + offline enqueue");
+	let mut restored: HashMap<String, PersistedSession> = HashMap::new();
+	crate::persistence::wal::apply(&batch, &mut restored);
+	let ps = restored.get("c1").expect("c1 upserted into the WAL");
+	assert_eq!(ps.session.offline.len(), 1, "queued message captured");
+	assert_eq!(ps.session.subscriptions.len(), 1, "subscription captured");
+
+	// Reconnecting resumes it → a tombstone; replaying that removes the durable copy.
+	let (tx2, _rx2) = local_channel::new_unbounded::<Delivery>();
+	s.open_session("c1", tx2, false);
+	let batch = s.take_wal_batch(now).expect("a WAL batch after resume");
+	crate::persistence::wal::apply(&batch, &mut restored);
+	assert!(
+		!restored.contains_key("c1"),
+		"resume tombstoned the durable session"
+	);
+}
+
+#[test]
 fn open_session_fresh_then_resumes_after_suspend() {
 	let mut s = ShardState::default();
 	let (tx, _rx) = local_channel::new_unbounded::<Delivery>();

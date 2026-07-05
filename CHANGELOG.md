@@ -5,6 +5,49 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): from 1.0 on, the major
 version bumps for breaking changes, the minor for features, and the patch for fixes.
 
+## [1.8.0] - 2026-07-05
+
+Durability and transport-security release: a session write-ahead log, mutual TLS
+with certificate hot-reload, and a hardening of the last adversarial gap.
+
+### Added
+
+- **Session/queued-message write-ahead log** (`[persistence] wal_flush_ms`,
+  default 200 ms; `0` disables). Persistence was snapshot-based, so a crash lost
+  every session that suspended — and every QoS > 0 message queued to a suspended
+  session — since the last snapshot (`snapshot_interval`). A new per-shard,
+  append-only, group-committed WAL (`persistence/wal.rs`) records session
+  upserts/removes and offline-queue growth as they happen and replays them over
+  the snapshot on startup, shrinking the crash window from `snapshot_interval`
+  (default 300 s) to the flush interval. Records are last-writer-wins per client
+  id; a torn trailing record from a crash mid-append is detected and skipped. A
+  periodic checkpoint (a full session snapshot) truncates the log so it stays
+  bounded. Retained messages remain snapshot-only. Verified end-to-end: a
+  `kill -9` between snapshots, then restart, restores the suspended session and
+  redelivers its queued message.
+- **Mutual TLS (client-certificate authentication)** (`[tls] client_ca_file`,
+  `require_client_cert`). A presented client certificate is verified against the
+  configured CA; with `require_client_cert` a client without a trusted
+  certificate fails the handshake. A cert-verified client that sends no MQTT
+  username is authenticated by the certificate alone (so mTLS works with
+  `allow_anonymous = false`).
+- **Certificate hot-reload** (`[tls] reload_interval`, seconds; `0` = off). Each
+  shard watches the cert/key/CA files and rebuilds its own acceptor when they
+  change, so a rotated certificate reaches new handshakes without a restart.
+  Existing connections keep the certificate they handshook with. Shard-local —
+  no cross-core coordination, no lock (fits thread-per-core); a failed reload
+  keeps the previous certificate and retries.
+
+### Changed
+
+- **Partial-frame stall guard** closes the last adversarial-battery gap (the
+  suite's 15th case, a header-only truncated CONNECT). `Connection::event_loop`
+  now bounds *any* incomplete frame by the handshake window (`connect_timeout`),
+  not just a fully-silent socket — which also closes the previously **unbounded**
+  post-CONNECT slow-loris where a client finished CONNECT with keep-alive
+  disabled (`keep_alive = 0`) and then dribbled a partial packet header and
+  stalled. Pre- and post-CONNECT stalls are now one invariant.
+
 ## [1.7.0] - 2026-07-05
 
 Structural refactor from an architectural review — no behaviour, protocol, API,

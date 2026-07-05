@@ -62,7 +62,7 @@ pub(super) async fn serve(ctx: ConnCtx, stream: TcpStream, transport: Transport,
 /// exist as a temporary — or a moved-from binding — inside an async frame, or
 /// it gets a permanent slot in the enclosing task's allocation.
 fn boxed_run<S: ByteStream>(ctx: ConnCtx, stream: S) -> Pin<Box<impl Future<Output = ()>>> {
-	Box::pin(run_stream(ctx, stream))
+	Box::pin(run_stream(ctx, stream, false))
 }
 
 /// The whole WebSocket pipeline (handshake, then the connection) in one box —
@@ -76,7 +76,7 @@ fn boxed_serve_ws(
 ) -> Pin<Box<impl Future<Output = ()>>> {
 	Box::pin(async move {
 		match WsStream::accept(stream, max_frame, timeout).await {
-			Ok(ws) => run_stream(ctx, ws).await,
+			Ok(ws) => run_stream(ctx, ws, false).await,
 			Err(e) => tracing::warn!(error = %e, "WebSocket handshake failed"),
 		}
 	})
@@ -91,7 +91,10 @@ fn boxed_serve_tls(
 ) -> Pin<Box<impl Future<Output = ()>>> {
 	Box::pin(async move {
 		match tls::accept(&acceptor, stream, timeout).await {
-			Ok(tls) => run_stream(ctx, tls).await,
+			Ok(tls) => {
+				let verified = tls::client_cert_present(&tls);
+				run_stream(ctx, tls, verified).await
+			}
 			Err(e) => tracing::warn!(error = %e, "TLS handshake failed"),
 		}
 	})
@@ -108,10 +111,13 @@ fn boxed_serve_wss(
 ) -> Pin<Box<impl Future<Output = ()>>> {
 	Box::pin(async move {
 		match tls::accept(&acceptor, stream, timeout).await {
-			Ok(tls) => match WsStream::accept(tls, max_frame, timeout).await {
-				Ok(ws) => run_stream(ctx, ws).await,
-				Err(e) => tracing::warn!(error = %e, "WebSocket handshake over TLS failed"),
-			},
+			Ok(tls) => {
+				let verified = tls::client_cert_present(&tls);
+				match WsStream::accept(tls, max_frame, timeout).await {
+					Ok(ws) => run_stream(ctx, ws, verified).await,
+					Err(e) => tracing::warn!(error = %e, "WebSocket handshake over TLS failed"),
+				}
+			}
 			Err(e) => tracing::warn!(error = %e, "TLS handshake failed"),
 		}
 	})
@@ -120,7 +126,7 @@ fn boxed_serve_wss(
 /// Drives the MQTT state machine over an established stream to completion. Generic
 /// over the transport (the payoff of [`ByteStream`]): one implementation serves
 /// plain TCP, WebSocket, TLS, and WebSocket-over-TLS alike.
-async fn run_stream<S: ByteStream>(ctx: ConnCtx, stream: S) {
+async fn run_stream<S: ByteStream>(ctx: ConnCtx, stream: S, tls_verified: bool) {
 	let mut conn = Connection::new(
 		stream,
 		ctx.shard_id,
@@ -129,6 +135,7 @@ async fn run_stream<S: ByteStream>(ctx: ConnCtx, stream: S) {
 		ctx.auth,
 		ctx.metrics,
 		ctx.shutdown,
+		tls_verified,
 	);
 	let _ = conn.run().await;
 }
