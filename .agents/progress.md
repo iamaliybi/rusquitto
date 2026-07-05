@@ -712,3 +712,34 @@ like the examples. Test client key details: `read()` accumulates socket bytes +
 window doesn't stall. Also wrote TESTING.md (root) — the full A-Z test strategy
 (unit/integration/adversarial/crash-recovery/mTLS/soak/probes) + known gaps
 (no parser fuzz yet; wss not E2E). 94 unit + 15 integration, clippy/fmt clean.
+
+## Phase 13 — mTLS cert-CN → username ACL mapping (2026-07-06, v1.10.0)
+
+The deferred mTLS follow-up (next-steps §2). A verified client cert's subject CN
+becomes the MQTT username so `[[auth.users]]` ACLs apply per-device.
+
+- Dep: `x509-parser = "0.18"` (rustls verifies the chain but doesn't expose the
+  parsed subject). Already in the tree as a transitive DEV dep of rcgen, so its
+  transitive deps (asn1-rs/der-parser/nom/oid-registry) were locked; now compiled
+  into the release binary.
+- tls.rs: new `pub enum TlsIdentity { None, Verified, Cn(String) }` +
+  `client_tls_identity(stream, map_cn)` (reads peer_certificates leaf, extracts CN
+  via `X509Certificate::from_der(...).subject().iter_common_name().next().as_str()`).
+  Replaced the old `client_cert_present()->bool`.
+- Threading: serve.rs computes the identity from `ctx.map_cert_cn`; ConnCtx gained
+  `map_cert_cn` (set from `config.tls.cert_cn_as_username`); Connection's
+  `tls_verified: bool` field/param became `tls_identity: TlsIdentity`.
+- connect.rs: `cert_grant: Option<Option<String>>` computed from `&self.tls_identity`
+  BEFORE mutating self (borrow-checker: match on the borrow, clone the CN, then
+  assign self.username) — `Some(Some(cn))` => CN is the username, `Some(None)` =>
+  verified but anonymous, `None` => normal `[auth]` check. Explicit username always
+  takes the normal path (guard `_ if has_username => None`).
+- Config: `[tls] cert_cn_as_username: bool` (default false). A `[[auth.users]]`
+  entry named after the CN still needs a credential (validation), but the cert
+  path never checks it — the cert IS the credential; the entry exists only to carry
+  ACLs.
+- Tests: 2 new unit tests (cert_cn_becomes_username_when_no_login,
+  verified_cert_without_mapping_has_no_username) + a LIVE harness (openssl CA,
+  client CN=sensor-01, user sensor-01 publish=["sensors/01/#"], cert_cn_as_username=
+  true, allow_anonymous=false): in-ACL publish DELIVERED, out-of-ACL publish BLOCKED.
+  96 unit + 15 integration, clippy/fmt clean. FUTURE: SAN fallback when no CN.

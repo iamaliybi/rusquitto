@@ -1,6 +1,6 @@
 [package]
 name = "rusquitto"
-version = "1.9.2"
+version = "1.10.0"
 edition = "2024"
 default-run = "rusquitto"
 
@@ -43,6 +43,11 @@ base64 = "0.22"
 # and ships only AEAD cipher suites, so weak protocols/ciphers are impossible.
 futures-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls-pemfile = "2"
+# Parse the verified client certificate's subject to map its Common Name onto an
+# MQTT identity for per-device ACLs (`[tls] cert_cn_as_username`). rustls verifies
+# the chain but does not expose the parsed subject; this reads it. Already in the
+# tree as a transitive dev-dependency of rcgen, so it adds little new weight.
+x509-parser = "0.18"
 
 [dev-dependencies]
 # Self-signed certificate generation for the TLS handshake tests.

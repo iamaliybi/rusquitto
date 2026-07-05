@@ -16,6 +16,7 @@ use crate::auth::AuthResult;
 use crate::broker::messages::MigratedSession;
 use crate::telemetry::logging::redact;
 use crate::transport::ByteStream;
+use crate::transport::tls::TlsIdentity;
 
 impl<S: ByteStream> Connection<S> {
 	/// Replies to a rejected CONNECT with a failure CONNACK (session present is
@@ -108,13 +109,28 @@ impl<S: ByteStream> Connection<S> {
 		let login = connect.login.as_ref();
 		let supplied_username = login.map(|l| l.username.as_str());
 		let has_username = supplied_username.is_some_and(|u| !u.is_empty());
-		if self.tls_verified && !has_username {
-			// Mutual TLS: the verified client certificate is the credential, so a
-			// CONNECT that carries no username is accepted on its strength. Its
-			// per-topic ACLs are the anonymous allow-lists (no MQTT identity to key on;
-			// certificate-CN → user mapping is future work — see next-steps).
-			debug!("authenticated via client certificate (mutual TLS)");
-			self.username = None;
+
+		// Mutual TLS: a verified client certificate authenticates a CONNECT that
+		// supplies no MQTT username. With `cert_cn_as_username` its subject CN
+		// becomes the username (per-device `[[auth.users]]` ACLs); otherwise it has
+		// no MQTT identity (anonymous ACLs). An explicit username is always checked
+		// against `[auth]` the usual way (the certificate only gated the transport).
+		// `cert_grant` is `Some(identity)` when the certificate authenticates this
+		// connection, computed here so the `tls_identity` borrow ends before the auth
+		// path mutates `self`.
+		let cert_grant: Option<Option<String>> = match &self.tls_identity {
+			_ if has_username => None,
+			TlsIdentity::Cn(cn) => Some(Some(cn.clone())),
+			TlsIdentity::Verified => Some(None),
+			TlsIdentity::None => None,
+		};
+
+		if let Some(identity) = cert_grant {
+			match &identity {
+				Some(cn) => debug!(identity = %cn, "authenticated via client-certificate CN (mutual TLS)"),
+				None => debug!("authenticated via client certificate (mutual TLS)"),
+			}
+			self.username = identity;
 		} else {
 			// An explicit username (or a plain, non-mTLS connection) is checked against
 			// `[auth]` exactly as before.

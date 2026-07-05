@@ -28,6 +28,10 @@ websocket_port = 8884     # wss listener port (used only when enabled and websoc
 # reload_interval = 0               # seconds between checking the cert/key/CA files and hot-reloading
 #                                   #   a rotated cert into new handshakes (0 = off; existing
 #                                   #   connections keep the cert they handshook with)
+# cert_cn_as_username = false       # use a verified client cert's subject CN as the MQTT username,
+#                                   #   so [[auth.users]] ACLs apply per device (a client that also
+#                                   #   sends a username is checked the usual way). Default false =>
+#                                   #   a cert-verified client with no username is anonymous for ACLs.
 # For mqtts:// / wss:// in production, front rusquitto with a trusted certificate
 # (e.g. from your CA or Let's Encrypt), or use mutual TLS above so only clients
 # holding a CA-signed certificate can connect.

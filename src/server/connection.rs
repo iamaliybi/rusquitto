@@ -45,6 +45,7 @@ use crate::broker::shard::ShardState;
 use crate::config::LimitsConfig;
 use crate::telemetry::metrics::Metrics;
 use crate::transport::ByteStream;
+use crate::transport::tls::TlsIdentity;
 
 /// How long a CONNECT handler waits for peers to answer a cross-shard session
 /// [`Claim`](crate::broker::messages::SessionControl::Claim) before giving up and
@@ -205,10 +206,11 @@ pub struct Connection<S: ByteStream> {
 	/// Set once a valid CONNECT has been accepted. Every other packet type is a
 	/// protocol violation before this, and a second CONNECT is a violation after.
 	connected: bool,
-	/// The client authenticated with a certificate trusted under mutual TLS. When
-	/// set, a CONNECT that supplies no username is accepted on the strength of the
-	/// certificate alone (see [`handle_connect`](Self::handle_connect)).
-	tls_verified: bool,
+	/// The mutual-TLS authentication outcome for this connection, consulted by the
+	/// CONNECT handler to decide the client's MQTT identity: a verified certificate
+	/// authenticates a client that supplies no username, and its CN can stand in as
+	/// that username (see [`handle_connect`](Self::handle_connect)).
+	tls_identity: TlsIdentity,
 	/// Idle deadline: the CONNECT handshake deadline before connecting, then the
 	/// keep-alive deadline (1.5× the negotiated keep-alive) afterwards. `None`
 	/// disables the check. Reset on every inbound packet.
@@ -260,7 +262,7 @@ impl<S: ByteStream> Connection<S> {
 		auth: Rc<Authenticator>,
 		metrics: Arc<Metrics>,
 		shutdown: Arc<AtomicBool>,
-		tls_verified: bool,
+		tls_identity: TlsIdentity,
 	) -> Self {
 		let (mailbox_tx, mailbox_rx) = local_channel::new_unbounded();
 		Self {
@@ -294,7 +296,7 @@ impl<S: ByteStream> Connection<S> {
 			peer_topic_alias_max: 0,
 			aliases: None,
 			connected: false,
-			tls_verified,
+			tls_identity,
 			// Bound the pre-CONNECT handshake so an idle socket can't hold a slot.
 			deadline: (limits.connect_timeout > 0)
 				.then(|| Instant::now() + Duration::from_secs(u64::from(limits.connect_timeout))),

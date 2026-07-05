@@ -114,6 +114,9 @@ struct ConnCtx {
 	auth: Rc<Authenticator>,
 	metrics: Arc<Metrics>,
 	shutdown: Arc<AtomicBool>,
+	/// Whether to map a verified client certificate's CN onto the MQTT username
+	/// (`[tls] cert_cn_as_username`), decided once at startup.
+	map_cert_cn: bool,
 }
 
 /// Runs one shard to completion: the body of every `LocalExecutor` in the pool.
@@ -225,6 +228,7 @@ pub async fn run_shard(
 		auth,
 		metrics: metrics.clone(),
 		shutdown: shutdown.clone(),
+		map_cert_cn: config.tls.cert_cn_as_username,
 	};
 	let counts = Rc::new(ConnCounts::default());
 

@@ -40,17 +40,7 @@ Gate each phase on the `alloc_probe` + adversarial-battery numbers.
 
 ---
 
-## 2. mTLS cert-CN → username ACL mapping
-
-![priority](https://img.shields.io/badge/priority-medium-yellow)
-![risk](https://img.shields.io/badge/risk-low-green)
-![status](https://img.shields.io/badge/status-deferred-lightgrey)
-
-A cert-authenticated client that sends no MQTT username gets the *anonymous* ACLs.
-Map the certificate's subject CN (or a SAN) to an MQTT identity so `[[auth.users]]`
-ACLs apply per-device.
-
-- [ ] Add an X.509 parsing dependency (rustls verifies but doesn't expose the
-      parsed subject) — evaluate `x509-parser` against the dependency budget first.
-- [ ] Extract CN/SAN after the handshake, thread it as the connection's identity.
-- [ ] Apply `[[auth.users]]` ACLs keyed by that identity.
+*(The parked-connection idle path is the only open item. The mTLS cert-CN →
+username ACL mapping shipped and moved to [progress.md](progress.md); a SAN-based
+identity fallback — using a Subject Alternative Name when the cert has no CN — is a
+possible small follow-up, not currently tracked.)*
