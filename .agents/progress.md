@@ -631,3 +631,41 @@ three features validated with live brokers, not just unit tests.
   rotated server cert served to new handshakes after reload_interval.
 - DEFERRED (=> next-steps): cert-CN => username ACL mapping (needs an X.509
   parsing dep; rustls verifies but doesn't expose the parsed subject).
+
+## Phase 9b — idle-memory investigation (2026-07-06, v1.8.1)
+
+Patch release. Lazily boxed the topic-alias tables (`Option<Box<AliasTables>>`;
+connection.rs + publish.rs + delivery.rs) => idle 3.87→3.7 KiB/conn. Plus
+`examples/park_probe.rs` (io-uring dev-dep): proved the parked-fd floor = 48-B
+struct on one shared IORING_OP_POLL_ADD ring, 0.06 KiB heap / 0.08 KiB RSS (~46×,
+under Mosquitto), wake 2000/2000. Full decomposition + staged parking plan in
+next-steps.md item 1. NOT building parking yet (user gated it).
+
+## Phase 10 — mesh reliability + hot-path efficiency (2026-07-06, v1.9.0)
+
+Three audit follow-ups (user explicitly deferred the memory-density/parking item).
+94 tests, clippy clean, multi-shard verified.
+
+- **Reliable mesh control plane.** Claim/Handoff + shared-sub Join/Leave were
+  `try_send_to` (drop-on-full) => a drop under overload desyncs the shared-sub
+  membership pick (double/zero-deliver) or loses a migrating session. Now a
+  per-shard reliable outbox: ShardState.control_tx (unbounded local_channel);
+  `enqueue_control` (sync, non-dropping) replaces the three try_send_to sites
+  (mesh.rs send_control_to/broadcast_shared/broadcast_claim); a foreground drain
+  task (maintenance.rs spawn_control_drain) awaits rx.recv() and `send_to(peer,
+  msg).await` (backpressure), FIFO so Join can't reorder past Leave. Only spawned
+  with peers. $SYS/QoS0 stay best-effort. Control volume low => outbox small.
+- **Batch-drain the inbound mesh receiver** (maintenance.rs): after recv() wakes,
+  drain all queued msgs via `poll_once(receiver.recv())` without yielding =>
+  one wake per forwarded burst, not one reschedule per msg (cross-shard CPU +
+  tail latency). Factored the match into `handle_mesh_msg(&state, msg)`.
+- **QoS1/2 delivery: one Publish clone, not two** (delivery.rs send_publish).
+  Was: clone working copy + track_inflight clones again. Now: `retransmit_copy`
+  cloned only when `peer_topic_alias_max > 0` (aliasing may clear the topic);
+  else move `message` into inflight AFTER a successful write. inflight recorded
+  post-write => rollback paths no longer remove it. track_inflight() deleted.
+- Verified: 3-shard smoke — cross-shard 40/40, shared-sub exactly-once 60/60
+  (31/29 split, no dupes/loss); battery 8/8; QoS0 3-shard 380k msg/s (≈ audit
+  373k, no regression). GOTCHA: mqttwire.read_packet RAISES socket.timeout (not
+  None) — catch it when draining. The QoS1 publisher-ack microbench doesn't touch
+  send_publish (no delivery), so Task-2's clone win shows on fan-out, not that bench.

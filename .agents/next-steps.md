@@ -94,23 +94,24 @@ From the v1.7.0 audit + benchmark:
 
    Risk: high (a second io_uring ring cooperating with glommio's reactor, plus the
    egress-wake correctness). Gate each phase on the `alloc_probe`/battery numbers.
-2. **Cross-shard mesh reliability under overload.** Mesh control messages are
-   best-effort (drop-on-full). Under sustained saturation, shared-subscription
-   single-delivery and session migration can transiently double- or
-   zero-deliver if a control message is dropped. Replace best-effort control
-   with a bounded-reliable channel for membership/handoff (keep best-effort only
-   for `$SYS`). Data-plane QoS 1/2 forwards already apply backpressure; this is
-   about the *control* plane.
+2. ~~Cross-shard mesh reliability under overload.~~ **Addressed in v1.9.0** — the
+   control plane (`Claim`/`Handoff`, shared-sub `Join`/`Leave`) now goes through a
+   per-shard reliable outbox (never drops; FIFO; awaiting `send_to` backpressure),
+   while `$SYS`/QoS 0 stay best-effort. Verified exactly-once shared-sub delivery
+   across shards.
 3. **No per-core throughput superiority on the ack-bound path.** Single-shard
    QoS 1 is ~76k msg/s vs Mosquitto's ~83k — per core the mature C event loop is
-   marginally faster. Our ~4.6× edge is entirely multicore scaling. On a 1-vCPU
-   host, Mosquitto wins. Worth profiling the QoS 1/2 ack path for the last bit of
-   per-core parity.
-4. **Cross-shard latency tax (~50 µs p50).** A publish that crosses shards pays
-   the mesh forward + receiving-shard scheduling: p50 73 µs same-core vs 125 µs
-   cross-shard. Inherent to the shared-nothing design (it buys the scaling in
-   §3), but topology-aware subscriber placement or a faster mesh wakeup could
-   trim it for cross-core pub/sub topologies.
+   marginally faster; the audit's specific gap is the *publisher-ack* microbench
+   (no delivery), which is parse-bound (`mqttbytes`) + one boxed handler alloc per
+   publish (the box shrinks idle memory, so removing it would regress §1). v1.9.0
+   cut a `Publish` clone from the *delivery* path (helps QoS pub/sub fan-out, not
+   the pure-ack bench). Remaining per-core parity on the ack bench is bounded by
+   the parser and the memory/CPU trade-off of the handler boxing — low headroom.
+4. ~~Cross-shard latency tax (~50 µs p50).~~ **Partially addressed in v1.9.0** —
+   the inbound mesh receiver now batch-drains (one wake per forwarded burst, not
+   one reschedule per message), cutting cross-shard CPU + tail latency under load.
+   Single-message p50 is still bounded by the cross-thread wake (glommio-internal);
+   a faster mesh wakeup or topology-aware placement would trim it further.
 
 The audit found **no race conditions and no memory leaks** — the shared-nothing
 model makes intra-shard data races structurally impossible, and RSS returns to

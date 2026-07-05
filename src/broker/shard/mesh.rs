@@ -27,6 +27,25 @@ impl ShardState {
 		self.mesh_tx.clone()
 	}
 
+	/// Installs the sender half of the reliable control-plane outbox (its receiver
+	/// is drained by a per-shard task that awaits `send_to`). Called once the mesh
+	/// is joined, only when there are peers.
+	pub fn set_control_tx(&mut self, tx: LocalSender<(usize, MeshMsg)>) {
+		self.control_tx = Some(tx);
+	}
+
+	/// Reliably enqueues one control-plane message for `peer`. Synchronous and
+	/// non-dropping (the local outbox is unbounded); the drain task applies mesh
+	/// backpressure. A no-op with no peers (single-shard broker), where the message
+	/// would have gone nowhere anyway.
+	fn enqueue_control(&self, peer: usize, msg: MeshMsg) {
+		if let Some(tx) = &self.control_tx {
+			// The unbounded local channel only errors if the receiver (the drain
+			// task) is gone, which happens only at shard teardown.
+			let _ = tx.try_send((peer, msg));
+		}
+	}
+
 	/// Forwards a publish to every *other* shard in the mesh, best-effort. Each peer
 	/// runs its own local `route`, so a remote subscriber receives it identically.
 	///
@@ -57,17 +76,18 @@ impl ShardState {
 			.map_or(0, |s| s.nr_consumers().saturating_sub(1))
 	}
 
-	/// Sends a single control message to one peer shard (best effort, drop-on-full).
+	/// Reliably sends a single control message to one peer shard (queued to the
+	/// control outbox, never dropped).
 	fn send_control_to(&self, peer: usize, control: SessionControl) {
-		if let Some(senders) = &self.mesh_tx {
-			let _ = senders.try_send_to(peer, MeshMsg::Control(Box::new(control)));
-		}
+		self.enqueue_control(peer, MeshMsg::Control(Box::new(control)));
 	}
 
-	/// Announces a shared-group membership change to every peer shard (best
-	/// effort, drop-on-full — the same semantics as every other mesh control
-	/// message). Peers fold it into their replicated membership view so all
-	/// shards agree on the group's connected members.
+	/// Announces a shared-group membership change to every peer shard, **reliably**
+	/// (via the control outbox — never dropped, and delivered in order so a
+	/// `Join` can't be reordered past a later `Leave`). Peers fold it into their
+	/// replicated membership view so all shards agree on the group's connected
+	/// members; a dropped announcement would desync the deterministic global
+	/// shared-subscription pick (double- or zero-delivery), so this must not drop.
 	pub(super) fn broadcast_shared(&self, group: &str, client_id: &str, join: bool) {
 		let Some(senders) = &self.mesh_tx else {
 			return;
@@ -82,7 +102,7 @@ impl ShardState {
 			} else {
 				SharedEvent::Leave { group: group.to_string(), client_id: client_id.to_string() }
 			};
-			let _ = senders.try_send_to(idx, MeshMsg::Shared(event));
+			self.enqueue_control(idx, MeshMsg::Shared(event));
 		}
 	}
 
@@ -107,10 +127,12 @@ impl ShardState {
 		}
 	}
 
-	/// Broadcasts a session [`Claim`](SessionControl::Claim) to every peer shard.
-	/// With `resume = true` peers holding a suspended session hand it back; with
-	/// `resume = false` (Clean Start) they discard it instead. A no-op when there
-	/// are no peers.
+	/// Broadcasts a session [`Claim`](SessionControl::Claim) to every peer shard,
+	/// **reliably** (via the control outbox). With `resume = true` peers holding a
+	/// suspended session hand it back; with `resume = false` (Clean Start) they
+	/// discard it instead. A no-op when there are no peers. Dropping a claim under
+	/// overload would silently lose a migrating client's session, so it must not
+	/// drop.
 	pub fn broadcast_claim(&self, client_id: &str, resume: bool) {
 		let Some(senders) = &self.mesh_tx else {
 			return;
@@ -120,7 +142,7 @@ impl ShardState {
 			if idx == me {
 				continue;
 			}
-			let _ = senders.try_send_to(
+			self.enqueue_control(
 				idx,
 				MeshMsg::Control(Box::new(SessionControl::Claim {
 					client_id: client_id.to_string(),

@@ -5,6 +5,38 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): from 1.0 on, the major
 version bumps for breaking changes, the minor for features, and the patch for fixes.
 
+## [1.9.0] - 2026-07-06
+
+Cross-shard reliability and hot-path efficiency: the mesh control plane is now
+loss-free under overload, and the cross-shard and QoS delivery paths do less work
+per message.
+
+### Changed
+
+- **Mesh control plane is now reliable under overload.** Session `Claim`/`Handoff`
+  (migration) and shared-subscription `Join`/`Leave` (membership) were best-effort
+  (`try_send_to`, drop-on-full). A drop under sustained saturation could desync the
+  replicated shared-subscription membership view — risking transient double- or
+  zero-delivery — or silently lose a migrating client's session. They now go
+  through a per-shard **reliable outbox**: enqueuing is synchronous and never
+  drops, and a foreground task drains it with the awaiting `send_to` (mesh
+  backpressure), in FIFO order so a `Join` can't be reordered past a later `Leave`.
+  The best-effort data plane (`$SYS`, QoS 0 publishes) is unchanged; control volume
+  is low, so the outbox stays small even under data-plane saturation. Verified on a
+  3-shard broker: shared-subscription delivery is exactly-once across members on
+  different shards (60/60, no loss, no duplicates).
+- **Inbound mesh receiver batch-drains.** After a blocking `recv` wakes, it drains
+  every already-queued message via `poll_once` without yielding, so a peer's
+  forwarded burst is handled in a single wake instead of one reactor reschedule per
+  message — cutting cross-shard scheduling overhead and CPU under load.
+- **QoS 1/2 delivery clones the PUBLISH once, not twice.** `send_publish` kept a
+  working copy *and* an in-flight retransmit copy. It now takes the retransmit copy
+  only when outbound topic-aliasing could clear the topic; on the common
+  non-aliasing path the message is moved into the in-flight table after a
+  successful write — one fewer `Publish` clone (topic + properties) per QoS 1/2
+  delivery, which scales with fan-out. The in-flight entry is recorded post-write,
+  simplifying the rollback paths.
+
 ## [1.8.1] - 2026-07-06
 
 Idle-connection memory: a safe reduction, plus the measurement that grounds the
