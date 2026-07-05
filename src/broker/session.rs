@@ -17,6 +17,7 @@ pub const OFFLINE_QUEUE_LIMIT: usize = 1024;
 
 /// Stage of an outbound QoS 1/2 message awaiting acknowledgement, held per
 /// in-flight packet id so the exchange can resume after a reconnect.
+#[derive(Clone, Copy)]
 pub enum InflightState {
 	/// QoS 1 PUBLISH sent, awaiting PUBACK.
 	Qos1,
@@ -28,6 +29,7 @@ pub enum InflightState {
 
 /// An outbound QoS 1/2 message in flight: its stage plus the PUBLISH itself, so
 /// it can be retransmitted with the DUP flag when a session resumes.
+#[derive(Clone)]
 pub struct InflightMessage {
 	pub publish: Publish,
 	pub state: InflightState,
@@ -36,7 +38,7 @@ pub struct InflightMessage {
 /// The durable QoS state a connection hands to its session on disconnect and
 /// receives back on resume. While connected this lives in the `Connection` (hot
 /// path, no shared borrow); it only rests here between connections.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct SessionSnapshot {
 	/// Outbound QoS 1/2 messages sent but not fully acknowledged.
 	pub inflight: HashMap<u16, InflightMessage>,
@@ -66,6 +68,17 @@ pub struct Delivery {
 /// Sender half of a connection's mailbox. `LocalSender` is single-owner (not
 /// `Clone`), so each connection's sender is stored exactly once — in its session.
 pub type Mailbox = LocalSender<Delivery>;
+
+/// A durable session captured for on-disk persistence: the same owned state as a
+/// [`MigratedSession`](crate::broker::mesh::MigratedSession) plus the identity and
+/// remaining expiry needed to restore it standalone at startup.
+pub struct PersistedSession {
+	pub client_id: String,
+	/// Remaining seconds until the session expires; [`u32::MAX`] means it never
+	/// expires (Session Expiry Interval `0xFFFFFFFF`).
+	pub expiry_secs: u32,
+	pub session: crate::broker::mesh::MigratedSession,
+}
 
 /// Outcome of opening a session at CONNECT, returned so the connection can set
 /// CONNACK `session_present`, remember its generation, and restore durable state.

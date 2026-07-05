@@ -34,6 +34,7 @@ See [progress.md](progress.md) for the detailed implementation log, decisions, a
 | Structured logging (tracing)                 | ✅ `src/logger.rs`                  |
 | CLI + TOML config                            | ✅ `src/config.rs`                  |
 | Session persistence / expiry                 | ✅ suspend/resume + expiry sweep    |
+| Disk persistence (retained + sessions)       | ✅ `[persistence]`, `src/persistence/` — snapshot on interval + shutdown |
 | Offline message queueing (QoS > 0)           | ✅ buffered while suspended         |
 | In-flight retransmission (DUP) on resume     | ✅ QoS 1/2                          |
 | Session takeover (Client ID reuse)           | ✅ generation-guarded              |

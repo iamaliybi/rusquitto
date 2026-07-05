@@ -1,86 +1,58 @@
-//! Disk-backed persistence of retained messages.
+//! Retained-message snapshot.
 //!
-//! Retained messages are the broker's "last known value" per topic and the one
-//! piece of state that most needs to survive a restart. They are also the easiest
-//! to persist correctly: every shard holds an identical copy (each retained
-//! publish is broadcast to all shards), so there is a single authoritative set.
-//! One shard writes the snapshot; on startup every shard reloads it into its own
-//! table, with no cross-shard coordination.
+//! Retained messages are the broker's "last known value" per topic and the state
+//! that most needs to survive a restart. Every shard holds an identical copy (each
+//! retained publish is broadcast to all shards), so there is a single authoritative
+//! set: one shard writes the snapshot and every shard reloads it on startup, with
+//! no cross-shard coordination.
 //!
-//! The snapshot is just the concatenated MQTT wire bytes of each retained PUBLISH
-//! (self-delimiting, so no framing is needed) behind a small magic header — the
-//! same codec used on the network, so all v5 properties round-trip. Writes are
-//! atomic: a temp file is written, `fdatasync`'d, then renamed over the target, so
-//! a crash mid-write never corrupts the previous snapshot. File I/O uses glommio's
-//! io_uring-backed [`BufferedFile`], so it never blocks the reactor.
+//! The snapshot is the concatenated MQTT wire bytes of each retained PUBLISH
+//! (self-delimiting, so no framing is needed) behind a magic header — the same
+//! codec used on the network, so all v5 properties round-trip.
 
 use std::io::{Error, ErrorKind, Result};
 use std::path::Path;
 
 use bytes::BytesMut;
-use glommio::io::BufferedFile;
 use mqttbytes::{
 	QoS,
 	v5::{self as mqtt_v5, Packet, Publish},
 };
 
+use super::codec::{read_file, write_atomic};
+
 /// Magic header identifying a rusquitto retained-message snapshot, version 1.
 const MAGIC: &[u8; 4] = b"RQR1";
 
-/// Ceiling on a single serialized retained PUBLISH when loading (generous; the
-/// broker's own payload cap applied when the message was first accepted).
+/// Ceiling on a single serialized retained PUBLISH when loading.
 const MAX_PACKET: usize = 256 * 1024 * 1024;
 
-/// Serializes `messages` and writes them atomically to `path` (temp file →
-/// `fdatasync` → rename).
+/// Serializes `messages` and writes them atomically to `path`.
 pub async fn save_retained(path: &Path, messages: &[Publish]) -> Result<()> {
-	let mut buf = BytesMut::new();
+	let mut buf = Vec::new();
 	buf.extend_from_slice(MAGIC);
 	for message in messages {
 		let mut m = message.clone();
 		m.retain = true;
 		// A QoS > 0 PUBLISH needs a non-zero packet id on the wire; retained delivery
-		// reassigns it, so a placeholder is fine and round-trips.
+		// reassigns it, so a placeholder round-trips fine.
 		if m.qos != QoS::AtMostOnce && m.pkid == 0 {
 			m.pkid = 1;
 		}
-		m.write(&mut buf)
+		let mut wire = BytesMut::new();
+		m.write(&mut wire)
 			.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+		buf.extend_from_slice(&wire);
 	}
-
-	let tmp = path.with_extension("tmp");
-	let file = BufferedFile::create(&tmp).await?;
-	file.write_at(buf.to_vec(), 0).await?;
-	file.fdatasync().await?;
-	file.close().await?;
-	std::fs::rename(&tmp, path)?;
-	Ok(())
+	write_atomic(path, buf).await
 }
 
-/// Loads retained messages from `path`. A missing file yields an empty vector (a
-/// fresh broker); a file whose header or body is corrupt is an error.
+/// Loads retained messages from `path`. A missing file yields an empty vector.
 pub async fn load_retained(path: &Path) -> Result<Vec<Publish>> {
-	let file = match BufferedFile::open(path).await {
-		Ok(f) => f,
-		Err(e) => {
-			// A missing snapshot is normal (fresh broker); anything else is a real error.
-			let io: Error = e.into();
-			return if io.kind() == ErrorKind::NotFound {
-				Ok(Vec::new())
-			} else {
-				Err(io)
-			};
-		}
-	};
-	let size = file.file_size().await? as usize;
-	let data = if size == 0 {
-		Vec::new()
-	} else {
-		file.read_at(0, size).await?.to_vec()
-	};
-	file.close().await?;
-
-	parse_retained(&data)
+	match read_file(path).await? {
+		Some(data) => parse_retained(&data),
+		None => Ok(Vec::new()),
+	}
 }
 
 /// Parses the concatenated PUBLISH bytes of a snapshot (behind the magic header).
@@ -119,9 +91,8 @@ mod tests {
 		p
 	}
 
-	/// Serializes to bytes the same way `save_retained` does, for a file-less test.
 	fn serialize(messages: &[Publish]) -> Vec<u8> {
-		let mut buf = BytesMut::new();
+		let mut buf = Vec::new();
 		buf.extend_from_slice(MAGIC);
 		for message in messages {
 			let mut m = message.clone();
@@ -129,9 +100,11 @@ mod tests {
 			if m.qos != QoS::AtMostOnce && m.pkid == 0 {
 				m.pkid = 1;
 			}
-			m.write(&mut buf).unwrap();
+			let mut wire = BytesMut::new();
+			m.write(&mut wire).unwrap();
+			buf.extend_from_slice(&wire);
 		}
-		buf.to_vec()
+		buf
 	}
 
 	#[test]

@@ -24,8 +24,8 @@ use glommio::channels::channel_mesh::Senders;
 use glommio::channels::local_channel::LocalSender;
 use mqttbytes::v5::Publish;
 
-use crate::broker::mesh::{MeshMsg, MigratedSession};
-use crate::broker::session::{Delivery, Mailbox, SessionHandle, SessionSnapshot};
+use crate::broker::mesh::{MeshMsg, MigratedSession, MigratedSub};
+use crate::broker::session::{Delivery, Mailbox, PersistedSession, SessionHandle, SessionSnapshot};
 use crate::broker::topics::{SubOptions, TopicTrie};
 
 /// MQTT 5 Session Expiry Interval sentinel meaning "the session never expires".
@@ -237,6 +237,107 @@ impl ShardState {
 	pub fn shutdown_connections(&mut self) {
 		for session in self.sessions.values_mut() {
 			session.mailbox = None;
+		}
+	}
+
+	/// Snapshots the durable *suspended* (offline) sessions on this shard for
+	/// persistence, non-destructively. Connected sessions are skipped: their live
+	/// QoS state lives in the connection, not here, and their expiry interval isn't
+	/// known to the shard. A session already at its expiry deadline is skipped too.
+	pub fn persist_sessions(&self, now: Instant) -> Vec<PersistedSession> {
+		let mut out = Vec::new();
+		for (client_id, session) in &self.sessions {
+			if session.mailbox.is_some() {
+				continue; // connected — not durable here
+			}
+			let expiry_secs = match session.expires_at {
+				None => u32::MAX, // never expires
+				Some(deadline) => {
+					let remaining = deadline.saturating_duration_since(now).as_secs();
+					if remaining == 0 {
+						continue; // about to expire; not worth persisting
+					}
+					u32::try_from(remaining).unwrap_or(u32::MAX)
+				}
+			};
+			let subscriptions = self
+				.trie
+				.client_subscriptions(client_id)
+				.into_iter()
+				.map(|f| MigratedSub {
+					filter: f.filter,
+					qos: f.qos,
+					nolocal: f.nolocal,
+					retain_as_published: f.retain_as_published,
+					share_group: f.share_group,
+					sub_id: f.sub_id,
+				})
+				.collect();
+			let snapshot = session.snapshot.clone();
+			let offline = session
+				.offline_queue
+				.iter()
+				.map(|d| ((*d.publish).clone(), d.qos, d.retain, d.sub_ids.clone()))
+				.collect();
+			out.push(PersistedSession {
+				client_id: client_id.clone(),
+				expiry_secs,
+				session: MigratedSession {
+					subscriptions,
+					inflight: snapshot.inflight,
+					incoming_qos2: snapshot.incoming_qos2,
+					next_pkid: snapshot.next_pkid,
+					offline,
+				},
+			});
+		}
+		out
+	}
+
+	/// Installs persisted sessions as *suspended* sessions at startup: re-arms their
+	/// subscriptions in the trie, restores durable QoS state and the offline queue,
+	/// and recomputes each expiry deadline from `now`. A reconnecting client then
+	/// resumes it locally, or the cross-shard `Claim`/`Handoff` migrates it here.
+	pub fn load_sessions(&mut self, sessions: Vec<PersistedSession>, now: Instant) {
+		for ps in sessions {
+			for sub in &ps.session.subscriptions {
+				self.trie.insert(
+					&sub.filter,
+					&ps.client_id,
+					SubOptions {
+						qos: sub.qos,
+						nolocal: sub.nolocal,
+						retain_as_published: sub.retain_as_published,
+						share_group: sub.share_group.as_deref(),
+						sub_id: sub.sub_id,
+					},
+				);
+			}
+			let offline_queue = ps
+				.session
+				.offline
+				.into_iter()
+				.map(|(publish, qos, retain, sub_ids)| Delivery { publish: Rc::new(publish), qos, retain, sub_ids })
+				.collect();
+			let snapshot = SessionSnapshot {
+				inflight: ps.session.inflight,
+				incoming_qos2: ps.session.incoming_qos2,
+				next_pkid: ps.session.next_pkid,
+			};
+			let expires_at = (ps.expiry_secs != u32::MAX).then(|| now + Duration::from_secs(u64::from(ps.expiry_secs)));
+			self.next_generation += 1;
+			let generation = self.next_generation;
+			self.sessions.insert(
+				ps.client_id,
+				Session {
+					mailbox: None,
+					expires_at,
+					generation,
+					snapshot,
+					offline_queue,
+					pending_will: None,
+				},
+			);
 		}
 	}
 
