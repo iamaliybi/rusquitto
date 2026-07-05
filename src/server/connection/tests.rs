@@ -69,8 +69,54 @@ fn make_conn_with(out: Rc<RefCell<Vec<u8>>>, limits: LimitsConfig) -> Connection
 		Rc::new(Authenticator::from_config(&AuthConfig::default())),
 		Arc::new(Metrics::default()),
 		Arc::new(AtomicBool::new(false)),
-		false,
+		TlsIdentity::None,
 	)
+}
+
+/// `make_conn` with a caller-chosen mutual-TLS identity (anonymous auth otherwise).
+fn make_conn_tls(out: Rc<RefCell<Vec<u8>>>, tls_identity: TlsIdentity) -> Connection<MockStream> {
+	let stream = MockStream { inbound: VecDeque::new(), outbound: out };
+	Connection::new(
+		stream,
+		0,
+		ShardState::new(),
+		LimitsConfig::default(),
+		Rc::new(Authenticator::from_config(&AuthConfig::default())),
+		Arc::new(Metrics::default()),
+		Arc::new(AtomicBool::new(false)),
+		tls_identity,
+	)
+}
+
+#[test]
+fn cert_cn_becomes_username_when_no_login() {
+	block_on(async {
+		let out = Rc::new(RefCell::new(Vec::new()));
+		let mut conn = make_conn_tls(out.clone(), TlsIdentity::Cn("device-7".into()));
+		// A clean CONNECT with no login: the verified cert's CN is the identity.
+		drive(&mut conn, connect_packet("c1")).await.unwrap();
+		assert!(conn.connected);
+		assert_eq!(
+			conn.username.as_deref(),
+			Some("device-7"),
+			"cert CN mapped to the MQTT username"
+		);
+	});
+}
+
+#[test]
+fn verified_cert_without_mapping_has_no_username() {
+	block_on(async {
+		let out = Rc::new(RefCell::new(Vec::new()));
+		let mut conn = make_conn_tls(out.clone(), TlsIdentity::Verified);
+		// Cert-authenticated but CN mapping off: connected, but no MQTT identity.
+		drive(&mut conn, connect_packet("c1")).await.unwrap();
+		assert!(conn.connected);
+		assert_eq!(
+			conn.username, None,
+			"verified-only cert grants but carries no identity"
+		);
+	});
 }
 
 /// A minimal clean-start CONNECT for client id `id`.
@@ -531,7 +577,7 @@ fn stall_conn(out: Rc<RefCell<Vec<u8>>>, inbound: VecDeque<u8>, limits: LimitsCo
 		Rc::new(Authenticator::from_config(&AuthConfig::default())),
 		Arc::new(Metrics::default()),
 		Arc::new(AtomicBool::new(false)),
-		false,
+		TlsIdentity::None,
 	)
 }
 

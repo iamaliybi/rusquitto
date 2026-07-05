@@ -98,16 +98,53 @@ pub fn load_server_config(
 	build_server_config(certs, key, client_auth).map(Arc::new)
 }
 
-/// Whether the peer presented a client certificate that passed verification — the
-/// signal a connection uses to treat itself as authenticated by mutual TLS. After
-/// a completed handshake against a client-cert verifier, a present peer chain
-/// means the certificate was trusted.
-pub fn client_cert_present(stream: &TlsStream) -> bool {
-	stream
+/// Outcome of mutual-TLS client authentication, handed to the connection so the
+/// CONNECT handler can decide the client's MQTT identity.
+#[derive(Clone, Debug, Default)]
+pub enum TlsIdentity {
+	/// No verified client certificate (plain TCP, or TLS without client auth).
+	#[default]
+	None,
+	/// A client certificate was verified, but CN→username mapping is off: the
+	/// client is authenticated by the certificate yet carries no MQTT identity
+	/// (anonymous ACLs).
+	Verified,
+	/// A client certificate was verified and its subject Common Name is used as
+	/// the MQTT username (per-device ACLs).
+	Cn(String),
+}
+
+/// Resolves the mutual-TLS identity of a completed handshake. A present peer chain
+/// means the certificate was trusted (the verifier ran during the handshake). When
+/// `map_cn` is set, the leaf's subject Common Name becomes the identity; a
+/// verified certificate with no usable CN falls back to [`TlsIdentity::Verified`].
+pub fn client_tls_identity(stream: &TlsStream, map_cn: bool) -> TlsIdentity {
+	let Some(leaf) = stream
 		.get_ref()
 		.1
 		.peer_certificates()
-		.is_some_and(|chain| !chain.is_empty())
+		.and_then(|chain| chain.first())
+	else {
+		return TlsIdentity::None;
+	};
+	if !map_cn {
+		return TlsIdentity::Verified;
+	}
+	match cert_common_name(leaf.as_ref()) {
+		Some(cn) => TlsIdentity::Cn(cn),
+		None => TlsIdentity::Verified,
+	}
+}
+
+/// Extracts the subject Common Name from a DER-encoded certificate, if present.
+fn cert_common_name(der: &[u8]) -> Option<String> {
+	use x509_parser::prelude::{FromDer, X509Certificate};
+	let (_, cert) = X509Certificate::from_der(der).ok()?;
+	cert.subject()
+		.iter_common_name()
+		.next()
+		.and_then(|attr| attr.as_str().ok())
+		.map(str::to_string)
 }
 
 /// Completes the TLS handshake on an accepted TCP connection, bounded by `timeout`

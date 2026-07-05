@@ -5,6 +5,25 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): from 1.0 on, the major
 version bumps for breaking changes, the minor for features, and the patch for fixes.
 
+## [1.10.0] - 2026-07-06
+
+Mutual-TLS identity: a verified client certificate can now carry a per-device MQTT
+identity for ACLs.
+
+### Added
+
+- **`[tls] cert_cn_as_username`** — when mutual TLS is enabled, use a verified
+  client certificate's subject **Common Name** as the MQTT username, so
+  `[[auth.users]]` ACLs apply per device. A cert-verified client that sends no
+  username is authenticated by the certificate and keyed on its CN; a client that
+  also sends an explicit username is checked against `[auth]` the usual way (the
+  certificate only gated the transport). Default `false` — a cert-verified client
+  with no username remains anonymous for ACLs, as before. Adds the `x509-parser`
+  dependency (rustls verifies the chain but does not expose the parsed subject).
+  Verified end-to-end: with a client CN mapped to a `[[auth.users]]` entry whose
+  publish ACL is `sensors/01/#`, an in-scope publish is delivered and an
+  out-of-scope one is refused.
+
 ## [1.9.2] - 2026-07-06
 
 Test coverage: a real end-to-end integration suite, plus documentation of the

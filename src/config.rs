@@ -122,6 +122,13 @@ pub struct TlsConfig {
 	/// pick up a rotated certificate. Each shard reloads its own acceptor, so the
 	/// swap needs no cross-core coordination.
 	pub reload_interval: u64,
+	/// Use a verified client certificate's subject Common Name as the MQTT
+	/// username, so `[[auth.users]]` ACLs apply per device. A client that also
+	/// sends an explicit MQTT username is checked the usual way instead (the CN
+	/// only stands in when no username is supplied). Ignored unless
+	/// `client_ca_file` is set. Default `false` — a cert-verified client with no
+	/// username is then treated as anonymous for ACLs.
+	pub cert_cn_as_username: bool,
 }
 
 impl TlsConfig {
@@ -431,6 +438,7 @@ impl Default for TlsConfig {
 			client_ca_file: None,
 			require_client_cert: false,
 			reload_interval: 0,
+			cert_cn_as_username: false,
 		}
 	}
 }
