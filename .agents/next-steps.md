@@ -15,14 +15,16 @@ via boxed transport pipelines), `malloc_trim` on the maintenance tick,
 `[server] socket_recv_buffer`/`socket_send_buffer`, and a
 `rusquitto-aarch64-unknown-linux-gnu` release asset via `cargo zigbuild`.
 
+**Sub-4-KiB idle connections: DONE** (2026-07-05, on the
+`feat/connection-future-diet` branch): 3.9 KiB RSS/conn, via cold-path and
+hot-arm boxing of the connection state machine (`run()` 3312 → 624 B) plus
+boxing rare/suspended-only data out of `Connection` and the sessions table.
+The remaining floor is glommio per-connection internals (~1.7 KiB task +
+stream/source allocations) — going lower means changes inside glommio.
+
 ## Candidate future work (nothing committed)
 
 Ideas noted along the way, in rough value order — none is planned or promised:
-
-- **Sub-4-KiB idle connections** — the remaining footprint is the connection
-  state machine itself (~4.5 KiB boxed) plus session/channel bookkeeping;
-  shrinking further means slimming `event_loop`/handler futures. `examples/
-  allocprobe.rs` measures it.
 - **Session/queued-message WAL** — persistence is snapshot-based; a
   write-ahead log would close the crash window (`snapshot_interval`).
 - **mTLS** (client-certificate authentication) and certificate hot-reload.

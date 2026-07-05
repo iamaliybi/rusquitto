@@ -519,3 +519,31 @@ Transports re-verified after the serve() restructure: plain + mqtts (openssl
 self-signed cert) + raw-RFC6455 ws client -> CONNACK. GOTCHA that cost an
 hour: a hand-rolled test CONNECT with a wrong remaining-length byte made the
 WS path look broken; the broker was fine.
+
+---
+
+## Phase 7b — Sub-4-KiB idle connections (2026-07-05, feat/connection-future-diet)
+
+Idle RSS 7.5 -> 3.9 KiB/conn (allocprobe, 2000 conns). run() future 3312 ->
+624 B. THE TECHNIQUE THAT WORKS (vs source-level slot elimination, which
+provably does nothing): boxing through plain-fn seams —
+1. fan_out mesh forward: try_send_to first (sync, common case); only a FULL
+   link falls back to boxed send_to (backpressure preserved; QoS0 unchanged).
+   Also reduce GlommioError<MeshMsg> (~230 B) to a bool before the await.
+2. Hot-arm boxing: PUBLISH / PUBREL / CONNECT handlers boxed per packet
+   (boxed_handle_* seams). One ~1KB-class alloc per such packet. Throughput
+   A/B vs v1.6.0 binary (stresser, 400 conns QoS1 12s): 49.9k -> 57.2k msg/s
+   — FASTER, because the in-place publish normalization killed a String
+   alloc+copy per publish and try-send-first skips future setup.
+3. parse+dispatch merged into process_one (one Packet slot; process_packet is
+   GONE — tests drive via encode_packet + process_one, see tests::drive).
+4. Rare data boxed out of hot structs: Connection.will, Session.pending_will,
+   Session.snapshot (Option<Box<SessionSnapshot>>, None while connected) —
+   the last two shrink every sessions-table slot (~400 -> ~100 B), visible as
+   the amortized >16KiB class dropping 892 -> 463 -> ... B/conn.
+Remaining floor ~1.7 KiB/conn = glommio task (600) + stream/source allocs
+(1073) — below that means glommio-internal changes.
+
+Verified: 87 tests, clippy -D warnings, QoS 0/1/2 smoke, WS smoke, 2-shard
+shared-sub exactly-once (40/40), throughput A/B. probe_future_tree doc updated
+as the regression watchpoint.

@@ -95,7 +95,7 @@ impl<S: ByteStream> Connection<S> {
 				.unwrap_or(0);
 			let mut publish = mqtt_v5::Publish::new(w.topic, w.qos, w.message.to_vec());
 			publish.retain = w.retain;
-			self.will = Some(publish);
+			self.will = Some(Box::new(publish));
 		}
 
 		// Backfill the connection span's `client_id` so every subsequent log line

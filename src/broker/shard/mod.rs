@@ -55,7 +55,9 @@ struct Session {
 	generation: u64,
 	/// Durable QoS state, populated only while the session is suspended (the
 	/// connected client holds the live copy). Restored on resume.
-	snapshot: SessionSnapshot,
+	/// Boxed and absent while connected (the live connection holds the real
+	/// state), so a connected session costs its table slot nothing here.
+	snapshot: Option<Box<SessionSnapshot>>,
 	/// QoS > 0 messages that matched while the client was offline, delivered in
 	/// order when it reconnects. Bounded by [`OFFLINE_QUEUE_LIMIT`].
 	///
@@ -64,7 +66,9 @@ struct Session {
 	/// A Will Message armed with a non-zero Will Delay Interval: `(will, deadline)`.
 	/// Published by [`sweep_expired`](ShardState::sweep_expired) once the deadline
 	/// passes (or the session ends first), and cancelled if the client reconnects.
-	pending_will: Option<(Publish, Instant)>,
+	/// Boxed: armed wills are rare, and the tuple inline (~232 B) would bloat
+	/// every slot of the sessions table, which scales with connection count.
+	pending_will: Option<Box<(Publish, Instant)>>,
 }
 
 /// Per-shard broker state. See the [module docs](self) for the split of concerns.
@@ -148,7 +152,7 @@ impl ShardState {
 			let handle = SessionHandle {
 				resumed: true,
 				generation,
-				snapshot: std::mem::take(&mut existing.snapshot),
+				snapshot: existing.snapshot.take().map(|b| *b).unwrap_or_default(),
 				offline_queue: std::mem::take(&mut existing.offline_queue),
 			};
 			// The resumed client's shared subscriptions (kept armed in the trie
@@ -165,7 +169,7 @@ impl ShardState {
 				mailbox: Some(mailbox),
 				expires_at: None,
 				generation,
-				snapshot: SessionSnapshot::default(),
+				snapshot: None,
 				offline_queue: VecDeque::new(),
 				pending_will: None,
 			},
@@ -270,7 +274,7 @@ impl ShardState {
 			self.trie.remove_client(client_id);
 		} else {
 			session.mailbox = None;
-			session.snapshot = snapshot;
+			session.snapshot = Some(Box::new(snapshot));
 			// Messages held back by the outbound window were already dequeued, so
 			// they precede anything that arrives while suspended.
 			pending.append(&mut session.offline_queue);
@@ -329,7 +333,7 @@ impl ShardState {
 					sub_id: f.sub_id,
 				})
 				.collect();
-			let snapshot = session.snapshot.clone();
+			let snapshot = session.snapshot.as_deref().cloned().unwrap_or_default();
 			let offline = session
 				.offline_queue
 				.iter()
@@ -393,7 +397,7 @@ impl ShardState {
 					mailbox: None,
 					expires_at,
 					generation,
-					snapshot,
+					snapshot: Some(Box::new(snapshot)),
 					offline_queue,
 					pending_will: None,
 				},
@@ -437,7 +441,7 @@ impl ShardState {
 			&& session.generation == generation
 		{
 			let deadline = Instant::now() + Duration::from_secs(u64::from(delay_secs));
-			session.pending_will = Some((will, deadline));
+			session.pending_will = Some(Box::new((will, deadline)));
 		}
 	}
 
@@ -455,8 +459,9 @@ impl ShardState {
 			if session
 				.pending_will
 				.as_ref()
-				.is_some_and(|(_, deadline)| *deadline <= now)
+				.is_some_and(|armed| armed.1 <= now)
 			{
+				// Box permits moving the will out through its deref.
 				wills.push(session.pending_will.take().unwrap().0);
 			}
 		}
@@ -472,7 +477,8 @@ impl ShardState {
 			// A session ending publishes any still-pending will (the deadline is
 			// `min(will_delay, session_expiry)`, so this is the delay==expiry case).
 			if let Some(session) = self.sessions.remove(&id) {
-				if let Some((will, _)) = session.pending_will {
+				if let Some(armed) = session.pending_will {
+					let (will, _) = *armed;
 					wills.push(will);
 				}
 				self.trie.remove_client(&id);

@@ -7,12 +7,25 @@ use mqttbytes::{
 };
 use std::collections::VecDeque;
 use std::io::{Error, ErrorKind, Result};
+use std::rc::Rc;
 use tracing::{debug, warn};
 
 use super::{Connection, PENDING_OUTBOUND_LIMIT};
 use crate::broker::mesh::MeshMsg;
 use crate::broker::session::{Delivery, InflightMessage, InflightState};
 use crate::transport::ByteStream;
+
+/// Boxes a blocking mesh send on a plain (non-async) stack frame, so its future
+/// is heap-allocated only on the rare full-link path — see `fan_out`. (Inline
+/// `Box::pin(fut).await` would not help: statement temporaries containing
+/// `.await` keep their slot in the enclosing machine.)
+fn boxed_mesh_send<'a>(
+	senders: &'a Rc<glommio::channels::channel_mesh::Senders<MeshMsg>>,
+	idx: usize,
+	msg: MeshMsg,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = glommio::Result<(), MeshMsg>> + 'a>> {
+	Box::pin(senders.send_to(idx, msg))
+}
 
 /// An all-`None` v5 property set (mqttbytes has no constructor for it).
 fn empty_publish_properties() -> mqtt_v5::PublishProperties {
@@ -81,14 +94,18 @@ impl<S: ByteStream> Connection<S> {
 	/// Forwards a publish to peer shards, then fans it out to local subscribers.
 	///
 	/// The cross-shard forward is where at-least/exactly-once could previously be
-	/// lost: a full mesh link dropped the message. Now a **QoS > 0** publish is sent
-	/// with the awaiting `send_to`, so the publisher applies backpressure (its own
-	/// PUBACK/PUBREC is only written after this returns) rather than dropping —
-	/// making the guarantee hold across shards, not just within one. A **QoS 0**
-	/// publish keeps the non-blocking `try_send_to` (fire-and-forget). The mesh
-	/// senders are cloned out of `ShardState` so its borrow isn't held across the
-	/// await. `publisher` is this connection's client id for a client publish (No
-	/// Local), or `None` for a broker-originated one such as a Will Message.
+	/// lost: a full mesh link dropped the message. A **QoS > 0** publish is
+	/// guaranteed delivery to every peer link: the non-blocking `try_send_to`
+	/// covers the common case (room on the link, no future, no suspension), and
+	/// only a *full* link falls back to the awaiting `send_to` — boxed, so its
+	/// state machine lives on the heap for the rare congested moment instead of
+	/// occupying a slot in every connection's task forever. The publisher's own
+	/// PUBACK/PUBREC is written only after all forwards land, so the guarantee
+	/// holds across shards. A **QoS 0** publish keeps pure `try_send_to`
+	/// (fire-and-forget). The mesh senders are cloned out of `ShardState` so its
+	/// borrow isn't held across any await. `publisher` is this connection's
+	/// client id for a client publish (No Local), or `None` for a
+	/// broker-originated one such as a Will Message.
 	pub(super) async fn fan_out(&self, message: mqtt_v5::Publish, publisher: Option<&str>) {
 		let senders = self.state.borrow().mesh_senders();
 		if let Some(senders) = senders {
@@ -97,14 +114,19 @@ impl<S: ByteStream> Connection<S> {
 				if idx == me {
 					continue;
 				}
-				if message.qos == QoS::AtMostOnce {
-					let _ = senders.try_send_to(idx, MeshMsg::Publish(message.clone()));
-				} else {
-					// Backpressure: wait for room so a QoS > 0 message is never dropped
-					// on a full mesh link. Err means the peer is gone — nothing to do.
-					let _ = senders
-						.send_to(idx, MeshMsg::Publish(message.clone()))
-						.await;
+				// The error value carries the message back (`GlommioError<MeshMsg>`,
+				// ~230 bytes) — reduce it to a flag *before* the await below, or its
+				// slot would live in every connection's machine.
+				let full = matches!(
+					senders.try_send_to(idx, MeshMsg::Publish(message.clone())),
+					Err(glommio::GlommioError::WouldBlock(_))
+				);
+				// Full link. For QoS > 0, apply backpressure: wait for room so the
+				// message is never dropped (clone again — this path is rare and the
+				// mesh being congested dwarfs one clone). QoS 0 stays drop-on-full,
+				// and a closed link (peer gone) needs nothing either way.
+				if full && message.qos != QoS::AtMostOnce {
+					let _ = boxed_mesh_send(&senders, idx, MeshMsg::Publish(message.clone())).await;
 				}
 			}
 		}

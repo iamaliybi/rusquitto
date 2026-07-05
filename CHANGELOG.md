@@ -5,6 +5,30 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): from 1.0 on, the major
 version bumps for breaking changes, the minor for features, and the patch for fixes.
 
+## [Unreleased]
+
+### Changed
+
+- **Sub-4-KiB idle connections: 7.5 → 3.9 KiB RSS/conn** (originally 24.9).
+  The connection state machine went from 3312 to 624 bytes resident:
+  - The mesh forward in `fan_out` now tries the non-blocking send first and
+    only a *full* link falls back to the awaiting (backpressure) send — boxed,
+    so its machinery exists on the heap during congestion instead of occupying
+    every connection forever. The `GlommioError<MeshMsg>` result (~230 B) is
+    reduced to a flag before any await for the same reason. Delivery
+    guarantees are unchanged: QoS > 0 still never drops on a full link.
+  - The PUBLISH, PUBREL, and CONNECT handler futures are boxed through
+    plain-fn seams: one small allocation per such packet buys ~2.4 KiB out of
+    every connection's resident memory (throughput-checked against v1.6.0).
+  - Parse and dispatch merged into one `process_one` (one `Packet`-sized slot,
+    not two), the throttle sleep is boxed (exists only while pacing), the Will
+    Message and each session's suspended snapshot / armed will are boxed
+    (rare or absent-while-connected data no longer bloats every `Connection`
+    and every sessions-table slot).
+- **One less allocation per inbound PUBLISH**: the fan-out message is
+  normalized in place instead of cloned, removing a topic-string allocation
+  and copy from the hottest path.
+
 ## [1.6.0] - 2026-07-05
 
 Small-host hardening: less memory per connection (process *and* kernel side),
