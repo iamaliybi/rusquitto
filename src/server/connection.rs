@@ -198,6 +198,10 @@ pub struct Connection<S: ByteStream> {
 	/// Set once a valid CONNECT has been accepted. Every other packet type is a
 	/// protocol violation before this, and a second CONNECT is a violation after.
 	connected: bool,
+	/// The client authenticated with a certificate trusted under mutual TLS. When
+	/// set, a CONNECT that supplies no username is accepted on the strength of the
+	/// certificate alone (see [`handle_connect`](Self::handle_connect)).
+	tls_verified: bool,
 	/// Idle deadline: the CONNECT handshake deadline before connecting, then the
 	/// keep-alive deadline (1.5× the negotiated keep-alive) afterwards. `None`
 	/// disables the check. Reset on every inbound packet.
@@ -205,11 +209,27 @@ pub struct Connection<S: ByteStream> {
 	/// The keep-alive window (1.5× the negotiated interval), used to refresh
 	/// `deadline` after each inbound packet. `None` when keep-alive is disabled.
 	keepalive: Option<Duration>,
+	/// When the bytes of the current *incomplete* frame first appeared. A frame
+	/// that then stalls is a slow-loris (the truncated-header adversarial case);
+	/// [`framing_deadline`](Self::framing_deadline) reaps it within the handshake
+	/// window even when keep-alive is disabled (`deadline` is then `None`). Reset
+	/// to `None` whenever the assembly buffer holds no partial frame.
+	partial_since: Option<Instant>,
 	/// Count of active subscriptions, enforced against `limits.max_subscriptions_per_client`.
 	subscription_count: usize,
 	/// Per-connection inbound PUBLISH throttle. `Some` when `limits.max_message_rate`
 	/// is set: bounds how much CPU one noisy publisher can draw on its pinned core.
 	rate_limiter: Option<TokenBucket>,
+}
+
+/// The earlier of two optional deadlines; `None` means "no bound", so a present
+/// deadline always wins over an absent one.
+fn earlier(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+	match (a, b) {
+		(Some(x), Some(y)) => Some(x.min(y)),
+		(x, None) => x,
+		(None, y) => y,
+	}
 }
 
 impl<S: ByteStream> Connection<S> {
@@ -222,6 +242,9 @@ impl<S: ByteStream> Connection<S> {
 	/// stores its topic string, so this bounds that per-connection memory.
 	const OUTBOUND_TOPIC_ALIAS_MAX: u16 = 32;
 
+	// A constructor wiring the per-connection handles; each argument is a distinct
+	// required dependency, so bundling them would only add an indirection.
+	#[allow(clippy::too_many_arguments)]
 	pub fn new(
 		stream: S,
 		shard_id: usize,
@@ -230,6 +253,7 @@ impl<S: ByteStream> Connection<S> {
 		auth: Rc<Authenticator>,
 		metrics: Arc<Metrics>,
 		shutdown: Arc<AtomicBool>,
+		tls_verified: bool,
 	) -> Self {
 		let (mailbox_tx, mailbox_rx) = local_channel::new_unbounded();
 		Self {
@@ -264,10 +288,12 @@ impl<S: ByteStream> Connection<S> {
 			peer_topic_alias_max: 0,
 			outbound_aliases: HashMap::new(),
 			connected: false,
+			tls_verified,
 			// Bound the pre-CONNECT handshake so an idle socket can't hold a slot.
 			deadline: (limits.connect_timeout > 0)
 				.then(|| Instant::now() + Duration::from_secs(u64::from(limits.connect_timeout))),
 			keepalive: None,
+			partial_since: None,
 			subscription_count: 0,
 			rate_limiter: (limits.max_message_rate > 0)
 				.then(|| TokenBucket::per_second(limits.max_message_rate, Instant::now())),
@@ -383,6 +409,19 @@ impl<S: ByteStream> Connection<S> {
 		result
 	}
 
+	/// The stall deadline for an in-progress (incomplete) frame: a client that has
+	/// sent part of a packet must finish it within the handshake window
+	/// (`connect_timeout`). This bounds a slow-loris that dribbles a frame header
+	/// and stalls — including *after* CONNECT with keep-alive disabled, where the
+	/// idle deadline is otherwise `None`. A zero `connect_timeout` disables it.
+	fn framing_deadline(&self) -> Option<Instant> {
+		let secs = u64::from(self.limits.connect_timeout);
+		match self.partial_since {
+			Some(started) if secs > 0 => Some(started + Duration::from_secs(secs)),
+			_ => None,
+		}
+	}
+
 	/// Bidirectional event loop, structured as *drain → flush → block*:
 	///
 	/// 1. Process every complete packet already in the assembly buffer and every
@@ -414,6 +453,9 @@ impl<S: ByteStream> Connection<S> {
 				if let Some(window) = self.keepalive {
 					self.deadline = Some(Instant::now() + window);
 				}
+				// A complete frame was consumed: clear the stall clock so the next
+				// frame (if bytes for one are already buffered) starts a fresh one.
+				self.partial_since = None;
 				// A large ack burst shouldn't balloon the output buffer.
 				if self.outbound.len() >= FLUSH_THRESHOLD {
 					self.flush().await?;
@@ -446,8 +488,19 @@ impl<S: ByteStream> Connection<S> {
 			// The read reserves `read_chunk` bytes in the assembly buffer and reads
 			// directly into it (no intermediate copy). `valid` marks the real data
 			// length so a cancelled read's zeroed reservation is always dropped.
+			// Track an in-progress (incomplete) frame: leftover bytes that don't yet
+			// form a complete packet start the stall clock. A frame that then stalls
+			// — a slow-loris, or the truncated-CONNECT-header adversarial case — is
+			// reaped by `framing_deadline`, even when the idle `deadline` is `None`
+			// (keep-alive disabled). No partial frame ⇒ no framing bound.
+			if self.inbound.is_empty() {
+				self.partial_since = None;
+			} else if self.partial_since.is_none() {
+				self.partial_since = Some(Instant::now());
+			}
+
 			let valid = self.inbound.len();
-			let deadline = self.deadline;
+			let deadline = earlier(self.deadline, self.framing_deadline());
 			let chunk = self.read_chunk;
 			let event = {
 				let stream = &mut self.stream;
@@ -509,12 +562,18 @@ impl<S: ByteStream> Connection<S> {
 				// within the keep-alive window. Either way, drop the connection (an
 				// abnormal close, so a keep-alive timeout still fires the will).
 				Event::Timeout => {
+					// A partial frame still buffered means the deadline that fired was
+					// the framing (stall) bound, not an idle keep-alive lapse.
+					let stalled_mid_frame = !self.inbound.is_empty();
 					self.inbound.truncate(valid);
 					if self.connected {
-						warn!("keep-alive timeout, closing connection");
+						warn!(
+							stalled_mid_frame,
+							"keep-alive or framing timeout, closing connection"
+						);
 						let _ = self.send_disconnect(mqtt_v5::DisconnectReasonCode::KeepAliveTimeout);
 					} else {
-						warn!("CONNECT not received within handshake timeout, closing");
+						warn!("CONNECT not received or completed within handshake timeout, closing");
 					}
 					return Ok(());
 				}

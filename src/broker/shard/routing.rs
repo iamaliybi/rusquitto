@@ -238,6 +238,7 @@ impl ShardState {
 		let Some(session) = self.sessions.get_mut(client_id) else {
 			return;
 		};
+		let mut queued_offline = false;
 		match &session.mailbox {
 			Some(mailbox) => {
 				// The mailbox channel is unbounded so an idle connection allocates
@@ -255,8 +256,13 @@ impl ShardState {
 				session
 					.offline_queue
 					.push_back(Delivery { publish: publish.clone(), qos, retain, sub_ids });
+				queued_offline = true;
 			}
 			None => {}
+		}
+		// The suspended session's durable offline queue grew: re-log it in the WAL.
+		if queued_offline {
+			self.wal_dirty(client_id);
 		}
 	}
 }

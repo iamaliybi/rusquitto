@@ -162,13 +162,19 @@ impl ShardState {
 		// Decide with an immutable peek first so the borrow ends before we mutate.
 		let session = match self.sessions.get(&client_id).map(|s| s.mailbox.is_none()) {
 			// Suspended session and the client wants to resume: migrate it wholesale.
-			Some(true) if resume => Some(self.extract_session(&client_id)),
+			// It now lives on the requesting shard, so tombstone it here.
+			Some(true) if resume => {
+				let migrated = self.extract_session(&client_id);
+				self.wal_removed(&client_id);
+				Some(migrated)
+			}
 			// A still-live session (cross-shard takeover) or a Clean Start discard:
 			// drop it here — dropping the mailbox also disconnects the live client —
 			// without migrating any durable state.
 			Some(_) => {
 				self.sessions.remove(&client_id);
 				self.trie.remove_client(&client_id);
+				self.wal_removed(&client_id);
 				None
 			}
 			// Nothing for this client id.

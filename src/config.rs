@@ -107,6 +107,21 @@ pub struct TlsConfig {
 	pub cert_file: Option<PathBuf>,
 	/// PEM private key (PKCS#8, PKCS#1, or SEC1). Required when `enabled`.
 	pub key_file: Option<PathBuf>,
+	/// PEM bundle of trusted client-CA certificates. When set, mutual TLS is on:
+	/// a client presenting a certificate has it verified against this CA. Absent
+	/// (the default) disables client-certificate authentication entirely.
+	pub client_ca_file: Option<PathBuf>,
+	/// Require every TLS client to present a certificate valid under
+	/// `client_ca_file`. When true, a client without a trusted certificate fails
+	/// the TLS handshake. When false, client certificates are verified if offered
+	/// but not demanded. Ignored unless `client_ca_file` is set.
+	pub require_client_cert: bool,
+	/// Seconds between checking the certificate/key/CA files for changes and
+	/// hot-reloading them into new connections (`0` = disabled). Existing
+	/// connections keep the certificate they handshook with; only new handshakes
+	/// pick up a rotated certificate. Each shard reloads its own acceptor, so the
+	/// swap needs no cross-core coordination.
+	pub reload_interval: u64,
 }
 
 impl TlsConfig {
@@ -269,6 +284,13 @@ pub struct PersistenceConfig {
 	/// Seconds between snapshots (`0` = snapshot only on graceful shutdown). A crash
 	/// may lose retained updates made since the last snapshot.
 	pub snapshot_interval: u64,
+	/// Milliseconds between session write-ahead-log flushes (`0` = WAL disabled,
+	/// snapshot-only). When set, a per-shard append-only log records session
+	/// suspensions and offline-queue growth between snapshots, group-committed
+	/// (`fdatasync`'d) at this cadence and replayed over the snapshot on startup —
+	/// so a crash loses at most this window of durable *session* state instead of a
+	/// whole `snapshot_interval`. Retained messages are snapshot-only (not WAL'd).
+	pub wal_flush_ms: u64,
 }
 
 impl PersistenceConfig {
@@ -281,6 +303,17 @@ impl PersistenceConfig {
 	/// each shard (mesh peer) persists its own file.
 	pub fn session_path(&self, peer_id: usize) -> PathBuf {
 		self.dir.join(format!("sessions-{peer_id}.mqtt"))
+	}
+
+	/// Full path to a shard's session write-ahead log. Like the session snapshot,
+	/// it is shard-local (one file per mesh peer).
+	pub fn wal_path(&self, peer_id: usize) -> PathBuf {
+		self.dir.join(format!("sessions-{peer_id}.wal"))
+	}
+
+	/// Whether the session WAL is enabled (persistence on and a non-zero flush).
+	pub fn wal_enabled(&self) -> bool {
+		self.enabled && self.wal_flush_ms > 0
 	}
 }
 
@@ -395,6 +428,9 @@ impl Default for TlsConfig {
 			websocket_port: 8884,
 			cert_file: None,
 			key_file: None,
+			client_ca_file: None,
+			require_client_cert: false,
+			reload_interval: 0,
 		}
 	}
 }
@@ -460,6 +496,7 @@ impl Default for PersistenceConfig {
 			dir: PathBuf::from("data"),
 			retained_file: "retained.mqtt".to_string(),
 			snapshot_interval: 300,
+			wal_flush_ms: 200,
 		}
 	}
 }
@@ -504,6 +541,9 @@ impl Config {
 		if self.tls.enabled {
 			if self.tls.cert_file.is_none() || self.tls.key_file.is_none() {
 				return invalid("tls.cert_file and tls.key_file are required when tls.enabled is true");
+			}
+			if self.tls.require_client_cert && self.tls.client_ca_file.is_none() {
+				return invalid("tls.client_ca_file is required when tls.require_client_cert is true");
 			}
 			if self.tls.port == 0 {
 				return invalid("tls.port must be non-zero when tls.enabled is true");

@@ -106,7 +106,7 @@ Built on glommio's `channels::channel_mesh` — a full mesh of shared channels c
 
 ## Key Files
 
-Current as of v1.7.0 (the module-layout refactor). Modules are file-based
+Current as of v1.8.0 (session WAL + mutual TLS). Modules are file-based
 (`foo.rs` beside `foo/`), not `mod.rs`.
 
 | File                              | Role                                                                 |
@@ -126,6 +126,6 @@ Current as of v1.7.0 (the module-layout refactor). Modules are file-based
 | `src/broker/messages.rs`          | Mesh wire vocabulary: `MeshMsg`, `SessionControl`, `SharedEvent`, `MigratedSession` |
 | `src/broker/session.rs`           | Durable session value types (`SessionSnapshot`, `PersistedSession`, …) |
 | `src/broker/topics/trie.rs`       | Wildcard-aware subscription trie (`+` / `#`); `interner.rs` interns segments |
-| `src/persistence.rs` + `persistence/` | Atomic io_uring snapshot/restore: `retained.rs`, `session.rs`, shared `codec.rs` |
+| `src/persistence.rs` + `persistence/` | Atomic io_uring snapshot/restore: `retained.rs`, `session.rs`, shared `codec.rs`, plus `wal.rs` (per-shard session write-ahead log) |
 | `clippy.toml`                     | Mechanical shared-nothing enforcement (no `Mutex`/`RwLock`/`std::thread`) |
 | `examples/alloc_probe.rs` / `stress/stresser.rs` | Idle-memory probe and throughput hammer (both Cargo examples) |

@@ -90,7 +90,12 @@ pub fn run(config: Config) -> std::io::Result<()> {
 	// per-shard. rustls `ServerConfig` is immutable and `Send + Sync`, so a single
 	// `Arc` is shared read-only across every core (it holds no per-shard state).
 	let tls_config = match (&config.tls.cert_file, &config.tls.key_file) {
-		(Some(cert), Some(key)) if config.tls.enabled => Some(transport::tls::load_server_config(cert, key)?),
+		(Some(cert), Some(key)) if config.tls.enabled => Some(transport::tls::load_server_config(
+			cert,
+			key,
+			config.tls.client_ca_file.as_deref(),
+			config.tls.require_client_cert,
+		)?),
 		_ => None,
 	};
 

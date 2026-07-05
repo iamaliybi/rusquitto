@@ -10,10 +10,17 @@
 //!
 //! Both use [`codec`]'s atomic file I/O (glommio io_uring `BufferedFile`, so the
 //! reactor never blocks) and its small length-prefixed value encoding.
+//!
+//! Sessions additionally have a per-shard [`wal`] (write-ahead log): an
+//! append-only, group-committed record of session suspensions and offline-queue
+//! growth *between* snapshots, replayed over the snapshot on startup so a crash
+//! loses at most one WAL-flush window rather than a whole `snapshot_interval`.
 
 mod codec;
 pub mod retained;
 pub mod session;
+pub mod wal;
 
 pub use retained::{load_retained, save_retained};
 pub use session::{load_sessions, save_sessions};
+pub use wal::Wal;

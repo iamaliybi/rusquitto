@@ -106,28 +106,39 @@ impl<S: ByteStream> Connection<S> {
 		// Authenticate before logging a successful connection or opening any session
 		// state. On failure, reply with the matching CONNACK reason code and close.
 		let login = connect.login.as_ref();
-		let auth = self.auth.check(
-			login.map(|l| l.username.as_str()),
-			login.map(|l| l.password.as_str()),
-		);
-		if auth != AuthResult::Granted {
-			let code = match auth {
-				AuthResult::BadUserNamePassword => mqtt_v5::ConnectReturnCode::BadUserNamePassword,
-				_ => mqtt_v5::ConnectReturnCode::NotAuthorized,
-			};
-			warn!(
-				credentials = %redact::credentials(
-					login.map(|l| l.username.as_str()),
-					login.is_some_and(|l| !l.password.is_empty()),
-				),
-				reason = ?code,
-				"authentication failed, rejecting connection"
-			);
-			return self.reject_connect(code).await;
+		let supplied_username = login.map(|l| l.username.as_str());
+		let has_username = supplied_username.is_some_and(|u| !u.is_empty());
+		if self.tls_verified && !has_username {
+			// Mutual TLS: the verified client certificate is the credential, so a
+			// CONNECT that carries no username is accepted on its strength. Its
+			// per-topic ACLs are the anonymous allow-lists (no MQTT identity to key on;
+			// certificate-CN → user mapping is future work — see next-steps).
+			debug!("authenticated via client certificate (mutual TLS)");
+			self.username = None;
+		} else {
+			// An explicit username (or a plain, non-mTLS connection) is checked against
+			// `[auth]` exactly as before.
+			let auth = self
+				.auth
+				.check(supplied_username, login.map(|l| l.password.as_str()));
+			if auth != AuthResult::Granted {
+				let code = match auth {
+					AuthResult::BadUserNamePassword => mqtt_v5::ConnectReturnCode::BadUserNamePassword,
+					_ => mqtt_v5::ConnectReturnCode::NotAuthorized,
+				};
+				warn!(
+					credentials = %redact::credentials(
+						supplied_username,
+						login.is_some_and(|l| !l.password.is_empty()),
+					),
+					reason = ?code,
+					"authentication failed, rejecting connection"
+				);
+				return self.reject_connect(code).await;
+			}
+			// Remember the authenticated identity for per-topic ACL checks.
+			self.username = login.map(|l| l.username.clone());
 		}
-
-		// Remember the authenticated identity for per-topic ACL checks.
-		self.username = login.map(|l| l.username.clone());
 
 		// Drop a Will Message whose topic the client isn't authorized to publish.
 		let will_authorized = match &self.will {
