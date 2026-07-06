@@ -743,3 +743,110 @@ becomes the MQTT username so `[[auth.users]]` ACLs apply per-device.
   client CN=sensor-01, user sensor-01 publish=["sensors/01/#"], cert_cn_as_username=
   true, allow_anonymous=false): in-ACL publish DELIVERED, out-of-ACL publish BLOCKED.
   96 unit + 15 integration, clippy/fmt clean. FUTURE: SAN fallback when no CN.
+
+## Phase 14 — parked-connection idle path (2026-07-07, v2.0.0)
+
+The connection-density project (old next-steps §1), all four phases in one PR.
+Idle plain-TCP conns: task + io_uring read Source torn down after
+`[parking] idle_grace_secs` (default 30, ON by default); only the fd — oneshot
+POLL_ADD on a per-shard RAW io-uring (1024 SQ entries, ~100 KiB memlock; creation
+failure degrades to parking-off with a warning) — plus a boxed ResumeState remain.
+MEASURED: 0.68 KiB/conn live heap parked vs 3.8 on v1.10 (alloc_probe 2000 conns);
+live-idle rose to ~5.0 (park-capable driver holds ctx across await) — with
+parking disabled the v1.x path is used verbatim (zero regression). Battery 12/12
+(4 new park scenarios), 111 unit + 22 integration tests.
+
+Key design decisions (details in the code docs):
+- Broker model: parked == suspended session (mailbox None, snapshot stored incl.
+  next_pkid, expires_at None) + `parked`/`wake_pending` flags → mesh
+  Claim/extract, persistence-skip need no special cases. deliver_to parked arm
+  queues ALL QoS (client is connected!) + sends ONE deduped UnparkCmd::Wake.
+  Shared-sub online filter counts parked (else cross-shard pick desyncs).
+  persist_one skips parked; shutdown converts parked→suspended pre-snapshot.
+- Connection: run()/event_loop return Flow{Closed,Park}; park predicate =
+  connected && all QoS/buffers empty && no partial frame; park deadline
+  (last_activity + grace) folded into the block race as a third deadline; the
+  race resolving as Timeout PROVES nothing arrived (single-threaded shard) —
+  transition is fully synchronous (complete_park is a plain fn: structural
+  no-await invariant). into_parts()/resume() carry aliases BOTH directions,
+  will+delay, peer limits, rate limiter; next_pkid travels via the session
+  snapshot so migration keeps it.
+- fd extraction: glommio TcpStream has NO IntoRawFd and mem::forget would leak
+  its reactor Source → F_DUPFD_CLOEXEC then drop (dup shares the open file
+  description). Resume via TcpStream::from_raw_fd.
+- Ring task (parking.rs): glommio can't await a foreign eventfd (yolo_recv is
+  recv(2), ENOTSOCK) → adaptive tick: 25ms empty / 1ms busy / 10ms quiet; CQE
+  reap is a shared-memory read (zero syscalls when empty); egress Wakes race the
+  tick so they're immediate. user_data = slab idx<<32 | generation tag (stale
+  CQEs filtered); PollRemove on non-CQE removals. Runs on the DEFAULT queue
+  (maintenance queue would starve parked ingress under overload). Parked
+  keepalive: deadline frozen at park; 1s sweep closes + fires Will + suspends.
+- ConnSlot moves INTO ParkedConn (parked conns still occupy limits + gate the
+  shutdown drain); every registry-removal path pairs client_disconnected();
+  park/unpark pair the new clients_parked gauge ($SYS/broker/parked-connections).
+- Memory discipline: Connection built on the plain frame of boxed_run_tcp and
+  moved as an ARG into drive_tcp (one slot, not two); complete_park is sync (its
+  locals never enter the future); resume prelude boxed via plain-fn seam;
+  can't-park fallback SPAWNS a fresh task instead of returning a Connection
+  through the frame. Watch alloc_probe's 3072-class when touching drive_tcp.
+
+GOTCHA (cost a debugging round): the parking task originally blocked purely on
+wake_rx.recv() while the registry was empty — but connections park themselves in
+WITHOUT signalling it (LocalSender isn't Clone, drive_tcp has no handle), so
+after the FIRST park nothing reaped CQEs / swept deadlines; ingress + keepalive
+tests failed while egress tests passed (their Wake unblocked the task as a side
+effect). Fix: TICK_EMPTY=25ms heartbeat even when empty.
+
+GOTCHA: park-herd once showed 497/498 right after the classic battery (20k-conn
+churn); unreproducible in 6 clean runs with logs accounting 500=parked=resumed.
+Loopback TIME_WAIT/port pressure, not broker state — but keep park-herd in the
+battery, it's the regression net for exactly this class of bug.
+
+## Phase 15 — QoS 1/2 performance investigation: the debug-logging tax (2026-07-07, v2.0.0)
+
+User flagged the audit chart: QoS 0 · 3 shards 407k/s great, but QoS 1 36.5k vs
+"Mosquitto ~83k" — why would a single-threaded C broker beat us 2×? Investigated
+top-down with fresh measurements; the answer had three layers.
+
+LAYER 1 — THE BUG (fixed): every bench config left `[logging]` at its default
+`"info,rusquitto=debug"`, and publish.rs had a per-PUBLISH `debug!` (topic, qos,
+retain, redacted payload). Under the default filter that event is FORMATTED AND
+DISPATCHED on the shard thread for EVERY message: measured **~38 µs/msg of CPU**
+(single-conn QoS1 ping-pong: 64.5 µs/msg CPU with it, 26.5 without; wall RTT
+p50 51.1 → 37.5 µs). Every audit number — QoS 0 included — carried this tax;
+Mosquitto never did. Fix: demoted the event to `trace!` (wire-level per-message
+detail is what trace is for) with a comment carrying the measured cost. Default
+filter now costs ~0 per message (remaining debug! sites are per-connection
+lifecycle only). LESSON: a per-message event at debug level IS a hot-path
+allocation+format+channel-send under the default filter — grep for `debug!` in
+any per-message path before benchmarking, and bench configs must pin
+`logging.level = "error"` anyway.
+
+LAYER 2 — THE APPLES-TO-ORANGES: the audit's "Mosquitto ~83k (prior)" was a
+SATURATING Rust-hammer number; rusquitto's 36.5k was the PYTHON ping-pong
+harness (200 asyncio conns, 1 in flight each, client-capped ~33-40k). Reran both
+brokers under identical harnesses (mosquitto with set_tcp_nodelay=true, its
+default false throttles it ~2×).
+
+LAYER 3 — THE STRUCTURAL RESIDUAL (documented in next-steps §1): built
+`examples/wake_probe.rs` — a bare glommio echo loop = the runtime's per-wake
+floor: ~30 µs RTT / 21.5 µs CPU per wake vs mosquito's full-MQTT 15.5 µs CPU on
+epoll. Our MQTT layer adds only ~5 µs CPU over the floor. The floor amortizes
+under load; residual: saturating per-core QoS1 ~11% behind. Candidates
+(spin_before_park knob, ring tuning) in next-steps.
+
+POST-FIX NUMBERS (same box, 4 vCPU WSL, mosquitto 2.0.18 w/ nodelay):
+- 1-conn QoS1 ping-pong RTT p50: rusq 37.5 µs vs mosq 32.8 (was 51.1)
+- CPU/msg ping-pong: rusq 26.5 µs vs mosq 15.5 (was 64.5)
+- 200-conn Python harness: QoS0 328k vs 149k (2.2×); QoS1 36.1k vs 32.7k
+  (+11%); QoS2 21.6k vs 17.4k (+24%) — rusquitto leads EVERY tier
+- Saturating Rust hammer QoS1: 1-shard 77.6k vs mosq 87.1k (−11%);
+  **3-shard 328.9k = 3.8× mosquitto's ceiling**
+- publish→deliver p50: same-core 43.4 µs (was 60), 3-shard 60.9 (was 93),
+  mosq 36.5
+
+MEASUREMENT KIT (kept): examples/wake_probe.rs (runtime floor);
+/tmp/perf/{rtt.py,cputime.py,dellat.py,matrix.sh,sat.sh} (session-local).
+CPU-per-message via /proc/<pid>/stat utime+stime around N ping-pongs — the
+decisive signal was CPU/msg ≈ wall/msg (broker never idle ⇒ per-wake work, not
+waiting), and the echo probe splitting runtime floor from MQTT-layer cost.

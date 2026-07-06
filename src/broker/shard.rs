@@ -24,7 +24,7 @@ use glommio::channels::channel_mesh::Senders;
 use glommio::channels::local_channel::LocalSender;
 use mqttbytes::v5::Publish;
 
-use crate::broker::delivery::{Delivery, Mailbox};
+use crate::broker::delivery::{Delivery, Mailbox, UnparkCmd};
 use crate::broker::messages::{MeshMsg, MigratedSession, MigratedSub};
 use crate::broker::session::{PersistedSession, SessionHandle, SessionSnapshot};
 use crate::broker::topics::{SubOptions, TopicTrie};
@@ -70,6 +70,19 @@ struct Session {
 	/// Boxed: armed wills are rare, and the tuple inline (~232 B) would bloat
 	/// every slot of the sessions table, which scales with connection count.
 	pending_will: Option<Box<(Publish, Instant)>>,
+	/// Whether this session's client is *parked*: still connected, but its
+	/// connection task is torn down and only its fd (on the shard's readiness
+	/// ring) plus a resume record remain. Invariant while parked:
+	/// `mailbox.is_none() && snapshot.is_some() && expires_at.is_none()` — from the
+	/// broker's view a parked session looks exactly like a suspended one (so
+	/// persistence-skip and migration need no special cases) except deliveries
+	/// queue *and wake it* instead of waiting for a reconnect.
+	parked: bool,
+	/// Deduplicates egress wakes: set when the first delivery lands for a parked
+	/// session (one [`UnparkCmd::Wake`] is sent), cleared on reattach. Further
+	/// deliveries just queue — the one wake resurrects the connection, which
+	/// drains everything.
+	wake_pending: bool,
 }
 
 /// Per-shard broker state. See the [module docs](self) for the split of concerns.
@@ -126,6 +139,10 @@ pub struct ShardState {
 	/// Session mutations awaiting the next write-ahead-log flush. `None` when the
 	/// WAL is disabled, so a broker without persistence tracks nothing.
 	wal: Option<WalPending>,
+	/// Sender to the shard's parking task ([`UnparkCmd`] wake/close commands).
+	/// `None` when parking is disabled. Injected by the server layer at startup
+	/// (like `control_tx`), keeping the broker layer free of server dependencies.
+	unpark_tx: Option<LocalSender<UnparkCmd>>,
 }
 
 /// Pending durable-session mutations for the write-ahead log: client ids whose
@@ -175,15 +192,27 @@ impl ShardState {
 		let generation = self.next_generation;
 
 		if clean_start {
+			// A parked predecessor is discarded like any other; its dormant fd must
+			// be closed too (takeover semantics — no Will), so signal the parking
+			// task before the session record disappears.
+			self.signal_close_parked(client_id);
 			if self.sessions.remove(client_id).is_some() {
 				self.trie.remove_client(client_id);
 				// A prior durable session is discarded: tombstone it in the WAL.
 				self.wal_removed(client_id);
 			}
-		} else if let Some(existing) = self.sessions.get_mut(client_id) {
+		} else if self.sessions.contains_key(client_id) {
+			// Resuming over a *parked* predecessor is a session takeover: the old
+			// connection still holds a dormant fd, which must be closed (signalled
+			// before the generation is overwritten, since the Close carries the old
+			// generation for the parking task's race check).
+			self.signal_close_parked(client_id);
+			let existing = self.sessions.get_mut(client_id).expect("checked above");
 			existing.mailbox = Some(mailbox);
 			existing.expires_at = None;
 			existing.generation = generation;
+			existing.parked = false;
+			existing.wake_pending = false;
 			// Reconnecting cancels any armed (delayed) Will Message.
 			existing.pending_will = None;
 			// Hand the durable state back to the resuming connection.
@@ -214,6 +243,8 @@ impl ShardState {
 				snapshot: None,
 				offline_queue: VecDeque::new(),
 				pending_will: None,
+				parked: false,
+				wake_pending: false,
 			},
 		);
 		SessionHandle {
@@ -221,6 +252,129 @@ impl ShardState {
 			generation,
 			snapshot: SessionSnapshot::default(),
 			offline_queue: VecDeque::new(),
+		}
+	}
+
+	// --- parking --------------------------------------------------------------
+
+	/// Installs the sender half of the parking task's command channel (see
+	/// [`UnparkCmd`]). Called at startup when `[parking]` is enabled, mirroring
+	/// [`set_control_tx`](Self::set_control_tx).
+	pub fn set_unpark_tx(&mut self, tx: LocalSender<UnparkCmd>) {
+		self.unpark_tx = Some(tx);
+	}
+
+	/// Flips a connected session to *parked* — the synchronous half of the park
+	/// transition, called by the connection's own shard (no `.await` between the
+	/// caller's idle check and this flip, so no delivery can slip past unseen).
+	///
+	/// The mailbox is dropped (deliveries now take the parked arm of `deliver_to`:
+	/// queue + wake) and the connection's durable QoS state is stored exactly as a
+	/// suspension would, so migration and takeover paths need no parked special
+	/// cases. The generation is *not* bumped: the same logical connection resumes.
+	///
+	/// Returns `false` — the caller must not park, and should close instead — if
+	/// the session is missing, was taken over (generation mismatch), or holds no
+	/// live mailbox.
+	pub fn park_session(&mut self, client_id: &str, generation: u64, snapshot: SessionSnapshot) -> bool {
+		let Some(session) = self.sessions.get_mut(client_id) else {
+			return false;
+		};
+		if session.generation != generation || session.mailbox.is_none() {
+			return false;
+		}
+		session.mailbox = None;
+		session.parked = true;
+		session.wake_pending = false;
+		session.snapshot = Some(Box::new(snapshot));
+		// A parked client is connected: it has no expiry deadline (keep-alive is
+		// enforced by the parking task's deadline sweep instead).
+		session.expires_at = None;
+		true
+	}
+
+	/// Re-attaches a resurrected connection to its parked session: installs the
+	/// new mailbox and returns the stored QoS state plus everything queued while
+	/// parked, in order. The unpark counterpart of [`park_session`](Self::park_session).
+	///
+	/// Returns `None` if the session is gone, was taken over (generation
+	/// mismatch), or is no longer parked — the resumed task must then close its
+	/// socket quietly (displaced-connection semantics: no Will).
+	pub fn reattach_parked(
+		&mut self,
+		client_id: &str,
+		generation: u64,
+		mailbox: Mailbox,
+	) -> Option<(SessionSnapshot, VecDeque<Delivery>)> {
+		let session = self.sessions.get_mut(client_id)?;
+		if session.generation != generation || !session.parked {
+			return None;
+		}
+		session.mailbox = Some(mailbox);
+		session.parked = false;
+		session.wake_pending = false;
+		let snapshot = session.snapshot.take().map(|b| *b).unwrap_or_default();
+		let queued = std::mem::take(&mut session.offline_queue);
+		Some((snapshot, queued))
+	}
+
+	/// Converts a parked session into a properly *suspended* (or destroyed) one —
+	/// the parked analogue of [`close_session`](Self::close_session), used when the
+	/// dormant fd is closed without resuming: parked keep-alive expiry, or graceful
+	/// shutdown. The stored snapshot is already in place from the park, so only the
+	/// expiry deadline, WAL record, and shared-group Leave announcements are new.
+	///
+	/// Returns `true` if the session was parked under this generation and is now
+	/// suspended/destroyed (the caller then owns Will publication, exactly like a
+	/// disconnect); `false` on any mismatch (taken over meanwhile — publish no Will).
+	pub fn suspend_parked(&mut self, client_id: &str, generation: u64, expiry_secs: u32) -> bool {
+		let shared_groups = self.shared_groups_of(client_id);
+
+		let Some(session) = self.sessions.get_mut(client_id) else {
+			return false;
+		};
+		if session.generation != generation || !session.parked {
+			return false;
+		}
+		session.parked = false;
+		session.wake_pending = false;
+
+		if expiry_secs == 0 {
+			self.sessions.remove(client_id);
+			self.trie.remove_client(client_id);
+			self.wal_removed(client_id);
+		} else {
+			session.expires_at = (expiry_secs != SESSION_NEVER_EXPIRES)
+				.then(|| Instant::now() + Duration::from_secs(u64::from(expiry_secs)));
+			// Now genuinely suspended: its durable record (snapshot + queue stored at
+			// park time) enters the WAL.
+			self.wal_dirty(client_id);
+		}
+		// Parked counted as a connected shared-group member; suspended does not.
+		for group in &shared_groups {
+			self.broadcast_shared(group, client_id, false);
+		}
+		true
+	}
+
+	/// Tells the parking task to close a parked session's dormant fd without
+	/// resuming it (session takeover, Clean Start discard, or a mesh claim). A
+	/// no-op unless the session is currently parked. The command carries the
+	/// parked generation so a racing unpark makes it harmless.
+	pub(super) fn signal_close_parked(&mut self, client_id: &str) {
+		let Some(session) = self.sessions.get_mut(client_id) else {
+			return;
+		};
+		if !session.parked {
+			return;
+		}
+		session.parked = false;
+		session.wake_pending = false;
+		let generation = session.generation;
+		if let Some(tx) = &self.unpark_tx {
+			// Unbounded local channel: only errors if the parking task is gone
+			// (shard teardown), where the fd is reclaimed by the drain instead.
+			let _ = tx.try_send(UnparkCmd::Close { client_id: client_id.to_string(), generation });
 		}
 	}
 
@@ -365,8 +519,13 @@ impl ShardState {
 	/// [`persist_sessions`](Self::persist_sessions) and the WAL batch.
 	fn persist_one(&self, client_id: &str, now: Instant) -> Option<PersistedSession> {
 		let session = self.sessions.get(client_id)?;
-		if session.mailbox.is_some() {
-			return None; // connected — not durable here
+		if session.mailbox.is_some() || session.parked {
+			// Connected (or parked, which *is* connected — just task-less): not
+			// durable here. Persisting a parked session would write it with "never
+			// expires", resurrecting every parked client as an immortal suspended
+			// session after a crash. Graceful shutdown converts parked → suspended
+			// before the final snapshot, so nothing is lost on a clean stop.
+			return None;
 		}
 		let expiry_secs = match session.expires_at {
 			None => u32::MAX, // never expires
@@ -512,6 +671,8 @@ impl ShardState {
 					snapshot: Some(Box::new(snapshot)),
 					offline_queue,
 					pending_will: None,
+					parked: false,
+					wake_pending: false,
 				},
 			);
 		}
@@ -527,6 +688,12 @@ impl ShardState {
 	/// it — usually onto a less-loaded shard. Already-suspended sessions (no live
 	/// mailbox) are skipped. This is how the thread-per-core model rebalances: it
 	/// moves the *connection*, since the compute can't move between cores.
+	///
+	/// *Parked* sessions are deliberately skipped too (they also hold no mailbox):
+	/// shedding relieves reactor saturation — a CPU signal — and a parked
+	/// connection contributes ~zero CPU, so closing one relieves nothing while
+	/// disconnecting the best-behaved clients (whose reconnects would then *add*
+	/// CONNECT load).
 	pub fn shed_connections(&mut self, max: usize) -> usize {
 		if max == 0 {
 			return 0;

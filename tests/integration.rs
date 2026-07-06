@@ -575,3 +575,212 @@ fn shared_subscription_delivers_each_message_once() {
 		"each message delivered exactly once across the group"
 	);
 }
+
+// --- tests: connection parking -------------------------------------------------
+//
+// These run against a broker with `parking.idle_grace_secs = 1`, so a client
+// that stays fully idle for ~1 s has its connection task torn down and its fd
+// parked on the shard's readiness ring. Every test below first idles past the
+// grace (2.5 s, comfortably beyond it) and then proves the client cannot tell
+// the difference: deliveries arrive (egress wake), its own packets are answered
+// (ingress wake), keep-alive and Will semantics hold, and takeover still works.
+
+/// Parking fixture: single shard, 1-second idle grace (so tests can observe the
+/// parked state), 1-second `$SYS` updates for the gauge test.
+fn parking_broker() -> u16 {
+	static PORT: OnceLock<u16> = OnceLock::new();
+	*PORT.get_or_init(|| {
+		let mut cfg = base_config(free_port(), 1);
+		cfg.parking.idle_grace_secs = 1;
+		cfg.sys.interval = 1;
+		start(cfg)
+	})
+}
+
+/// Parking fixture with no server keep-alive override, so a client's own tiny
+/// keep-alive drives the parked keep-alive-expiry path.
+fn parking_keepalive_broker() -> u16 {
+	static PORT: OnceLock<u16> = OnceLock::new();
+	*PORT.get_or_init(|| {
+		let mut cfg = base_config(free_port(), 1);
+		cfg.parking.idle_grace_secs = 1;
+		cfg.limits.keep_alive = 0; // the client's own keep-alive rules
+		start(cfg)
+	})
+}
+
+/// Idle long enough that a fully-idle connection is certainly parked
+/// (grace 1 s + scheduling slack).
+fn idle_past_grace() {
+	std::thread::sleep(Duration::from_millis(2500));
+}
+
+/// Connects with a Will Message and a caller-chosen keep-alive.
+fn connect_with_will(port: u16, id: &str, keep_alive: u16, will_topic: &str) -> Client {
+	let sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+	sock.set_nodelay(true).ok();
+	let mut c = v5::Connect::new(id);
+	c.clean_session = true;
+	c.keep_alive = keep_alive;
+	c.last_will = Some(v5::LastWill::new(
+		will_topic,
+		b"parked-rip".to_vec(),
+		QoS::AtMostOnce,
+		false,
+	));
+	let mut client = Client { sock, buf: BytesMut::new(), pkid: 0 };
+	client.write_packet(|b| c.write(b));
+	assert!(matches!(
+		client.read(Duration::from_secs(2)),
+		Some(Packet::ConnAck(_))
+	));
+	client
+}
+
+/// Egress wake: a publish routed to a parked subscriber resurrects it and is
+/// delivered — twice, so the park → wake → re-park → wake cycle is covered (the
+/// second round would fail on a stale-completion or re-arm bug).
+#[test]
+fn parked_subscriber_receives_publishes_across_park_cycles() {
+	let port = parking_broker();
+	let mut sub = Client::connect(port, "it-park-sub");
+	sub.subscribe("it/park/egress", QoS::AtLeastOnce);
+
+	for round in 0..2 {
+		idle_past_grace(); // sub is parked now
+		let mut pubc = Client::connect(port, &format!("it-park-pub-{round}"));
+		let msg = format!("wake-{round}");
+		assert!(pubc.publish("it/park/egress", msg.as_bytes(), QoS::AtLeastOnce));
+		let got = sub
+			.recv(Duration::from_secs(3))
+			.unwrap_or_else(|| panic!("delivery to the parked subscriber, round {round}"));
+		assert_eq!(payload(&got), msg.as_bytes(), "round {round}");
+		assert_eq!(
+			got.qos,
+			QoS::AtLeastOnce,
+			"QoS 1 handshake intact, round {round}"
+		);
+	}
+}
+
+/// Ingress wake: a parked client's own PINGREQ resurrects it and is answered.
+#[test]
+fn parked_client_ping_is_answered() {
+	let port = parking_broker();
+	let mut c = Client::connect(port, "it-park-ping");
+	idle_past_grace();
+	c.raw(&[0xC0, 0x00]); // PINGREQ
+	assert!(
+		matches!(c.read(Duration::from_secs(3)), Some(Packet::PingResp)),
+		"parked connection answered PINGREQ after resurrection"
+	);
+}
+
+/// Ingress wake with data: a parked client publishes and the full QoS 1
+/// handshake completes; the message reaches a live subscriber.
+#[test]
+fn parked_client_can_publish() {
+	let port = parking_broker();
+	let mut sub = Client::connect(port, "it-park-pub-sub");
+	sub.subscribe("it/park/ingress", QoS::AtLeastOnce);
+
+	let mut c = Client::connect(port, "it-park-pub-client");
+	idle_past_grace(); // c is parked
+	assert!(
+		c.publish("it/park/ingress", b"from-parked", QoS::AtLeastOnce),
+		"parked client's publish completed its PUBACK handshake"
+	);
+	assert_eq!(
+		payload(&sub.recv(Duration::from_secs(3)).expect("delivered")),
+		b"from-parked"
+	);
+}
+
+/// Keep-alive is enforced while parked: a silent client past 1.5× its own
+/// keep-alive is reaped by the parking task's sweep and its Will fires.
+#[test]
+fn parked_keepalive_expiry_fires_will() {
+	let port = parking_keepalive_broker();
+	let mut watcher = Client::connect(port, "it-park-ka-watch");
+	watcher.subscribe("it/park/ka-will", QoS::AtMostOnce);
+
+	// keep_alive = 2 → deadline 3 s; the grace (1 s) parks it well before that.
+	let _victim = connect_with_will(port, "it-park-ka-victim", 2, "it/park/ka-will");
+	let got = watcher
+		.recv(Duration::from_secs(8))
+		.expect("will from the parked keep-alive expiry");
+	assert_eq!(payload(&got), b"parked-rip");
+}
+
+/// An abrupt close (EOF) while parked resurrects the connection, which observes
+/// the EOF and runs the normal abnormal-close path: the Will fires.
+#[test]
+fn parked_connection_eof_fires_will() {
+	let port = parking_broker();
+	let mut watcher = Client::connect(port, "it-park-eof-watch");
+	watcher.subscribe("it/park/eof-will", QoS::AtMostOnce);
+
+	let victim = connect_with_will(port, "it-park-eof-victim", 60, "it/park/eof-will");
+	idle_past_grace(); // victim is parked
+	drop(victim); // abrupt close, no DISCONNECT
+	let got = watcher
+		.recv(Duration::from_secs(5))
+		.expect("will fired after EOF on a parked connection");
+	assert_eq!(payload(&got), b"parked-rip");
+}
+
+/// Session takeover reaches a parked connection: a second CONNECT with the same
+/// client id closes the dormant fd (no Will — takeover semantics) and the new
+/// connection works normally.
+#[test]
+fn takeover_closes_parked_connection() {
+	let port = parking_broker();
+	let mut watcher = Client::connect(port, "it-park-tko-watch");
+	watcher.subscribe("it/park/tko-will", QoS::AtMostOnce);
+
+	let mut old = connect_with_will(port, "it-park-tko", 60, "it/park/tko-will");
+	idle_past_grace(); // old is parked
+
+	let mut new = Client::connect(port, "it-park-tko"); // takeover
+	assert!(
+		old.is_closed(),
+		"the parked predecessor's socket was closed by the takeover"
+	);
+	assert!(
+		watcher.recv(Duration::from_secs(2)).is_none(),
+		"takeover publishes no Will"
+	);
+	// The new connection is fully functional.
+	new.subscribe("it/park/tko-check", QoS::AtMostOnce);
+	let mut pubc = Client::connect(port, "it-park-tko-pub");
+	assert!(pubc.publish("it/park/tko-check", b"alive", QoS::AtMostOnce));
+	assert_eq!(
+		payload(&new.recv(Duration::from_secs(2)).expect("delivered")),
+		b"alive"
+	);
+}
+
+/// The `$SYS/broker/parked-connections` gauge reports parked connections.
+#[test]
+fn sys_gauge_reports_parked_connections() {
+	let port = parking_broker();
+	// A client that will park and stay parked for the whole test.
+	let _idler = Client::connect(port, "it-park-gauge-idler");
+	idle_past_grace();
+
+	// The gauge is retained and republished every second; poll until it is ≥ 1.
+	let mut sys = Client::connect(port, "it-park-gauge-sub");
+	sys.subscribe("$SYS/broker/parked-connections", QoS::AtMostOnce);
+	let deadline = Instant::now() + Duration::from_secs(8);
+	let mut last = String::new();
+	while Instant::now() < deadline {
+		let Some(p) = sys.recv(Duration::from_secs(2)) else {
+			continue;
+		};
+		last = String::from_utf8_lossy(payload(&p)).into_owned();
+		if last.parse::<u64>().is_ok_and(|n| n >= 1) {
+			return;
+		}
+	}
+	panic!("$SYS parked gauge never reached ≥ 1 (last value: {last:?})");
+}

@@ -17,7 +17,7 @@ so it is run deliberately, not on every commit.
 
 ### A. Unit tests — the connection state machine over an in-memory stream
 
-`src/**/tests.rs`, ~94 tests. The MQTT engine is written against the
+`src/**/tests.rs`, ~111 tests. The MQTT engine is written against the
 [`ByteStream`] trait, so the entire handshake and packet-handling logic is driven
 over an in-memory `MockStream` with **no sockets** — the full protocol runs
 deterministically and fast.
@@ -29,10 +29,19 @@ deterministically and fast.
   shared subscriptions, per-connection rate limiting, and the **partial-frame
   stall guard** (a `StallStream` that yields bytes once then parks, driving the
   real `event_loop` to prove a stalled frame is reaped even with keep-alive off).
+  **Parking**: the park-predicate truth table (every disqualifier individually),
+  a fully-idle connection parking after the grace over the real event loop, the
+  park → deliver-while-parked → resume → replay → re-park round trip, and a
+  takeover-displaced resume closing quietly.
 - **Broker state** (`broker/shard/tests.rs`): fan-out with QoS downgrade,
   subscription-identifier delivery, session open/resume/suspend/expire generation
   handling, shared-subscription membership + the deterministic global pick, and
-  the WAL dirty/removed tracking round-tripped through replay.
+  the WAL dirty/removed tracking round-tripped through replay. **Parking**: the
+  parked-session state machine (`park_session`/`reattach_parked`/`suspend_parked`
+  generation guards), all-QoS queueing with exactly one deduplicated Wake,
+  takeover/Clean-Start/mesh-claim `Close` signalling, persistence + WAL exclusion
+  of parked sessions, and parked members counting as online in the shared-group
+  pick.
 - **Persistence codec** (`persistence/*/tests.rs`): retained + session snapshot
   round-trips, bad-magic/truncation rejection, and the **WAL** (last-writer-wins
   replay, snapshot-seeded replay, torn-trailing-record tolerance).
@@ -47,12 +56,13 @@ deterministically and fast.
 
 ### B. Integration tests — a real broker over real sockets
 
-`tests/integration.rs`, 15 tests. Each boots a **real broker in-process** (via the
+`tests/integration.rs`, 22 tests. Each boots a **real broker in-process** (via the
 public `rusquitto::run`) on an ephemeral port and drives it with a minimal MQTT 5
 client built on `mqttbytes` + `std::net::TcpStream`. Brokers are lazily started
 and **shared per configuration** (a `OnceLock` each — a default anonymous broker,
-an auth/ACL broker, and a 3-shard broker), so the suite spins up only a handful of
-executor pools and tests stay isolated via unique client ids and topics.
+an auth/ACL broker, a 3-shard broker, and two parking fixtures with a 1-second
+grace), so the suite spins up only a handful of executor pools and tests stay
+isolated via unique client ids and topics.
 
 | Area | Tests |
 |------|-------|
@@ -68,6 +78,7 @@ executor pools and tests stay isolated via unique client ids and topics.
 | ACL | out-of-scope publish is refused (not delivered), in-scope is |
 | Cross-shard | every publish crossing shards is delivered |
 | Shared subs | each message delivered exactly once across group members on different shards |
+| Parking | egress wake across two park/unpark cycles (QoS 1 intact); ingress PINGREQ and PUBLISH from a parked client; parked keep-alive expiry fires the Will; EOF while parked fires the Will; takeover closes the dormant fd (no Will); `$SYS/broker/parked-connections` gauge |
 
 ```sh
 cargo test                    # unit + integration + doctests
@@ -88,11 +99,25 @@ a firehose), `fragment` (byte-by-byte reassembly), `malformed` (a battery of
 hostile frames), `topics` (deep trees, wildcard explosion, oversized topics), and
 `throughput`.
 
+Four **parking** scenarios (`park-all`, against a broker with
+`[parking] idle_grace_secs = 1`): `park-herd` (park 500, wake them all with one
+broadcast — thundering-herd unpark), `park-thrash` (repeated full park/unpark
+cycles via mass PINGREQ — hunts transition races and stale ring completions),
+`park-takeover` (a reconnect storm onto parked client ids — every dormant fd must
+close), and `park-dribble` (wake parked connections with a single byte of a frame,
+then stall — the partial-frame guard must reap them after the unpark).
+
 ```sh
 cargo build --release
 target/x86_64-unknown-linux-gnu/release/rusquitto stress.toml &   # single-shard config
 python3 stress/attack.py --port 1883 all
+python3 stress/attack.py --port 1883 park-all --park-grace 1      # needs the short-grace config
 ```
+
+**Benchmark configs must pin `[logging] level = "error"`.** The default filter
+enables per-connection debug events, and any accidentally-per-message event
+under it taxes the hot path heavily (a per-PUBLISH `debug!` once cost a
+measured ~38 µs/msg and skewed a whole benchmark round — see CHANGELOG 2.0.0).
 
 ### D. Crash recovery (WAL)
 
@@ -124,9 +149,14 @@ These measure rather than assert — used to catch regressions and to guide
 optimization.
 
 - **`alloc_probe`** — decomposes idle per-connection heap by allocation size
-  class, separating true heap from allocator/page overhead (idle is ~3.7 KiB/conn).
-- **`park_probe`** — the parked-connection feasibility spike: measures the memory
-  floor of an idle fd on a shared `io_uring` readiness ring (~0.08 KiB/conn).
+  class, separating true heap from allocator/page overhead, and reports both the
+  live-idle cost (~5.0 KiB/conn) and the **parked floor (~0.68 KiB/conn)**.
+- **`park_probe`** — the parked-connection feasibility spike that motivated the
+  production feature: the memory floor of an idle fd on a shared `io_uring`
+  readiness ring (~0.08 KiB/conn, fd + minimal struct only).
+- **`wake_probe`** — a bare glommio echo loop measuring the runtime's per-wake
+  floor (park/unpark + task wake, no MQTT): the baseline that separates
+  runtime cost from connection-engine cost in any latency investigation.
 - **`stresser`** (`stress/stresser.rs`) — the throughput hammer.
 - Ad-hoc latency: a synchronous PUBLISH→PUBACK round-trip probe (single-shard p50
   ~55 µs).

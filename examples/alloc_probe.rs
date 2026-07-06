@@ -138,6 +138,8 @@ fn main() {
 	config.runtime.cores = Some(1);
 	config.logging.level = "error".into();
 	config.logging.dir = std::env::temp_dir().join("allocprobe-logs");
+	// A short grace so the probe can also measure the *parked* floor below.
+	config.parking.idle_grace_secs = 1;
 
 	std::thread::spawn(move || rusquitto::run(config).expect("broker run"));
 
@@ -152,7 +154,7 @@ fn main() {
 	let base_rss = rss_kb();
 
 	let _conns: Vec<TcpStream> = (0..n).map(|i| open_idle_conn(port, i)).collect();
-	std::thread::sleep(Duration::from_millis(1500));
+	std::thread::sleep(Duration::from_millis(800)); // settled, still under the grace
 
 	let (bytes, allocs, count, size) = snapshot();
 	let rss = rss_kb();
@@ -166,6 +168,18 @@ fn main() {
 	println!(
 		"process RSS: {:+.1} KiB/conn  (RSS - heap = allocator/page overhead)",
 		(rss - base_rss) as f64 / n as f64,
+	);
+
+	// Now let the parking grace lapse: every connection's task + read Source are
+	// torn down and only its fd (on the shard's readiness ring) plus a boxed
+	// resume record remain. The live-heap delta below is the *parked floor*.
+	std::thread::sleep(Duration::from_millis(3200));
+	let (parked_bytes, parked_allocs, _, _) = snapshot();
+	println!("\n== parked ({n} connections, task-less, fd on the readiness ring) ==",);
+	println!(
+		"live heap:  {:+.2} KiB/conn   ({:+.1} allocations/conn)",
+		(parked_bytes - base_bytes) as f64 / n as f64 / 1024.0,
+		(parked_allocs - base_allocs) as f64 / n as f64,
 	);
 	println!("\nper-connection live delta by size class:");
 	println!(

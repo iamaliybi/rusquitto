@@ -514,6 +514,209 @@ def scn_throughput(host, port, connections, duration, qos, payload_bytes):
            f"{rate:,.0f} msg/s at QoS {qos}, broker healthy")
 
 
+# --- 9-12. Connection parking ------------------------------------------------
+#
+# These four scenarios attack the parked-connection idle path and are only
+# meaningful against a broker running with a SHORT parking grace, e.g.
+#     [parking]
+#     idle_grace_secs = 1
+# (with the default 30 s grace nothing parks within the test window and the
+# scenarios pass trivially). `--park-grace` must match the broker's setting.
+
+
+def _park_fleet(host, port, n, prefix, shared_topic=None):
+    """Connect n clients, each subscribed to its own topic (and optionally a
+    shared broadcast topic). Returns the list of sockets."""
+    socks = []
+    for i in range(n):
+        try:
+            s = raw_connect(host, port)
+            s.sendall(m.connect(client_id=f"{prefix}-{i}", keepalive=120))
+            if not m.expect_connack_ok(s):
+                s.close()
+                continue
+            filters = [(f"{prefix}/{i}", 0x01)]
+            if shared_topic:
+                filters.append((shared_topic, 0x01))
+            s.sendall(m.subscribe(filters, pkid=1))
+            if not (pkt := m.read_packet(s, 3.0)) or pkt[0] != m.SUBACK:
+                s.close()
+                continue
+            socks.append(s)
+        except OSError:
+            pass
+    return socks
+
+
+def _drain_expect(socks, want_type, timeout):
+    """Waits until every socket delivers one packet of `want_type` (answering
+    QoS 1 PUBLISHes with PUBACK). Returns (hits, latency_of_last_hit)."""
+    import select as _select
+    bufs = {s: b"" for s in socks}
+    got = set()
+    t0 = time.time()
+    last = 0.0
+    while len(got) < len(socks) and time.time() - t0 < timeout:
+        r, _, _ = _select.select([s for s in socks if s not in got], [], [], 0.1)
+        for s in r:
+            try:
+                data = s.recv(65536)
+            except OSError:
+                continue
+            if not data:
+                continue
+            bufs[s] += data
+            while True:
+                buf = bufs[s]
+                if len(buf) < 2:
+                    break
+                # parse one packet (1-byte VBI is enough for these tiny frames)
+                length = buf[1]
+                if buf[1] & 0x80 or len(buf) < 2 + length:
+                    break
+                ptype, flags, body = buf[0] >> 4, buf[0] & 0x0F, buf[2:2 + length]
+                bufs[s] = buf[2 + length:]
+                if ptype == m.PUBLISH and (flags >> 1) & 0x03 == 1:
+                    tlen = struct.unpack("!H", body[:2])[0]
+                    pkid = struct.unpack("!H", body[2 + tlen:4 + tlen])[0]
+                    try:
+                        s.sendall(bytes([0x40, 0x02]) + struct.pack("!H", pkid))
+                    except OSError:
+                        pass
+                if ptype == want_type and s not in got:
+                    got.add(s)
+                    last = time.time() - t0
+    return len(got), last
+
+
+def scn_park_herd(host, port, connections, grace):
+    hdr(f"PARK-HERD — park {connections} conns, wake them ALL with one broadcast")
+    socks = _park_fleet(host, port, connections, "pkh", shared_topic="pkh/all")
+    rss0 = broker_rss_kb()
+    info(f"{len(socks)} subscribed; idling {grace + 1.5:.1f}s so every one parks")
+    time.sleep(grace + 1.5)
+    rss1 = broker_rss_kb()
+    if rss0 and rss1:
+        info(f"broker RSS while parked: {rss1 / 1024:.0f} MiB ({(rss1 - rss0) / max(len(socks), 1):+.2f} KiB/conn vs pre-park)")
+
+    # One publish to the shared topic must resurrect every parked subscriber.
+    pub = raw_connect(host, port)
+    pub.sendall(m.connect(client_id="pkh-pub", keepalive=30))
+    m.expect_connack_ok(pub)
+    t0 = time.time()
+    pub.sendall(m.publish("pkh/all", b"herd-wake", qos=0))
+    hits, last = _drain_expect(socks, m.PUBLISH, 15.0)
+    info(f"{hits}/{len(socks)} parked subscribers woke and received (last after {last:.2f}s, publish->deliver)")
+    for s in socks + [pub]:
+        try:
+            s.close()
+        except OSError:
+            pass
+    survived = healthy(host, port) and hits == len(socks)
+    record("park-herd", survived, f"{hits}/{len(socks)} thundering-herd unparks delivered, broker healthy")
+    _ = t0
+
+
+def scn_park_thrash(host, port, connections, grace, cycles):
+    hdr(f"PARK-THRASH — {connections} conns × {cycles} park/unpark cycles (ingress wakes)")
+    socks = _park_fleet(host, port, connections, "pkt")
+    clean = True
+    for cycle in range(cycles):
+        time.sleep(grace + 1.5)  # everyone parks
+        for s in socks:
+            try:
+                s.sendall(m.PINGREQ)  # mass ingress unpark
+            except OSError:
+                clean = False
+        hits, _ = _drain_expect(socks, m.PINGRESP, 10.0)
+        info(f"cycle {cycle + 1}: {hits}/{len(socks)} parked conns answered PINGREQ")
+        if hits != len(socks):
+            clean = False
+    for s in socks:
+        try:
+            s.close()
+        except OSError:
+            pass
+    record("park-thrash", healthy(host, port) and clean,
+           f"{cycles} full park/unpark cycles over {len(socks)} conns, broker healthy")
+
+
+def scn_park_takeover(host, port, connections, grace):
+    hdr(f"PARK-TAKEOVER — park {connections} conns, then a reconnect storm on the same ids")
+    old = _park_fleet(host, port, connections, "pko")
+    time.sleep(grace + 1.5)  # everyone parks
+
+    new = []
+    for i in range(len(old)):
+        try:
+            s = raw_connect(host, port)
+            s.sendall(m.connect(client_id=f"pko-{i}", keepalive=30))
+            if m.expect_connack_ok(s):
+                new.append(s)
+        except OSError:
+            pass
+    info(f"{len(new)}/{len(old)} takeovers connected")
+
+    # Every displaced parked socket must be closed by the broker.
+    closed = 0
+    deadline = time.time() + 10
+    pending = list(old)
+    while pending and time.time() < deadline:
+        import select as _select
+        r, _, _ = _select.select(pending, [], [], 0.2)
+        for s in r:
+            try:
+                if s.recv(4096) == b"":
+                    closed += 1
+                    pending.remove(s)
+            except OSError:
+                closed += 1
+                pending.remove(s)
+    info(f"{closed}/{len(old)} parked predecessors closed by the takeover")
+    for s in old + new:
+        try:
+            s.close()
+        except OSError:
+            pass
+    record("park-takeover", healthy(host, port) and closed == len(old) and len(new) == len(old),
+           f"{closed}/{len(old)} parked fds closed on takeover, broker healthy")
+
+
+def scn_park_dribble(host, port, connections, grace):
+    hdr(f"PARK-DRIBBLE — wake {connections} parked conns with ONE byte of a frame, then stall")
+    socks = _park_fleet(host, port, connections, "pkd")
+    time.sleep(grace + 1.5)  # everyone parks
+    for s in socks:
+        try:
+            s.sendall(b"\x30")  # first byte of a PUBLISH header, never completed
+        except OSError:
+            pass
+    info("sent 1 dribble byte each; the resumed connections must apply the partial-frame stall guard")
+
+    # The framing deadline (connect_timeout, default 10 s) must reap them all.
+    closed = 0
+    deadline = time.time() + 15
+    pending = list(socks)
+    while pending and time.time() < deadline:
+        import select as _select
+        r, _, _ = _select.select(pending, [], [], 0.25)
+        for s in r:
+            try:
+                if s.recv(4096) == b"":
+                    closed += 1
+                    pending.remove(s)
+            except OSError:
+                closed += 1
+                pending.remove(s)
+    for s in socks:
+        try:
+            s.close()
+        except OSError:
+            pass
+    record("park-dribble", healthy(host, port) and closed == len(socks),
+           f"{closed}/{len(socks)} mid-frame stalls reaped after unpark, broker healthy")
+
+
 # --- driver ------------------------------------------------------------------
 
 
@@ -521,7 +724,9 @@ def main():
     ap = argparse.ArgumentParser(description="rusquitto adversarial stress suite")
     ap.add_argument("scenario",
                     choices=["idle", "churn", "slowloris", "slowreader", "fragment",
-                             "malformed", "topics", "throughput", "all"])
+                             "malformed", "topics", "throughput",
+                             "park-herd", "park-thrash", "park-takeover", "park-dribble",
+                             "all", "park-all"])
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=1883)
     ap.add_argument("--connections", type=int, default=500)
@@ -533,6 +738,10 @@ def main():
     ap.add_argument("--concurrency", type=int, default=200)
     ap.add_argument("--flood", type=int, default=40000,
                     help="slowreader: messages to fire at the dead reader (must exceed the mailbox cap)")
+    ap.add_argument("--park-grace", type=float, default=1.0,
+                    help="the broker's [parking] idle_grace_secs (park-* scenarios idle past it)")
+    ap.add_argument("--park-cycles", type=int, default=3,
+                    help="park-thrash: park/unpark cycles to run")
     args = ap.parse_args()
 
     if not healthy(args.host, args.port):
@@ -559,6 +768,20 @@ def main():
     if run("throughput"):
         scn_throughput(args.host, args.port, args.connections, args.duration,
                        args.qos, args.payload)
+
+    # The park-* scenarios need a short-grace broker config (see their comment
+    # block); they run under `park-all` or individually, NOT under plain `all`,
+    # so `all` keeps working against any broker config.
+    run_park = lambda name: s in (name, "park-all")
+    park_n = min(args.connections, 500)
+    if run_park("park-herd"):
+        scn_park_herd(args.host, args.port, park_n, args.park_grace)
+    if run_park("park-thrash"):
+        scn_park_thrash(args.host, args.port, park_n, args.park_grace, args.park_cycles)
+    if run_park("park-takeover"):
+        scn_park_takeover(args.host, args.port, park_n, args.park_grace)
+    if run_park("park-dribble"):
+        scn_park_dribble(args.host, args.port, min(park_n, 200), args.park_grace)
 
     hdr("REPORT CARD")
     passed = sum(1 for _, good, _ in RESULTS if good)

@@ -181,6 +181,10 @@ impl ShardState {
 	/// Handles a peer's session [`Claim`](SessionControl::Claim): reply with the
 	/// session if we own one and this is a resume, otherwise discard/none.
 	fn handle_claim(&mut self, client_id: String, requester: usize, resume: bool) {
+		// A parked session is about to be migrated or discarded either way; its
+		// dormant fd on this shard must close (takeover semantics — no Will).
+		// Signalled first, while the session record still exists.
+		self.signal_close_parked(&client_id);
 		// Decide with an immutable peek first so the borrow ends before we mutate.
 		let session = match self.sessions.get(&client_id).map(|s| s.mailbox.is_none()) {
 			// Suspended session and the client wants to resume: migrate it wholesale.

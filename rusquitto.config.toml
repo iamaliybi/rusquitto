@@ -73,6 +73,20 @@ admission_delay_ms = 0     # reject NEW connections above this delay (0 = off); 
 shed_delay_ms = 0          # shed EXISTING connections above this sustained delay (0 = off); they reconnect and SO_REUSEPORT rehashes them
 shed_batch = 8             # max connections shed per second per shard while shedding
 
+[parking]
+# Parked-connection idle path. A fully idle plain-TCP connection (no buffered
+# bytes, no partial frame, no in-flight QoS state, no queued deliveries) has its
+# per-connection task torn down after idle_grace_secs; only its fd — armed on a
+# small per-shard io_uring readiness ring — and a minimal resume record remain
+# (~0.1-0.5 KiB instead of several KiB). Any inbound byte or a delivery routed to
+# the parked client resurrects it transparently. Plain TCP only (TLS/WebSocket
+# streams carry mid-stream codec state and never park). Gauge:
+# $SYS/broker/parked-connections.
+enabled = true             # master switch
+idle_grace_secs = 30       # seconds fully idle before parking; a client pinging every K secs
+                           #   is parked ~(K - grace)/K of the time, so keep this well below
+                           #   the fleet's typical keep-alive interval
+
 [persistence]
 # Disk-backed durability. Disabled by default (broker is otherwise in-memory).
 # When enabled, both the retained-message set and suspended sessions (their

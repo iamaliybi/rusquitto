@@ -5,6 +5,114 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): from 1.0 on, the major
 version bumps for breaking changes, the minor for features, and the patch for fixes.
 
+## [2.0.0] - 2026-07-07
+
+The parked-connection idle path: idle connections now cost **0.68 KiB** of live
+heap instead of 3.8 KiB — the connection-density gap identified in the v1.7/v1.10
+audits, closed. A major version because the broker's default runtime behaviour
+changes (parking is on by default), not because any wire or config compatibility
+breaks: every v1.x config file loads unchanged.
+
+### Added
+
+- **Connection parking (`[parking]`, on by default)** — a plain-TCP connection
+  that stays *fully idle* (no in-flight QoS state in either direction, no
+  buffered bytes, no partial frame, everything flushed) for `idle_grace_secs`
+  (default 30) has its per-connection task and io_uring read `Source` torn down;
+  only its fd — armed as a oneshot `POLL_ADD` on a small per-shard **raw
+  io_uring readiness ring** — and a boxed resume record remain. Any inbound byte
+  (ingress) or a delivery routed to the parked client (egress, via a shard-local
+  wake channel) resurrects it transparently; the client cannot tell the
+  difference. Plain TCP only: TLS/WebSocket streams carry mid-stream codec state
+  and never park. `parking.enabled = false` restores the exact v1.x path.
+  - Measured (`alloc_probe`, 2000 idle connections, 1 shard): **0.68 KiB/conn
+    live heap parked** vs 3.8 KiB/conn in v1.10.0 (5.6×); the Phase-0
+    `park_probe` floor of 0.08 KiB is the fd-only bound, the rest is the resume
+    record, registry slot, and suspended session snapshot.
+  - Semantics preserved across the park, all covered by tests: QoS 0 *and* QoS 1/2
+    deliveries queue and wake (a parked client is connected, not offline);
+    keep-alive is enforced by the parking task's sweep against the deadline
+    frozen at park time, Will included; session takeover, Clean Start, and
+    cross-shard `Claim` close the dormant fd with takeover semantics (no Will);
+    topic aliases in both directions, the packet-id allocator, and negotiated
+    limits survive; shared-subscription member picks count parked members as
+    online (anything else would desync the cross-shard pick); graceful shutdown
+    drains parked fds with a best-effort DISCONNECT (0x8B) and converts their
+    sessions to properly suspended before the final persistence snapshot.
+  - Every removal is generation-guarded twice (io_uring `user_data` slab tag +
+    broker session generation), so stale completions and takeover/wake races
+    resolve as no-ops or quiet closes — verified by the park/unpark/re-park
+    cycle tests and the new adversarial scenarios.
+- **`$SYS/broker/parked-connections`** — gauge of currently parked connections
+  (parked clients still count in `$SYS/broker/clients/connected`).
+- **Four adversarial parking scenarios** in `stress/attack.py` (`park-all`):
+  `park-herd` (park 500, wake all with one broadcast — 500/500 delivered),
+  `park-thrash` (3 full park/unpark cycles × 500 conns via PINGREQ — 1500/1500),
+  `park-takeover` (reconnect storm onto parked ids — 500/500 dormant fds
+  closed), `park-dribble` (wake with one byte of a frame, then stall — 200/200
+  reaped by the partial-frame guard after unpark). Full battery: **12/12**.
+- **Tests**: 11 broker-layer parking tests (park/reattach/suspend generation
+  guards, wake dedup, WAL and persistence exclusion, shared-group pick), 4
+  connection-level tests (predicate truth table, park-after-grace,
+  resume-replay-repark round trip, takeover-displaced resume), and 7
+  integration tests over real sockets (egress wake across two park cycles,
+  ingress PINGREQ/PUBLISH, parked keep-alive expiry firing the Will, EOF-while-
+  parked firing the Will, takeover, `$SYS` gauge) — 111 unit + 22 integration.
+- `examples/alloc_probe.rs` now also reports the **parked** live-heap floor.
+
+### Changed
+
+- **`io-uring` is now a runtime dependency** (was dev-only, for the spike): the
+  per-shard readiness ring is a 1024-entry raw ring (~100 KiB locked memory per
+  shard, created at startup; if creation fails — e.g. a tight `RLIMIT_MEMLOCK` —
+  the shard logs a warning and runs with parking disabled rather than failing).
+- **Live (unparked) idle connections measure ~5.0 KiB/conn** (was 3.8): the
+  park-capable connection driver keeps the serve context across its await and
+  carries the grace/activity bookkeeping. Idle fleets spend all but the first
+  `idle_grace_secs` in the parked state, so steady-state density improves ~5.6×
+  despite this; with `parking.enabled = false` the v1.x path (and its 3.8
+  KiB/conn) is used verbatim.
+- `shed_connections` documents that parked connections are deliberately never
+  shed: shedding relieves reactor saturation (a CPU signal) and parked
+  connections contribute ~zero CPU, so closing them would only disconnect the
+  best-behaved clients and add reconnect load.
+
+### Fixed
+
+- **The per-PUBLISH `debug!` event cost ~38 µs/msg under the default log filter**
+  (`info,rusquitto=debug`): the event was formatted and dispatched on the shard
+  thread for every message, more than doubling per-message CPU (64.5 → 26.5
+  µs/msg) and inflating every published benchmark — the audit's "QoS 1 far
+  behind Mosquitto" reading was primarily this tax (plus a saturating-vs-
+  ping-pong harness mismatch in the comparison). Demoted to `trace!` — wire-level
+  per-message detail is what the trace level is for; the default filter now
+  costs nothing measurable per message (all remaining `debug!` sites are
+  per-connection lifecycle). Measured after the fix, same box, identical
+  harnesses, Mosquitto 2.0.18 with `set_tcp_nodelay true`:
+  - 200-connection publisher→ack: QoS 0 **328k vs 149k** msg/s (2.2×), QoS 1
+    **36.1k vs 32.7k** (+11%), QoS 2 **21.6k vs 17.4k** (+24%) — rusquitto
+    leads every tier.
+  - Saturating QoS 1 (Rust hammer): 1 shard 77.6k vs 87.1k (−11%, the
+    runtime's per-wake floor — see below); **3 shards 328.9k, 3.8× Mosquitto's
+    single-threaded ceiling**.
+  - publish→deliver p50: 43.4 µs same-core (was 60), 60.9 µs cross-shard
+    (was 93); 1-connection PUBLISH→PUBACK RTT p50 37.5 µs (was 51.1).
+- Added **`examples/wake_probe.rs`** — a bare glommio echo loop measuring the
+  runtime's per-wake floor (~30 µs RTT / 21.5 µs CPU on this box), which
+  attributes the remaining single-message gap vs epoll-based brokers to the
+  runtime rather than the MQTT layer (which adds only ~5 µs CPU over the
+  floor). The residual is tracked with candidate fixes in
+  `.agents/next-steps.md` §1.
+
+### Notes on the ~0.7 KiB parked floor
+
+`ParkedConn` + boxed `ResumeState` (~0.2 KiB) + the suspended-style session
+snapshot and registry/index entries make up the measured 0.68 KiB. The 0.1 KiB
+aspiration from the spike excluded everything but the fd and a minimal struct;
+the production number carries the full negotiated MQTT state (aliases, Will,
+limits, packet-id allocator) so the resume is exact. Kernel socket memory is
+outside RSS either way.
+
 ## [1.10.0] - 2026-07-06
 
 Mutual-TLS identity: a verified client certificate can now carry a per-device MQTT

@@ -85,7 +85,13 @@ impl ConnCounts {
 /// RAII counter for a live connection slot. Incremented on [`acquire`](Self::acquire)
 /// and decremented on drop, so both the total and per-IP counts stay balanced even
 /// if the connection task panics and unwinds.
-struct ConnSlot {
+///
+/// `pub(super)` because a slot outlives its accept-loop wrapper task when the
+/// connection *parks*: it moves into the parking registry's
+/// [`ParkedConn`](super::parking::ParkedConn), so parked connections keep
+/// occupying their per-shard and per-IP slots (they are real connections) and
+/// keep gating the shutdown drain.
+pub(super) struct ConnSlot {
 	counts: Rc<ConnCounts>,
 	ip: Option<IpAddr>,
 }
@@ -255,11 +261,12 @@ pub(super) async fn accept_loop(
 		);
 		// NOTE: keep this task future small — it lives for the whole connection.
 		// The heavy per-transport state machines are boxed inside `serve` (see
-		// the comments there); this wrapper measures ~600 bytes.
+		// the comments there); this wrapper measures ~600 bytes. The slot moves
+		// *into* `serve` (not held here) because a parking connection outlives
+		// this wrapper task: the slot then rides along into the registry.
 		glommio::spawn_local(
 			async move {
-				let _slot = slot;
-				serve(ctx, stream, transport, tls_acceptor).await;
+				serve(ctx, stream, transport, tls_acceptor, slot).await;
 			}
 			.instrument(span),
 		)

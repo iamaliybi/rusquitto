@@ -106,7 +106,7 @@ Built on glommio's `channels::channel_mesh` — a full mesh of shared channels c
 
 ## Key Files
 
-Current as of v1.8.0 (session WAL + mutual TLS). Modules are file-based
+Current as of v2.0.0 (connection parking). Modules are file-based
 (`foo.rs` beside `foo/`), not `mod.rs`.
 
 | File                              | Role                                                                 |
@@ -118,8 +118,8 @@ Current as of v1.8.0 (session WAL + mutual TLS). Modules are file-based
 | `src/telemetry/metrics.rs`        | Cross-shard `Metrics` atomics, published to `$SYS/broker/...`         |
 | `src/telemetry/logging.rs`        | tracing setup: non-blocking appenders, spans, redaction              |
 | `src/transport.rs`                | `ByteStream` trait; `tcp.rs` (SO_REUSEPORT + socket buffers), `websocket.rs`, `tls.rs` |
-| `src/server/shard.rs` + `shard/`  | Per-shard **runtime**: `run_shard`; `accept.rs` (loop/accounting/admission/`Listeners`), `serve.rs` (transport dispatch), `maintenance.rs` (persistence/mesh-drain/sweep/load) |
-| `src/server/connection.rs` + `connection/` | Per-connection state machine + MQTT handlers (`connect`/`publish`/`subscribe`/`control`/`delivery`/`ratelimit`) |
+| `src/server/shard.rs` + `shard/`  | Per-shard **runtime**: `run_shard`; `accept.rs` (loop/accounting/admission/`Listeners`), `serve.rs` (transport dispatch + TCP park/resume driver), `maintenance.rs` (persistence/mesh-drain/sweep/load), `parking.rs` (parked-fd registry + raw io_uring readiness ring) |
+| `src/server/connection.rs` + `connection/` | Per-connection state machine + MQTT handlers (`connect`/`publish`/`subscribe`/`control`/`delivery`/`ratelimit`); park predicate + `ResumeState` |
 | `src/server/overload.rs`          | `LoadMonitor`: reactor scheduling-delay EWMA for admission/shedding   |
 | `src/broker/shard.rs` + `shard/`  | `ShardState` (per-shard **data**): sessions/subs/retain; `routing.rs` (fan-out), `mesh.rs` (cross-shard migration + shared-sub membership) |
 | `src/broker/delivery.rs`          | `Delivery`/`Mailbox` + queue limits — the delivery lingua franca     |
