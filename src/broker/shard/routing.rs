@@ -7,7 +7,7 @@ use std::rc::Rc;
 use mqttbytes::{QoS, v5::Publish};
 
 use super::ShardState;
-use crate::broker::delivery::{Delivery, MAILBOX_LIMIT, OFFLINE_QUEUE_LIMIT};
+use crate::broker::delivery::{Delivery, MAILBOX_LIMIT, OFFLINE_QUEUE_LIMIT, UnparkCmd};
 use crate::broker::topics::filter_matches;
 use crate::protocol::min_qos;
 
@@ -182,9 +182,18 @@ impl ShardState {
 				continue;
 			}
 			ids.sort();
+			// A parked member counts as online: it is still a connected client (a
+			// delivery queues and wakes it), and — critically — it never announced a
+			// shared-group Leave, so *remote* shards still count it in the global
+			// pick. Excluding it locally would desync the deterministic choice
+			// (double- or zero-delivery).
 			let online: Vec<String> = ids
 				.iter()
-				.filter(|id| self.sessions.get(*id).is_some_and(|s| s.mailbox.is_some()))
+				.filter(|id| {
+					self.sessions
+						.get(*id)
+						.is_some_and(|s| s.mailbox.is_some() || s.parked)
+				})
 				.cloned()
 				.collect();
 
@@ -229,9 +238,10 @@ impl ShardState {
 	}
 
 	/// Delivers one message to a single client's session: straight to its live
-	/// mailbox if connected, otherwise buffered in its offline queue (QoS > 0 only;
-	/// QoS 0 is dropped for a suspended session). `sub_ids` are the Subscription
-	/// Identifiers to echo on the delivered PUBLISH.
+	/// mailbox if connected; queued (and the parking task woken) if *parked*;
+	/// otherwise buffered in its offline queue (QoS > 0 only; QoS 0 is dropped for
+	/// a suspended session). `sub_ids` are the Subscription Identifiers to echo on
+	/// the delivered PUBLISH.
 	///
 	/// (See `route` for how shared-group deliveries pick their one recipient.)
 	fn deliver_to(&mut self, client_id: &str, publish: &Rc<Publish>, qos: QoS, retain: bool, sub_ids: Vec<usize>) {
@@ -239,6 +249,7 @@ impl ShardState {
 			return;
 		};
 		let mut queued_offline = false;
+		let mut wake = false;
 		match &session.mailbox {
 			Some(mailbox) => {
 				// The mailbox channel is unbounded so an idle connection allocates
@@ -247,6 +258,23 @@ impl ShardState {
 				// stops draining, and unbounded growth would be a DoS).
 				if mailbox.len() < MAILBOX_LIMIT {
 					let _ = mailbox.try_send(Delivery { publish: publish.clone(), qos, retain, sub_ids });
+				}
+			}
+			None if session.parked => {
+				// Parked: the client is *connected*, just task-less — so QoS 0 is
+				// queued too (a suspended session would drop it), bounded like the
+				// offline queue. One deduplicated Wake resurrects the connection,
+				// which drains everything queued here. No WAL write: a parked
+				// session is a live connection, not durable state.
+				if session.offline_queue.len() >= OFFLINE_QUEUE_LIMIT {
+					session.offline_queue.pop_front();
+				}
+				session
+					.offline_queue
+					.push_back(Delivery { publish: publish.clone(), qos, retain, sub_ids });
+				if !session.wake_pending {
+					session.wake_pending = true;
+					wake = true;
 				}
 			}
 			None if qos != QoS::AtMostOnce => {
@@ -263,6 +291,11 @@ impl ShardState {
 		// The suspended session's durable offline queue grew: re-log it in the WAL.
 		if queued_offline {
 			self.wal_dirty(client_id);
+		}
+		if wake && let Some(tx) = &self.unpark_tx {
+			// Unbounded local channel: only errors at shard teardown, where the
+			// parked fd is reclaimed by the shutdown drain instead.
+			let _ = tx.try_send(UnparkCmd::Wake { client_id: client_id.to_string() });
 		}
 	}
 }

@@ -54,6 +54,8 @@ impl<S: ByteStream> Connection<S> {
 	/// The pending queue is bounded: a client that stalls its acks drops its
 	/// oldest held messages rather than growing broker memory without limit.
 	pub(super) fn deliver(&mut self, delivery: Delivery) -> Result<()> {
+		// Outbound work counts as activity for the parking grace clock.
+		self.last_activity = std::time::Instant::now();
 		if delivery.qos == QoS::AtMostOnce || self.inflight.len() < self.outbound_window() {
 			self.send_publish(
 				&delivery.publish,

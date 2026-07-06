@@ -48,6 +48,7 @@ pub struct Config {
 	pub logging: LoggingConfig,
 	pub limits: LimitsConfig,
 	pub overload: OverloadConfig,
+	pub parking: ParkingConfig,
 	pub persistence: PersistenceConfig,
 	pub auth: AuthConfig,
 	pub sys: SysConfig,
@@ -270,6 +271,27 @@ pub struct OverloadConfig {
 	pub shed_delay_ms: u32,
 	/// Maximum connections shed per second per shard while shedding is active.
 	pub shed_batch: usize,
+}
+
+/// `[parking]` — the parked-connection idle path. An idle plain-TCP connection
+/// normally holds a glommio task and an io_uring read `Source` (~a few KiB) just
+/// to wait for its next byte. When parking is enabled, a connection that has been
+/// fully idle (no buffered bytes, no partial frame, no in-flight QoS state, no
+/// queued deliveries) for `idle_grace_secs` is *parked*: its task is torn down and
+/// only its fd — armed on a small per-shard io_uring readiness ring — plus a
+/// minimal resume record remain (~0.1–0.5 KiB). Any inbound byte, or a routed
+/// delivery targeting the parked client, resurrects it transparently; the client
+/// never observes the difference. Plain TCP only: TLS and WebSocket streams carry
+/// mid-stream codec state and are never parked.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ParkingConfig {
+	/// Master switch for the parked-connection idle path.
+	pub enabled: bool,
+	/// Seconds a connection must stay fully idle before it is parked. A client
+	/// pinging every `K` seconds is parked roughly `(K − grace)/K` of the time,
+	/// so keep this well below the fleet's typical keep-alive interval.
+	pub idle_grace_secs: u64,
 }
 
 /// `[persistence]` — disk-backed durability. Disabled by default; the broker is
@@ -497,6 +519,12 @@ impl Default for OverloadConfig {
 	}
 }
 
+impl Default for ParkingConfig {
+	fn default() -> Self {
+		Self { enabled: true, idle_grace_secs: 30 }
+	}
+}
+
 impl Default for PersistenceConfig {
 	fn default() -> Self {
 		Self {
@@ -589,6 +617,9 @@ impl Config {
 		}
 		if self.limits.max_payload_size == 0 {
 			return invalid("limits.max_payload_size must be non-zero");
+		}
+		if self.parking.enabled && self.parking.idle_grace_secs == 0 {
+			return invalid("parking.idle_grace_secs must be non-zero when parking is enabled");
 		}
 		if self.persistence.enabled && self.persistence.retained_file.is_empty() {
 			return invalid("persistence.retained_file must be set when persistence is enabled");
@@ -812,6 +843,16 @@ mod tests {
 
 		c.tls.websocket = false;
 		assert_eq!(c.tls.wss_port(), None, "wss requires tls.websocket");
+	}
+
+	#[test]
+	fn parking_enabled_requires_nonzero_grace() {
+		let mut c = Config::default();
+		assert!(c.parking.enabled, "parking is on by default");
+		c.parking.idle_grace_secs = 0;
+		assert!(c.validate().is_err(), "zero grace rejected while enabled");
+		c.parking.enabled = false;
+		assert!(c.validate().is_ok(), "zero grace ignored when disabled");
 	}
 
 	#[test]

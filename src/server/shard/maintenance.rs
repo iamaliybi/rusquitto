@@ -19,18 +19,13 @@ use glommio::channels::channel_mesh::Receivers;
 use glommio::channels::local_channel;
 use mqttbytes::{QoS, v5::Publish};
 
-use super::{LOAD_PROBE_INTERVAL, MALLOC_TRIM_EVERY, SESSION_SWEEP_INTERVAL, SHED_INTERVAL};
+use super::{LOAD_PROBE_INTERVAL, MALLOC_TRIM_EVERY, SESSION_SWEEP_INTERVAL, SHED_INTERVAL, Shard};
 use crate::broker::messages::MeshMsg;
 use crate::broker::session::PersistedSession;
-use crate::broker::shard::ShardState;
 use crate::config::Config;
 use crate::persistence;
 use crate::server::overload::LoadMonitor;
 use crate::telemetry::metrics::Metrics;
-
-/// A shard-local handle to the broker state, as shared between the background
-/// tasks (each clones it, so a `borrow_mut` is only ever held transiently).
-type Shard = Rc<RefCell<ShardState>>;
 
 /// The two identities every shard task needs: the glommio `executor` id (1-based,
 /// used only in logs) and the mesh `peer` id (0-based; peer 0 owns broker-wide

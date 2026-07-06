@@ -611,6 +611,213 @@ fn truncated_connect_header_is_reaped_by_the_handshake_timeout() {
 	});
 }
 
+// --- parking ------------------------------------------------------------------
+
+/// The park predicate must hold only when the connection is *fully* idle: every
+/// disqualifier — pre-CONNECT, buffered inbound bytes, a stalled partial frame,
+/// in-flight QoS state in either direction, window-held messages, unflushed
+/// output — individually blocks it.
+#[test]
+fn park_ready_only_when_fully_idle() {
+	use crate::broker::session::{InflightMessage, InflightState};
+	block_on(async {
+		let out = Rc::new(RefCell::new(Vec::new()));
+		let mut conn = make_conn(out.clone());
+		assert!(!conn.park_ready(), "never before CONNECT");
+
+		drive(&mut conn, connect_packet("c1")).await.unwrap();
+		assert!(conn.park_ready(), "connected and idle");
+
+		conn.inbound.extend_from_slice(&[0x30]);
+		assert!(!conn.park_ready(), "buffered inbound bytes");
+		conn.inbound.clear();
+
+		conn.partial_since = Some(Instant::now());
+		assert!(!conn.park_ready(), "stalled partial frame");
+		conn.partial_since = None;
+
+		conn.inflight.insert(
+			1,
+			InflightMessage {
+				publish: Publish::new("t", QoS::AtLeastOnce, b"x".to_vec()),
+				state: InflightState::Qos1,
+			},
+		);
+		assert!(!conn.park_ready(), "outbound QoS in flight");
+		conn.inflight.clear();
+
+		conn.incoming_qos2
+			.insert(1, Publish::new("t", QoS::ExactlyOnce, b"x".to_vec()));
+		assert!(!conn.park_ready(), "inbound QoS 2 uncommitted");
+		conn.incoming_qos2.clear();
+
+		conn.pending_outbound.push_back(qos0_delivery("t"));
+		assert!(!conn.park_ready(), "window-held messages");
+		conn.pending_outbound.clear();
+
+		conn.outbound.extend_from_slice(b"x");
+		assert!(!conn.park_ready(), "unflushed output");
+		conn.outbound.clear();
+
+		assert!(conn.park_ready(), "idle again once everything drained");
+	});
+}
+
+/// Feeds CONNECT (+ optionally SUBSCRIBE) wire bytes to a parkable connection
+/// over a stalling stream and returns it just before its event loop runs.
+fn parkable_conn(out: Rc<RefCell<Vec<u8>>>, subscribe: Option<&str>) -> Connection<StallStream> {
+	let mut buf = BytesMut::new();
+	let mut connect = mqtt_v5::Connect::new("parker");
+	connect.clean_session = true;
+	connect.write(&mut buf).expect("encode CONNECT");
+	if let Some(filter) = subscribe {
+		let mut sub = Subscribe::new(filter, QoS::AtLeastOnce);
+		sub.pkid = 1;
+		sub.write(&mut buf).expect("encode SUBSCRIBE");
+	}
+	let mut conn = stall_conn(out, VecDeque::from(buf.to_vec()), LimitsConfig::default());
+	conn.set_parkable(std::time::Duration::from_millis(20));
+	conn
+}
+
+/// Races an event loop against a generous watchdog so a hang is a fast failure.
+async fn flow_or_watchdog(conn: &mut Connection<StallStream>) -> Flow {
+	use futures_lite::FutureExt;
+	let watchdog = async {
+		glommio::timer::sleep(std::time::Duration::from_secs(5)).await;
+		panic!("event loop neither parked nor closed within the watchdog window");
+	};
+	conn.event_loop()
+		.or(watchdog)
+		.await
+		.expect("event loop exits cleanly")
+}
+
+#[test]
+fn fully_idle_connection_parks_after_the_grace() {
+	block_on(async {
+		let out = Rc::new(RefCell::new(Vec::new()));
+		let mut conn = parkable_conn(out.clone(), Some("t"));
+
+		let flow = flow_or_watchdog(&mut conn).await;
+		assert_eq!(flow, Flow::Park, "idle past the grace ⇒ park, not close");
+		assert!(conn.park_ready(), "handed over fully idle");
+
+		// The handshake completed normally on the way: CONNACK then SUBACK.
+		let packets = decode_all(&out);
+		assert!(matches!(packets[0], Packet::ConnAck(_)));
+		assert!(matches!(packets[1], Packet::SubAck(_)));
+	});
+}
+
+/// The full park → deliver-while-parked → resume → replay → re-park cycle, at
+/// the unit level: exactly what the serve path and the parking task perform,
+/// minus the fd and the ring.
+#[test]
+fn parked_connection_resumes_replays_and_reparks() {
+	use crate::broker::session::SessionSnapshot;
+	block_on(async {
+		let out = Rc::new(RefCell::new(Vec::new()));
+		let mut conn = parkable_conn(out.clone(), Some("t"));
+		assert_eq!(flow_or_watchdog(&mut conn).await, Flow::Park);
+
+		// The serve path's synchronous transition: destructure, flip the session.
+		let shard = conn.shard.clone();
+		let (stream, state) = conn.into_parts();
+		assert!(shard.borrow_mut().park_session(
+			state.client_id(),
+			state.generation(),
+			SessionSnapshot { next_pkid: state.next_pkid, ..Default::default() },
+		));
+
+		// A message routed while parked queues on the session (and would Wake).
+		shard.borrow_mut().deliver_local(
+			Publish::new("t", QoS::AtMostOnce, b"while-parked".to_vec()),
+			None,
+		);
+
+		// Resurrect around the same stream and run: reattach, replay, re-park.
+		out.borrow_mut().clear();
+		let mut conn = Connection::resume(
+			stream,
+			*state,
+			0,
+			shard,
+			LimitsConfig::default(),
+			Rc::new(Authenticator::from_config(&AuthConfig::default())),
+			Arc::new(Metrics::default()),
+			Arc::new(AtomicBool::new(false)),
+			std::time::Duration::from_millis(20),
+		);
+		let flow = {
+			use futures_lite::FutureExt;
+			let watchdog = async {
+				glommio::timer::sleep(std::time::Duration::from_secs(5)).await;
+				panic!("resumed connection neither re-parked nor closed");
+			};
+			conn.run()
+				.or(watchdog)
+				.await
+				.expect("resumed run exits cleanly")
+		};
+		assert_eq!(flow, Flow::Park, "drained the backlog and re-parked");
+
+		// The queued message reached the wire during the replay.
+		let packets = decode_all(&out);
+		match &packets[0] {
+			Packet::Publish(p) => {
+				assert_eq!(p.topic, "t");
+				assert_eq!(&p.payload[..], b"while-parked");
+			}
+			other => panic!("expected the replayed PUBLISH, got {other:?}"),
+		}
+	});
+}
+
+#[test]
+fn resume_after_takeover_closes_quietly() {
+	use crate::broker::session::SessionSnapshot;
+	block_on(async {
+		let out = Rc::new(RefCell::new(Vec::new()));
+		let mut conn = parkable_conn(out.clone(), None);
+		assert_eq!(flow_or_watchdog(&mut conn).await, Flow::Park);
+
+		let shard = conn.shard.clone();
+		let (stream, state) = conn.into_parts();
+		assert!(shard.borrow_mut().park_session(
+			state.client_id(),
+			state.generation(),
+			SessionSnapshot { next_pkid: state.next_pkid, ..Default::default() },
+		));
+
+		// A new connection takes the client id over before the resume lands.
+		let (tx2, _rx2) = local_channel::new_unbounded();
+		shard.borrow_mut().open_session("parker", tx2, false);
+
+		out.borrow_mut().clear();
+		let mut conn = Connection::resume(
+			stream,
+			*state,
+			0,
+			shard,
+			LimitsConfig::default(),
+			Rc::new(Authenticator::from_config(&AuthConfig::default())),
+			Arc::new(Metrics::default()),
+			Arc::new(AtomicBool::new(false)),
+			std::time::Duration::from_millis(20),
+		);
+		assert_eq!(
+			conn.run().await.expect("displaced resume exits cleanly"),
+			Flow::Closed,
+			"stale generation ⇒ displaced-connection semantics"
+		);
+		assert!(
+			out.borrow().is_empty(),
+			"quiet close: no DISCONNECT, no will, nothing on the wire"
+		);
+	});
+}
+
 #[test]
 fn stalled_partial_frame_is_reaped_even_without_keepalive() {
 	// The dangerous post-CONNECT sibling: keep-alive disabled on BOTH ends (so the

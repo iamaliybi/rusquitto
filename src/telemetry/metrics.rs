@@ -34,6 +34,10 @@ pub struct Metrics {
 	connections_shed: AtomicU64,
 	/// New connections rejected by admission control (overload) since start.
 	admission_rejected: AtomicU64,
+	/// Connections currently parked (idle, task-less, fd on a readiness ring).
+	/// A parked client still counts in `clients_connected`; this gauge tells how
+	/// many of those are in the parked state right now.
+	clients_parked: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -56,6 +60,7 @@ impl Metrics {
 			shard_delay_us: (0..shards).map(|_| AtomicU64::new(0)).collect(),
 			connections_shed: AtomicU64::new(0),
 			admission_rejected: AtomicU64::new(0),
+			clients_parked: AtomicU64::new(0),
 		}
 	}
 
@@ -85,6 +90,16 @@ impl Metrics {
 	/// Records a client disconnecting. Pairs with [`client_connected`].
 	pub fn client_disconnected(&self) {
 		self.clients_connected.fetch_sub(1, Ordering::Relaxed);
+	}
+
+	/// Records a connection entering the parked state. Pairs with [`client_unparked`].
+	pub fn client_parked(&self) {
+		self.clients_parked.fetch_add(1, Ordering::Relaxed);
+	}
+
+	/// Records a connection leaving the parked state (resumed or closed).
+	pub fn client_unparked(&self) {
+		self.clients_parked.fetch_sub(1, Ordering::Relaxed);
 	}
 
 	/// Records a PUBLISH received from a client, with its payload size.
@@ -120,6 +135,7 @@ impl Metrics {
 			max_scheduling_delay_ms: max_delay_us / 1000,
 			connections_shed: self.connections_shed.load(Ordering::Relaxed),
 			admission_rejected: self.admission_rejected.load(Ordering::Relaxed),
+			clients_parked: self.clients_parked.load(Ordering::Relaxed),
 		}
 	}
 }
@@ -137,6 +153,7 @@ pub struct MetricsSnapshot {
 	pub max_scheduling_delay_ms: u64,
 	pub connections_shed: u64,
 	pub admission_rejected: u64,
+	pub clients_parked: u64,
 }
 
 impl MetricsSnapshot {
@@ -156,6 +173,10 @@ impl MetricsSnapshot {
 				self.clients_connected.to_string(),
 			),
 			("$SYS/broker/clients/total", self.clients_total.to_string()),
+			(
+				"$SYS/broker/parked-connections",
+				self.clients_parked.to_string(),
+			),
 			(
 				"$SYS/broker/messages/received",
 				self.messages_received.to_string(),

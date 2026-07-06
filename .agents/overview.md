@@ -6,7 +6,7 @@
 **Runtime:** Glommio (io_uring, Linux 5.8+)
 **Author:** Ali Yaghoubi
 **Status:** Functional broker — sessions, will, negotiation, auth+ACL, `$SYS`, shutdown, subscription options — Phase 3a–3i.
-**Last updated:** 2026-07-03
+**Last updated:** 2026-07-07 (v2.0.0)
 
 See [progress.md](progress.md) for the detailed implementation log, decisions, and gotchas.
 
@@ -54,6 +54,9 @@ See [progress.md](progress.md) for the detailed implementation log, decisions, a
 | Anonymous-client ACL                         | ✅ `[auth]` anonymous allow-lists   |
 | Outbound topic aliases                       | ✅ per-conn map, client's alias max |
 | Shared subscriptions (cross-shard)           | ✅ globally-coordinated single delivery (mesh membership + deterministic pick) |
+| Session WAL (group-commit, crash-window bound)| ✅ `[persistence] wal_flush_ms`, `persistence/wal.rs` |
+| Mutual TLS (client certs, CN→username ACLs)  | ✅ `[tls]` client_ca_file / cert_cn_as_username |
+| **Connection parking (idle path)**           | ✅ `[parking]` on by default — idle conns 0.68 KiB/conn on a per-shard readiness ring, `server/shard/parking.rs` |
 
 ---
 

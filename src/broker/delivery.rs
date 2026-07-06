@@ -45,3 +45,28 @@ pub struct Delivery {
 /// Sender half of a connection's mailbox. `LocalSender` is single-owner (not
 /// `Clone`), so each connection's sender is stored exactly once — in its session.
 pub type Mailbox = LocalSender<Delivery>;
+
+/// A command from the broker layer to the shard's parking task (the server-layer
+/// task that owns the parked-fd readiness ring). The broker knows *that* a session
+/// is parked, not *how*; the server injects the sender at startup
+/// ([`set_unpark_tx`](crate::broker::shard::ShardState::set_unpark_tx), mirroring
+/// how the mesh control outbox is injected) and this enum is the whole vocabulary
+/// between the two layers.
+#[derive(Debug)]
+pub enum UnparkCmd {
+	/// A delivery landed for a parked client: resurrect its connection task so it
+	/// can drain the queued messages. Sent at most once per park episode
+	/// (deduplicated by the session's `wake_pending` flag).
+	Wake {
+		client_id: String,
+	},
+	/// The parked fd must be closed without resuming — the session was taken over
+	/// by a new connection, discarded by a Clean Start, or claimed by another
+	/// shard. `generation` is the parked connection's session generation, so a
+	/// racing unpark (entry already gone or re-parked under a newer generation)
+	/// makes this a no-op. No Will is published: takeover semantics.
+	Close {
+		client_id: String,
+		generation: u64,
+	},
+}

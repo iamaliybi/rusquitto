@@ -2,6 +2,15 @@ use super::*;
 use glommio::channels::local_channel;
 use mqttbytes::QoS;
 
+/// Runs a future on a throwaway glommio executor — needed by the parking tests
+/// to `recv()` from the [`UnparkCmd`] command channel.
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+	glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+		.make()
+		.expect("build test executor")
+		.run(fut)
+}
+
 fn pubm(topic: &str, qos: QoS, payload: &[u8], retain: bool) -> Publish {
 	let mut p = Publish::new(topic, qos, payload.to_vec());
 	p.retain = retain;
@@ -30,6 +39,8 @@ fn arm(state: &mut ShardState, client: &str) {
 			snapshot: None,
 			offline_queue: VecDeque::new(),
 			pending_will: None,
+			parked: false,
+			wake_pending: false,
 		},
 	);
 }
@@ -345,6 +356,8 @@ fn persist_then_load_restores_a_full_suspended_session() {
 			})),
 			offline_queue: VecDeque::new(),
 			pending_will: None,
+			parked: false,
+			wake_pending: false,
 		},
 	);
 	// A subscription (No Local + a sub id) and one message queued while offline.
@@ -448,6 +461,271 @@ fn shared_global_pick_skips_local_suspended_when_remote_members_exist() {
 	// pick, so nothing is queued locally (the old per-shard behavior would have
 	// parked the message in the suspended member's offline queue).
 	assert_eq!(offline(&s, "local").len(), 0);
+}
+
+// --- parking ----------------------------------------------------------------
+
+/// Opens a live session and parks it, returning its generation.
+fn park(state: &mut ShardState, client: &str) -> u64 {
+	let (tx, _rx) = local_channel::new_unbounded::<Delivery>();
+	let h = state.open_session(client, tx, false);
+	assert!(
+		state.park_session(client, h.generation, SessionSnapshot::default()),
+		"parking a live session under its own generation must succeed"
+	);
+	h.generation
+}
+
+#[test]
+fn park_session_flips_state_and_checks_generation() {
+	let mut s = ShardState::default();
+	let (tx, _rx) = local_channel::new_unbounded::<Delivery>();
+	let h = s.open_session("c1", tx, false);
+
+	// A stale generation (taken-over connection) must not park.
+	assert!(!s.park_session("c1", h.generation + 1, SessionSnapshot::default()));
+	assert!(s.sessions["c1"].mailbox.is_some(), "session untouched");
+
+	let snapshot = SessionSnapshot { next_pkid: 17, ..Default::default() };
+	assert!(s.park_session("c1", h.generation, snapshot));
+	let session = &s.sessions["c1"];
+	assert!(session.parked);
+	assert!(session.mailbox.is_none());
+	assert!(
+		session.expires_at.is_none(),
+		"parked = connected, no expiry"
+	);
+	assert_eq!(
+		session.snapshot.as_ref().unwrap().next_pkid,
+		17,
+		"durable state stored like a suspension (migration-ready)"
+	);
+	assert_eq!(session.generation, h.generation, "generation not bumped");
+
+	// Double-park (no live mailbox any more) is refused.
+	assert!(!s.park_session("c1", h.generation, SessionSnapshot::default()));
+}
+
+#[test]
+fn deliver_to_parked_queues_all_qos_and_wakes_exactly_once() {
+	block_on(async {
+		let mut s = ShardState::default();
+		let (cmd_tx, cmd_rx) = local_channel::new_unbounded::<UnparkCmd>();
+		s.set_unpark_tx(cmd_tx);
+		park(&mut s, "c1");
+		s.subscribe("t", "c1", opts(QoS::AtLeastOnce, false, false, None, None));
+
+		// QoS 0 queues too — a parked client is connected, not suspended.
+		s.deliver_local(pubm("t", QoS::AtMostOnce, b"q0", false), None);
+		s.deliver_local(pubm("t", QoS::AtLeastOnce, b"q1", false), None);
+		assert_eq!(offline(&s, "c1").len(), 2, "QoS 0 and QoS 1 both queued");
+
+		// Exactly one Wake for the whole park episode.
+		match cmd_rx.recv().await {
+			Some(UnparkCmd::Wake { client_id }) => assert_eq!(client_id, "c1"),
+			other => panic!("expected one Wake, got {other:?}"),
+		}
+		assert!(
+			futures_lite::future::poll_once(cmd_rx.recv())
+				.await
+				.is_none(),
+			"further deliveries must not send further Wakes"
+		);
+	});
+}
+
+#[test]
+fn reattach_parked_returns_queue_in_order_and_clears_wake() {
+	block_on(async {
+		let mut s = ShardState::default();
+		let (cmd_tx, _cmd_rx) = local_channel::new_unbounded::<UnparkCmd>();
+		s.set_unpark_tx(cmd_tx);
+		let generation = park(&mut s, "c1");
+		s.subscribe("t", "c1", opts(QoS::AtLeastOnce, false, false, None, None));
+		s.deliver_local(pubm("t", QoS::AtLeastOnce, b"first", false), None);
+		s.deliver_local(pubm("t", QoS::AtLeastOnce, b"second", false), None);
+
+		// A stale generation must not reattach.
+		let (m1, _r1) = local_channel::new_unbounded::<Delivery>();
+		assert!(s.reattach_parked("c1", generation + 1, m1).is_none());
+
+		let (m2, _r2) = local_channel::new_unbounded::<Delivery>();
+		let (_snapshot, queued) = s
+			.reattach_parked("c1", generation, m2)
+			.expect("matching generation reattaches");
+		let payloads: Vec<&[u8]> = queued.iter().map(|d| &d.publish.payload[..]).collect();
+		assert_eq!(payloads, vec![&b"first"[..], &b"second"[..]], "in order");
+		let session = &s.sessions["c1"];
+		assert!(!session.parked);
+		assert!(!session.wake_pending, "wake dedup reset for the next park");
+		assert!(session.mailbox.is_some());
+
+		// Reattaching again (no longer parked) is refused.
+		let (m3, _r3) = local_channel::new_unbounded::<Delivery>();
+		assert!(s.reattach_parked("c1", generation, m3).is_none());
+	});
+}
+
+#[test]
+fn takeover_of_parked_session_signals_close_with_old_generation() {
+	block_on(async {
+		let mut s = ShardState::default();
+		let (cmd_tx, cmd_rx) = local_channel::new_unbounded::<UnparkCmd>();
+		s.set_unpark_tx(cmd_tx);
+		let old_generation = park(&mut s, "c1");
+
+		// A new connection resumes the same client id: session takeover.
+		let (tx2, _rx2) = local_channel::new_unbounded::<Delivery>();
+		let h2 = s.open_session("c1", tx2, false);
+		assert!(
+			h2.resumed,
+			"parked session state is resumed by the takeover"
+		);
+		assert!(!s.sessions["c1"].parked);
+
+		match cmd_rx.recv().await {
+			Some(UnparkCmd::Close { client_id, generation }) => {
+				assert_eq!(client_id, "c1");
+				assert_eq!(
+					generation, old_generation,
+					"Close carries the parked generation for the race check"
+				);
+			}
+			other => panic!("expected Close, got {other:?}"),
+		}
+	});
+}
+
+#[test]
+fn clean_start_over_parked_session_signals_close_and_discards() {
+	block_on(async {
+		let mut s = ShardState::default();
+		let (cmd_tx, cmd_rx) = local_channel::new_unbounded::<UnparkCmd>();
+		s.set_unpark_tx(cmd_tx);
+		park(&mut s, "c1");
+
+		let (tx2, _rx2) = local_channel::new_unbounded::<Delivery>();
+		let h2 = s.open_session("c1", tx2, true);
+		assert!(!h2.resumed, "Clean Start discards the parked session");
+		assert!(matches!(cmd_rx.recv().await, Some(UnparkCmd::Close { .. })));
+	});
+}
+
+#[test]
+fn mesh_claim_of_parked_session_migrates_state_and_signals_close() {
+	use crate::broker::messages::SessionControl;
+	block_on(async {
+		let mut s = ShardState::default();
+		let (cmd_tx, cmd_rx) = local_channel::new_unbounded::<UnparkCmd>();
+		s.set_unpark_tx(cmd_tx);
+		let (tx, _rx) = local_channel::new_unbounded::<Delivery>();
+		let h = s.open_session("c1", tx, false);
+		let snapshot = SessionSnapshot { next_pkid: 23, ..Default::default() };
+		assert!(s.park_session("c1", h.generation, snapshot));
+
+		// Another shard claims the client (it reconnected there).
+		s.on_control(SessionControl::Claim { client_id: "c1".into(), requester: 1, resume: true });
+
+		assert!(
+			!s.sessions.contains_key("c1"),
+			"parked session migrated away (extract works because park stores the snapshot)"
+		);
+		assert!(
+			matches!(cmd_rx.recv().await, Some(UnparkCmd::Close { .. })),
+			"the orphaned parked fd is told to close"
+		);
+	});
+}
+
+#[test]
+fn suspend_parked_sets_expiry_wal_and_destroys_on_zero() {
+	let mut s = ShardState::default();
+	s.enable_wal();
+	let generation = park(&mut s, "c1");
+	let _ = s.take_wal_batch(Instant::now()); // clear open_session's tombstone
+
+	// Stale generation: no-op (taken over meanwhile — caller publishes no Will).
+	assert!(!s.suspend_parked("c1", generation + 1, 3600));
+	assert!(s.sessions["c1"].parked, "untouched on mismatch");
+
+	assert!(s.suspend_parked("c1", generation, 3600));
+	let session = &s.sessions["c1"];
+	assert!(!session.parked);
+	assert!(session.expires_at.is_some(), "finite expiry now armed");
+	assert!(
+		s.take_wal_batch(Instant::now()).is_some(),
+		"now genuinely suspended: durable state enters the WAL"
+	);
+
+	// Expiry 0 destroys outright (the parked analogue of close_session).
+	let generation = park(&mut s, "c2");
+	assert!(s.suspend_parked("c2", generation, 0));
+	assert!(!s.sessions.contains_key("c2"));
+}
+
+#[test]
+fn persistence_skips_parked_sessions() {
+	let mut s = ShardState::default();
+	park(&mut s, "parked");
+	arm(&mut s, "suspended");
+	s.sessions.get_mut("suspended").unwrap().expires_at = Some(Instant::now() + Duration::from_secs(3600));
+
+	let persisted = s.persist_sessions(Instant::now());
+	assert_eq!(
+		persisted.len(),
+		1,
+		"only the truly suspended session persists"
+	);
+	assert_eq!(persisted[0].client_id, "suspended");
+}
+
+#[test]
+fn parked_queueing_does_not_dirty_the_wal() {
+	let mut s = ShardState::default();
+	s.enable_wal();
+	park(&mut s, "c1");
+	s.subscribe("t", "c1", opts(QoS::AtLeastOnce, false, false, None, None));
+	let _ = s.take_wal_batch(Instant::now()); // clear open_session's tombstone
+
+	s.deliver_local(pubm("t", QoS::AtLeastOnce, b"x", false), None);
+	assert_eq!(offline(&s, "c1").len(), 1);
+	assert!(
+		s.take_wal_batch(Instant::now()).is_none(),
+		"a parked session is a live connection, not durable state"
+	);
+}
+
+#[test]
+fn parked_shared_member_counts_as_online_for_the_group_pick() {
+	let mut s = ShardState::default();
+	// One parked member, one truly suspended member, same local group.
+	park(&mut s, "parked");
+	arm(&mut s, "suspended");
+	s.subscribe(
+		"t",
+		"parked",
+		opts(QoS::AtLeastOnce, false, false, Some("g"), None),
+	);
+	s.subscribe(
+		"t",
+		"suspended",
+		opts(QoS::AtLeastOnce, false, false, Some("g"), None),
+	);
+
+	// Round-robin over ONLINE members only: the parked one is online, the
+	// suspended one is not — so every pick lands on the parked member.
+	for i in 0..4 {
+		s.deliver_local(
+			pubm("t", QoS::AtLeastOnce, format!("m{i}").as_bytes(), false),
+			None,
+		);
+	}
+	assert_eq!(
+		offline(&s, "parked").len(),
+		4,
+		"all picks hit the parked member"
+	);
+	assert_eq!(offline(&s, "suspended").len(), 0);
 }
 
 /// Two shards' worth of state, cross-replicated views, one message stream:

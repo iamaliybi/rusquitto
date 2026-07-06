@@ -94,6 +94,22 @@ const PENDING_OUTBOUND_LIMIT: usize = 4096;
 // enforced instead at the routing site via [`MAILBOX_LIMIT`]
 // (crate::broker::session::MAILBOX_LIMIT).
 
+/// How a connection's event loop ended.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Flow {
+	/// The connection is over: EOF, protocol error, timeout, takeover, or a clean
+	/// DISCONNECT. `run()` has already torn the session down.
+	Closed,
+	/// The connection went fully idle past the parking grace and should be
+	/// *parked*: the caller must destructure it ([`Connection::into_parts`]),
+	/// flip the session ([`ShardState::park_session`]) and hand the fd + resume
+	/// state to the shard's parking registry — synchronously, with no `.await`
+	/// in between (the single-threaded shard then guarantees no delivery can
+	/// slip past the transition). `run()` performed **no** cleanup: the session,
+	/// the connected-clients gauge, and the Will all stay live.
+	Park,
+}
+
 /// One blocking turn of the connection event loop resolves to exactly one of
 /// these: bytes from the client socket, a routed delivery, or the idle deadline.
 /// Packets are parsed *outside* the race (synchronously, from the assembly
@@ -229,6 +245,92 @@ pub struct Connection<S: ByteStream> {
 	/// Per-connection inbound PUBLISH throttle. `Some` when `limits.max_message_rate`
 	/// is set: bounds how much CPU one noisy publisher can draw on its pinned core.
 	rate_limiter: Option<TokenBucket>,
+	/// How long the connection must stay fully idle before the event loop offers
+	/// it for parking (`[parking] idle_grace_secs`). `None` disables parking for
+	/// this connection — the default; only the plain-TCP path opts in (TLS and
+	/// WebSocket streams carry mid-stream codec state that can't be parked).
+	park_grace: Option<Duration>,
+	/// Last moment this connection did real work (an inbound packet processed or
+	/// an outbound delivery queued). The parking deadline is `last_activity +
+	/// park_grace`, evaluated only while [`park_ready`](Self::park_ready) holds.
+	last_activity: Instant,
+	/// Set by [`resume`](Self::resume): the next `run()` first re-attaches the
+	/// parked session and replays what queued while parked, before entering the
+	/// normal event loop.
+	resume_pending: bool,
+}
+
+/// Everything a parked connection needs to be rebuilt, beyond its fd: the
+/// negotiated MQTT session parameters that live in the connection while online.
+/// Produced by [`Connection::into_parts`] on park and consumed by
+/// [`Connection::resume`] on wake; boxed in the parking registry (~200 B — the
+/// entire per-connection cost of a parked client besides the fd itself).
+///
+/// Durable QoS state (`inflight`/`incoming_qos2`/`next_pkid`) is deliberately
+/// *not* here: the park predicate guarantees the maps are empty, and `next_pkid`
+/// travels through the session snapshot (`park_session` → `reattach_parked`) so
+/// cross-shard migration of a parked session carries it automatically. The
+/// mutual-TLS identity isn't here either: only plain TCP parks, which is always
+/// [`TlsIdentity::None`].
+///
+/// Fields are private; the parking registry reads what its sweep needs through
+/// the accessors below and treats the rest as an opaque payload.
+pub(crate) struct ResumeState {
+	client_id: String,
+	session_generation: u64,
+	next_pkid: u16,
+	session_expiry: u32,
+	keepalive: Option<Duration>,
+	deadline: Option<Instant>,
+	will: Option<Box<mqtt_v5::Publish>>,
+	will_delay: u32,
+	username: Option<String>,
+	peer_receive_max: u16,
+	peer_max_packet_size: Option<u32>,
+	peer_topic_alias_max: u16,
+	aliases: Option<Box<AliasTables>>,
+	subscription_count: usize,
+	rate_limiter: Option<TokenBucket>,
+}
+
+impl ResumeState {
+	/// The parked client's id (registry key).
+	pub(crate) fn client_id(&self) -> &str {
+		&self.client_id
+	}
+
+	/// The session generation the connection parked under, for the takeover /
+	/// stale-wake race checks.
+	pub(crate) fn generation(&self) -> u64 {
+		self.session_generation
+	}
+
+	/// The keep-alive deadline frozen at park time (`None` = keep-alive
+	/// disabled). The parking task's sweep reaps the fd past this — the client's
+	/// transmission clock keeps running while it is parked.
+	pub(crate) fn deadline(&self) -> Option<Instant> {
+		self.deadline
+	}
+
+	/// The negotiated Session Expiry Interval, for suspending the session when
+	/// the parked fd is reaped.
+	pub(crate) fn session_expiry(&self) -> u32 {
+		self.session_expiry
+	}
+
+	/// Takes the Will Message and its delay, if any — published when the parked
+	/// connection ends abnormally (keep-alive expiry), exactly as a live one's
+	/// `run()` cleanup would.
+	pub(crate) fn take_will(&mut self) -> Option<(mqtt_v5::Publish, u32)> {
+		self.will.take().map(|w| (*w, self.will_delay))
+	}
+
+	/// The durable snapshot to store on the session at park time. The QoS maps
+	/// are empty by the park predicate; only the packet-id allocator carries
+	/// over (and thus migrates with the session if another shard claims it).
+	pub(crate) fn session_snapshot(&self) -> crate::broker::session::SessionSnapshot {
+		crate::broker::session::SessionSnapshot { next_pkid: self.next_pkid, ..Default::default() }
+	}
 }
 
 /// The earlier of two optional deadlines; `None` means "no bound", so a present
@@ -305,7 +407,162 @@ impl<S: ByteStream> Connection<S> {
 			subscription_count: 0,
 			rate_limiter: (limits.max_message_rate > 0)
 				.then(|| TokenBucket::per_second(limits.max_message_rate, Instant::now())),
+			park_grace: None,
+			last_activity: Instant::now(),
+			resume_pending: false,
 		}
+	}
+
+	/// Opts this connection into parking: once fully idle for `grace`, its event
+	/// loop returns [`Flow::Park`] instead of blocking. Only the plain-TCP serve
+	/// path calls this — the fd of a TLS/WebSocket stream can't be parked.
+	pub(crate) fn set_parkable(&mut self, grace: Duration) {
+		self.park_grace = Some(grace);
+	}
+
+	/// Whether this connection is *fully* idle and thus parkable: past the
+	/// handshake, with no in-flight QoS state in either direction, nothing held
+	/// back by the outbound window, no buffered inbound bytes (a partial frame is
+	/// buffered bytes), and every outbound byte flushed. The mailbox is not
+	/// checked here — the event loop only consults this after its drain phase,
+	/// when the mailbox is provably empty.
+	fn park_ready(&self) -> bool {
+		self.connected
+			&& self.inflight.is_empty()
+			&& self.incoming_qos2.is_empty()
+			&& self.pending_outbound.is_empty()
+			&& self.inbound.is_empty()
+			&& self.outbound.is_empty()
+			&& self.partial_since.is_none()
+	}
+
+	/// Destructures a parking connection into its transport stream and the
+	/// [`ResumeState`] needed to rebuild it. Only meaningful after `run()`
+	/// returned [`Flow::Park`].
+	pub(crate) fn into_parts(self) -> (S, Box<ResumeState>) {
+		let state = Box::new(ResumeState {
+			client_id: self.client_id,
+			session_generation: self.session_generation,
+			next_pkid: self.next_pkid,
+			session_expiry: self.session_expiry,
+			keepalive: self.keepalive,
+			deadline: self.deadline,
+			will: self.will,
+			will_delay: self.will_delay,
+			username: self.username,
+			peer_receive_max: self.peer_receive_max,
+			peer_max_packet_size: self.peer_max_packet_size,
+			peer_topic_alias_max: self.peer_topic_alias_max,
+			aliases: self.aliases,
+			subscription_count: self.subscription_count,
+			rate_limiter: self.rate_limiter,
+		});
+		(self.stream, state)
+	}
+
+	/// Rebuilds a parked connection around its (re-materialized) stream: the
+	/// unpark counterpart of [`into_parts`](Self::into_parts). The connection
+	/// comes back `connected` and `counted` (the gauge was never decremented — the
+	/// client never disconnected) with a fresh mailbox pair; the next `run()`
+	/// re-attaches the session and replays whatever queued while parked.
+	#[allow(clippy::too_many_arguments)]
+	pub(crate) fn resume(
+		stream: S,
+		state: ResumeState,
+		shard_id: usize,
+		shard: Rc<RefCell<ShardState>>,
+		limits: LimitsConfig,
+		auth: Rc<Authenticator>,
+		metrics: Arc<Metrics>,
+		shutdown: Arc<AtomicBool>,
+		park_grace: Duration,
+	) -> Self {
+		let (mailbox_tx, mailbox_rx) = local_channel::new_unbounded();
+		Self {
+			stream,
+			inbound: BytesMut::with_capacity(limits.initial_read_buffer),
+			outbound: BytesMut::new(),
+			read_chunk: READ_CHUNK_MIN,
+			shard_id,
+			client_id: state.client_id,
+			shard,
+			mailbox_tx: Some(mailbox_tx),
+			mailbox_rx,
+			incoming_qos2: HashMap::new(),
+			inflight: HashMap::new(),
+			next_pkid: state.next_pkid,
+			limits,
+			session_expiry: state.session_expiry,
+			session_generation: state.session_generation,
+			will: state.will,
+			peer_receive_max: state.peer_receive_max,
+			peer_max_packet_size: state.peer_max_packet_size,
+			pending_outbound: VecDeque::new(),
+			auth,
+			username: state.username,
+			metrics,
+			counted: true,
+			shutdown,
+			will_delay: state.will_delay,
+			peer_topic_alias_max: state.peer_topic_alias_max,
+			aliases: state.aliases,
+			connected: true,
+			tls_identity: TlsIdentity::None, // only plain TCP parks
+			// The keep-alive deadline continues from where it froze at park time:
+			// the client's transmission clock never stopped. Refreshed by its next
+			// inbound packet as usual.
+			deadline: state.deadline,
+			keepalive: state.keepalive,
+			partial_since: None,
+			subscription_count: state.subscription_count,
+			rate_limiter: state.rate_limiter,
+			park_grace: Some(park_grace),
+			last_activity: Instant::now(),
+			resume_pending: true,
+		}
+	}
+
+	/// Boxes the unpark prelude — session reattach plus replay of everything
+	/// queued while parked — on a plain stack frame (see [`process_one`] for the
+	/// pattern). Returns `Ok(false)` when the session was taken over while the
+	/// wake was in flight: displaced-connection semantics — no Will, no session
+	/// teardown (a newer connection owns it), only the gauge decrement in
+	/// `run()`'s tail still applies.
+	fn boxed_resume_prelude(&mut self) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<bool>> + '_>> {
+		Box::pin(async move {
+			match self.reattach() {
+				None => {
+					debug!("parked session gone on resume (taken over), closing");
+					self.will = None;
+					self.client_id.clear();
+					Ok(false)
+				}
+				Some(queued) => {
+					self.resume_delivery(queued).await?;
+					debug!("connection resumed from parked");
+					Ok(true)
+				}
+			}
+		})
+	}
+
+	/// Re-attaches a resumed connection to its parked session, restoring the
+	/// snapshot and returning what queued while parked. `None` means the session
+	/// was taken over (or claimed away) while the wake was in flight — the caller
+	/// closes quietly with displaced-connection semantics.
+	fn reattach(&mut self) -> Option<VecDeque<Delivery>> {
+		let mailbox = self
+			.mailbox_tx
+			.take()
+			.expect("a resumed connection holds its fresh mailbox sender");
+		let (snapshot, queued) =
+			self.shard
+				.borrow_mut()
+				.reattach_parked(&self.client_id, self.session_generation, mailbox)?;
+		self.inflight = snapshot.inflight;
+		self.incoming_qos2 = snapshot.incoming_qos2;
+		self.next_pkid = snapshot.next_pkid;
+		Some(queued)
 	}
 
 	/// Encodes a single MQTT packet into the coalesced output buffer, mapping any
@@ -359,10 +616,31 @@ impl<S: ByteStream> Connection<S> {
 		}
 	}
 
-	pub async fn run(&mut self) -> Result<()> {
+	pub(crate) async fn run(&mut self) -> Result<Flow> {
 		debug!("connection opened");
 
-		let result = self.event_loop().await;
+		let result = if self.resume_pending {
+			// Unparked: re-attach the session, replay what queued while parked,
+			// then fall into the normal event loop. The prelude is boxed through
+			// a plain-fn seam (like the cold handler arms) so its slots don't
+			// live in every connection's long-lived `run()` machine.
+			self.resume_pending = false;
+			match self.boxed_resume_prelude().await {
+				Ok(true) => self.event_loop().await,
+				Ok(false) => Ok(Flow::Closed),
+				Err(e) => Err(e),
+			}
+		} else {
+			self.event_loop().await
+		};
+
+		// Parked: no cleanup at all — the client is still connected. The session,
+		// the connected-clients gauge, and the Will stay live; the caller now owns
+		// the fd + resume state (via `into_parts`) and completes the transition.
+		if matches!(result, Ok(Flow::Park)) {
+			debug!("connection parking");
+			return result;
+		}
 
 		// Best-effort: put any still-buffered output (a reject CONNACK, a final
 		// DISCONNECT) on the wire before tearing the session down. The connection
@@ -448,7 +726,7 @@ impl<S: ByteStream> Connection<S> {
 	/// Everything one wakeup produces — acks for a burst of PUBLISHes, a fan-out
 	/// of deliveries — thus leaves in a single io_uring op instead of one per
 	/// packet.
-	async fn event_loop(&mut self) -> Result<()> {
+	async fn event_loop(&mut self) -> Result<Flow> {
 		let max_packet = self.limits.max_payload_size;
 		loop {
 			// Drain: every complete packet already buffered. Parsing and dispatch
@@ -460,10 +738,12 @@ impl<S: ByteStream> Connection<S> {
 					Ok(false) => break, // need more bytes
 					Err(e) => {
 						warn!(error = %e, "protocol/io error, closing connection");
-						return Ok(());
+						return Ok(Flow::Closed);
 					}
 				}
-				// Any inbound packet refreshes the keep-alive deadline.
+				// Any inbound packet refreshes the keep-alive deadline and marks
+				// activity for the parking grace clock.
+				self.last_activity = Instant::now();
 				if let Some(window) = self.keepalive {
 					self.deadline = Some(Instant::now() + window);
 				}
@@ -513,8 +793,20 @@ impl<S: ByteStream> Connection<S> {
 				self.partial_since = Some(Instant::now());
 			}
 
+			// The parking deadline: armed only when this connection opted in, is
+			// fully idle right now (the drain phases above left nothing pending),
+			// and the broker isn't shutting down. If the race below resolves as a
+			// timeout on this deadline, nothing arrived in between — the connection
+			// is provably still idle and parks.
+			let park_at = match self.park_grace {
+				Some(grace) if self.park_ready() && !self.shutdown.load(Ordering::Relaxed) => {
+					Some(self.last_activity + grace)
+				}
+				_ => None,
+			};
 			let valid = self.inbound.len();
-			let deadline = earlier(self.deadline, self.framing_deadline());
+			let close_deadline = earlier(self.deadline, self.framing_deadline());
+			let deadline = earlier(close_deadline, park_at);
 			let chunk = self.read_chunk;
 			let event = {
 				let stream = &mut self.stream;
@@ -572,40 +864,61 @@ impl<S: ByteStream> Connection<S> {
 						None => return self.mailbox_closed(),
 					}
 				}
-				// The idle deadline lapsed: no valid CONNECT in time, or no traffic
-				// within the keep-alive window. Either way, drop the connection (an
-				// abnormal close, so a keep-alive timeout still fires the will).
+				// A deadline lapsed. Which one decides the outcome: the close deadline
+				// (handshake, keep-alive, or framing stall) drops the connection; the
+				// parking deadline — reachable only when it was armed, i.e. the
+				// connection was fully idle going into this block — parks it.
 				Event::Timeout => {
-					// A partial frame still buffered means the deadline that fired was
-					// the framing (stall) bound, not an idle keep-alive lapse.
-					let stalled_mid_frame = !self.inbound.is_empty();
 					self.inbound.truncate(valid);
-					if self.connected {
-						warn!(
-							stalled_mid_frame,
-							"keep-alive or framing timeout, closing connection"
-						);
-						let _ = self.send_disconnect(mqtt_v5::DisconnectReasonCode::KeepAliveTimeout);
-					} else {
-						warn!("CONNECT not received or completed within handshake timeout, closing");
+					let now = Instant::now();
+					if park_at.is_none() || close_deadline.is_some_and(|dl| dl <= now) {
+						// A partial frame still buffered means the deadline that fired
+						// was the framing (stall) bound, not an idle keep-alive lapse.
+						let stalled_mid_frame = !self.inbound.is_empty();
+						if self.connected {
+							warn!(
+								stalled_mid_frame,
+								"keep-alive or framing timeout, closing connection"
+							);
+							let _ = self.send_disconnect(mqtt_v5::DisconnectReasonCode::KeepAliveTimeout);
+						} else {
+							warn!("CONNECT not received or completed within handshake timeout, closing");
+						}
+						return Ok(Flow::Closed);
 					}
-					return Ok(());
+					// The parking grace elapsed while fully idle. The timeout winning
+					// the race proves no bytes and no delivery arrived meanwhile; one
+					// final non-yielding mailbox check (`poll_once` resolves on its
+					// first poll) is belt-and-braces before handing the connection to
+					// the caller for the synchronous park transition.
+					debug_assert!(self.park_ready());
+					match futures_lite::future::poll_once(self.mailbox_rx.recv()).await {
+						None => return Ok(Flow::Park),
+						Some(Some(delivery)) => {
+							// A delivery slipped in after all: don't park, serve it.
+							if let Err(e) = self.deliver(delivery) {
+								warn!(error = %e, "delivery error, closing connection");
+								return Err(e);
+							}
+						}
+						Some(None) => return self.mailbox_closed(),
+					}
 				}
 			}
 		}
 
-		Ok(())
+		Ok(Flow::Closed)
 	}
 
 	/// The mailbox sender was dropped — either the server is shutting down (tell
 	/// the client and suppress the will) or a new connection took over our client
 	/// id (just close). `run()` flushes the DISCONNECT on the way out.
-	fn mailbox_closed(&mut self) -> Result<()> {
+	fn mailbox_closed(&mut self) -> Result<Flow> {
 		if self.shutdown.load(Ordering::Relaxed) {
 			self.will = None;
 			let _ = self.send_disconnect(mqtt_v5::DisconnectReasonCode::ServerShuttingDown);
 		}
-		Ok(())
+		Ok(Flow::Closed)
 	}
 
 	/// Frames one complete MQTT packet out of `buffer`, or `None` if more bytes

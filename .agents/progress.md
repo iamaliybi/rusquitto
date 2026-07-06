@@ -743,3 +743,61 @@ becomes the MQTT username so `[[auth.users]]` ACLs apply per-device.
   client CN=sensor-01, user sensor-01 publish=["sensors/01/#"], cert_cn_as_username=
   true, allow_anonymous=false): in-ACL publish DELIVERED, out-of-ACL publish BLOCKED.
   96 unit + 15 integration, clippy/fmt clean. FUTURE: SAN fallback when no CN.
+
+## Phase 14 — parked-connection idle path (2026-07-07, v2.0.0)
+
+The connection-density project (old next-steps §1), all four phases in one PR.
+Idle plain-TCP conns: task + io_uring read Source torn down after
+`[parking] idle_grace_secs` (default 30, ON by default); only the fd — oneshot
+POLL_ADD on a per-shard RAW io-uring (1024 SQ entries, ~100 KiB memlock; creation
+failure degrades to parking-off with a warning) — plus a boxed ResumeState remain.
+MEASURED: 0.68 KiB/conn live heap parked vs 3.8 on v1.10 (alloc_probe 2000 conns);
+live-idle rose to ~5.0 (park-capable driver holds ctx across await) — with
+parking disabled the v1.x path is used verbatim (zero regression). Battery 12/12
+(4 new park scenarios), 111 unit + 22 integration tests.
+
+Key design decisions (details in the code docs):
+- Broker model: parked == suspended session (mailbox None, snapshot stored incl.
+  next_pkid, expires_at None) + `parked`/`wake_pending` flags → mesh
+  Claim/extract, persistence-skip need no special cases. deliver_to parked arm
+  queues ALL QoS (client is connected!) + sends ONE deduped UnparkCmd::Wake.
+  Shared-sub online filter counts parked (else cross-shard pick desyncs).
+  persist_one skips parked; shutdown converts parked→suspended pre-snapshot.
+- Connection: run()/event_loop return Flow{Closed,Park}; park predicate =
+  connected && all QoS/buffers empty && no partial frame; park deadline
+  (last_activity + grace) folded into the block race as a third deadline; the
+  race resolving as Timeout PROVES nothing arrived (single-threaded shard) —
+  transition is fully synchronous (complete_park is a plain fn: structural
+  no-await invariant). into_parts()/resume() carry aliases BOTH directions,
+  will+delay, peer limits, rate limiter; next_pkid travels via the session
+  snapshot so migration keeps it.
+- fd extraction: glommio TcpStream has NO IntoRawFd and mem::forget would leak
+  its reactor Source → F_DUPFD_CLOEXEC then drop (dup shares the open file
+  description). Resume via TcpStream::from_raw_fd.
+- Ring task (parking.rs): glommio can't await a foreign eventfd (yolo_recv is
+  recv(2), ENOTSOCK) → adaptive tick: 25ms empty / 1ms busy / 10ms quiet; CQE
+  reap is a shared-memory read (zero syscalls when empty); egress Wakes race the
+  tick so they're immediate. user_data = slab idx<<32 | generation tag (stale
+  CQEs filtered); PollRemove on non-CQE removals. Runs on the DEFAULT queue
+  (maintenance queue would starve parked ingress under overload). Parked
+  keepalive: deadline frozen at park; 1s sweep closes + fires Will + suspends.
+- ConnSlot moves INTO ParkedConn (parked conns still occupy limits + gate the
+  shutdown drain); every registry-removal path pairs client_disconnected();
+  park/unpark pair the new clients_parked gauge ($SYS/broker/parked-connections).
+- Memory discipline: Connection built on the plain frame of boxed_run_tcp and
+  moved as an ARG into drive_tcp (one slot, not two); complete_park is sync (its
+  locals never enter the future); resume prelude boxed via plain-fn seam;
+  can't-park fallback SPAWNS a fresh task instead of returning a Connection
+  through the frame. Watch alloc_probe's 3072-class when touching drive_tcp.
+
+GOTCHA (cost a debugging round): the parking task originally blocked purely on
+wake_rx.recv() while the registry was empty — but connections park themselves in
+WITHOUT signalling it (LocalSender isn't Clone, drive_tcp has no handle), so
+after the FIRST park nothing reaped CQEs / swept deadlines; ingress + keepalive
+tests failed while egress tests passed (their Wake unblocked the task as a side
+effect). Fix: TICK_EMPTY=25ms heartbeat even when empty.
+
+GOTCHA: park-herd once showed 497/498 right after the classic battery (20k-conn
+churn); unreproducible in 6 clean runs with logs accounting 500=parked=resumed.
+Loopback TIME_WAIT/port pressure, not broker state — but keep park-herd in the
+battery, it's the regression net for exactly this class of bug.

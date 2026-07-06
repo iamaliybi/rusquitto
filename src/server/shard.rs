@@ -20,6 +20,7 @@
 
 mod accept;
 mod maintenance;
+mod parking;
 mod serve;
 
 use std::cell::RefCell;
@@ -41,6 +42,10 @@ use crate::server::overload::LoadMonitor;
 use crate::telemetry::metrics::Metrics;
 
 use accept::{ConnCounts, Listeners};
+
+/// A shard-local handle to the broker state, as shared between the shard's
+/// tasks (each clones it, so a `borrow_mut` is only ever held transiently).
+type Shard = Rc<RefCell<ShardState>>;
 
 /// How often each shard reclaims suspended sessions past their expiry deadline.
 const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
@@ -117,6 +122,12 @@ struct ConnCtx {
 	/// Whether to map a verified client certificate's CN onto the MQTT username
 	/// (`[tls] cert_cn_as_username`), decided once at startup.
 	map_cert_cn: bool,
+	/// The shard's parked-connection registry, `None` when `[parking]` is
+	/// disabled (or its ring could not be created). Plain-TCP connections park
+	/// into it when fully idle past `park_grace`.
+	parking: Option<Rc<RefCell<parking::Parking>>>,
+	/// `[parking] idle_grace_secs`, resolved once.
+	park_grace: Duration,
 }
 
 /// Runs one shard to completion: the body of every `LocalExecutor` in the pool.
@@ -221,6 +232,27 @@ pub async fn run_shard(
 		}
 	}
 
+	// The parked-connection registry (`[parking]`): one small raw io_uring per
+	// shard holding the fds of fully-idle plain-TCP connections whose tasks have
+	// been torn down. A ring-creation failure (e.g. a tight RLIMIT_MEMLOCK)
+	// degrades gracefully: parking is disabled for the shard and connections
+	// simply keep their tasks.
+	let park = if config.parking.enabled {
+		match parking::Parking::new() {
+			Ok(p) => Some(Rc::new(RefCell::new(p))),
+			Err(e) => {
+				tracing::warn!(
+					shard = shard_id,
+					error = %e,
+					"could not create the parking ring (RLIMIT_MEMLOCK?); parking disabled on this shard"
+				);
+				None
+			}
+		}
+	} else {
+		None
+	};
+
 	let ctx = ConnCtx {
 		shard_id,
 		shard: state.clone(),
@@ -229,7 +261,15 @@ pub async fn run_shard(
 		metrics: metrics.clone(),
 		shutdown: shutdown.clone(),
 		map_cert_cn: config.tls.cert_cn_as_username,
+		parking: park.clone(),
+		park_grace: Duration::from_secs(config.parking.idle_grace_secs),
 	};
+	if park.is_some() {
+		// Inject the broker→parking command channel and start the parking task.
+		let (unpark_tx, unpark_rx) = glommio::channels::local_channel::new_unbounded();
+		state.borrow_mut().set_unpark_tx(unpark_tx);
+		parking::spawn_parking(ctx.clone(), state.clone(), unpark_rx);
+	}
 	let counts = Rc::new(ConnCounts::default());
 
 	// The accept loop runs until the shutdown flag is set.
@@ -243,6 +283,38 @@ pub async fn run_shard(
 		"shutdown signal received, draining connections"
 	);
 	state.borrow_mut().shutdown_connections();
+
+	// Parked connections have no task to wake: drain the registry directly —
+	// best-effort DISCONNECT (0x8B Server shutting down), close the fd, and
+	// convert each parked session to properly *suspended* so the final snapshot
+	// below captures it (a parked session is skipped by persistence). Wills are
+	// suppressed, matching a live connection's shutdown path.
+	if let Some(park) = &park {
+		let drained = park.borrow_mut().drain_all();
+		if !drained.is_empty() {
+			tracing::info!(
+				shard = shard_id,
+				parked = drained.len(),
+				"draining parked connections"
+			);
+		}
+		for parked in drained {
+			// Wire bytes of a minimal DISCONNECT with reason 0x8B. The socket is
+			// idle (it was parked), so this lands in the send buffer or not at all.
+			let frame: [u8; 3] = [0xE0, 0x01, 0x8B];
+			// SAFETY: `fd` is an open socket owned by the drained entry.
+			unsafe { libc::write(parked.fd, frame.as_ptr().cast(), frame.len()) };
+			let client_id = parked.resume.client_id().to_string();
+			let generation = parked.resume.generation();
+			let expiry = parked.resume.session_expiry();
+			state
+				.borrow_mut()
+				.suspend_parked(&client_id, generation, expiry);
+			metrics.client_unparked();
+			metrics.client_disconnected();
+			parked.close();
+		}
+	}
 
 	let deadline = Instant::now() + SHUTDOWN_GRACE;
 	while counts.live() > 0 && Instant::now() < deadline {
