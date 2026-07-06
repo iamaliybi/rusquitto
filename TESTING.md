@@ -114,6 +114,11 @@ python3 stress/attack.py --port 1883 all
 python3 stress/attack.py --port 1883 park-all --park-grace 1      # needs the short-grace config
 ```
 
+**Benchmark configs must pin `[logging] level = "error"`.** The default filter
+enables per-connection debug events, and any accidentally-per-message event
+under it taxes the hot path heavily (a per-PUBLISH `debug!` once cost a
+measured ~38 µs/msg and skewed a whole benchmark round — see CHANGELOG 2.0.0).
+
 ### D. Crash recovery (WAL)
 
 Proves the session write-ahead log closes the crash window: create a durable
@@ -149,6 +154,9 @@ optimization.
 - **`park_probe`** — the parked-connection feasibility spike that motivated the
   production feature: the memory floor of an idle fd on a shared `io_uring`
   readiness ring (~0.08 KiB/conn, fd + minimal struct only).
+- **`wake_probe`** — a bare glommio echo loop measuring the runtime's per-wake
+  floor (park/unpark + task wake, no MQTT): the baseline that separates
+  runtime cost from connection-engine cost in any latency investigation.
 - **`stresser`** (`stress/stresser.rs`) — the throughput hammer.
 - Ad-hoc latency: a synchronous PUBLISH→PUBACK round-trip probe (single-shard p50
   ~55 µs).

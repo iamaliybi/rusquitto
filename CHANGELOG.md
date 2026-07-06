@@ -77,6 +77,33 @@ breaks: every v1.x config file loads unchanged.
   connections contribute ~zero CPU, so closing them would only disconnect the
   best-behaved clients and add reconnect load.
 
+### Fixed
+
+- **The per-PUBLISH `debug!` event cost ~38 µs/msg under the default log filter**
+  (`info,rusquitto=debug`): the event was formatted and dispatched on the shard
+  thread for every message, more than doubling per-message CPU (64.5 → 26.5
+  µs/msg) and inflating every published benchmark — the audit's "QoS 1 far
+  behind Mosquitto" reading was primarily this tax (plus a saturating-vs-
+  ping-pong harness mismatch in the comparison). Demoted to `trace!` — wire-level
+  per-message detail is what the trace level is for; the default filter now
+  costs nothing measurable per message (all remaining `debug!` sites are
+  per-connection lifecycle). Measured after the fix, same box, identical
+  harnesses, Mosquitto 2.0.18 with `set_tcp_nodelay true`:
+  - 200-connection publisher→ack: QoS 0 **328k vs 149k** msg/s (2.2×), QoS 1
+    **36.1k vs 32.7k** (+11%), QoS 2 **21.6k vs 17.4k** (+24%) — rusquitto
+    leads every tier.
+  - Saturating QoS 1 (Rust hammer): 1 shard 77.6k vs 87.1k (−11%, the
+    runtime's per-wake floor — see below); **3 shards 328.9k, 3.8× Mosquitto's
+    single-threaded ceiling**.
+  - publish→deliver p50: 43.4 µs same-core (was 60), 60.9 µs cross-shard
+    (was 93); 1-connection PUBLISH→PUBACK RTT p50 37.5 µs (was 51.1).
+- Added **`examples/wake_probe.rs`** — a bare glommio echo loop measuring the
+  runtime's per-wake floor (~30 µs RTT / 21.5 µs CPU on this box), which
+  attributes the remaining single-message gap vs epoll-based brokers to the
+  runtime rather than the MQTT layer (which adds only ~5 µs CPU over the
+  floor). The residual is tracked with candidate fixes in
+  `.agents/next-steps.md` §1.
+
 ### Notes on the ~0.7 KiB parked floor
 
 `ParkedConn` + boxed `ResumeState` (~0.2 KiB) + the suspended-style session
