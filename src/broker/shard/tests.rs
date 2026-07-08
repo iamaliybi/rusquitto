@@ -426,6 +426,31 @@ fn persist_then_load_restores_a_full_suspended_session() {
 }
 
 #[test]
+fn gc_indexes_reclaims_stale_shared_cursor() {
+	let mut s = ShardState::default();
+	arm(&mut s, "c1");
+	s.subscribe(
+		"t",
+		"c1",
+		opts(QoS::AtLeastOnce, false, false, Some("g"), None),
+	);
+	// Routing to the purely-local group populates its round-robin cursor.
+	s.deliver_local(pubm("t", QoS::AtLeastOnce, b"x", false), None);
+	assert!(
+		s.shared_cursor.contains_key("g"),
+		"cursor created for the group"
+	);
+
+	// The member unsubscribes; the group is now dead, but the cursor lingers until GC.
+	s.unsubscribe("t", "c1", Some("g"));
+	s.gc_indexes();
+	assert!(
+		!s.shared_cursor.contains_key("g"),
+		"gc reclaims the cursor once no local member holds the group"
+	);
+}
+
+#[test]
 fn shared_events_maintain_the_remote_view() {
 	use crate::broker::messages::SharedEvent;
 	let mut s = ShardState::default();

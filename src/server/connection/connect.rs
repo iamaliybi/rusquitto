@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 use super::{Connection, MAX_CLIENT_ID_LEN, SESSION_CLAIM_TIMEOUT};
 use crate::auth::AuthResult;
 use crate::broker::messages::MigratedSession;
+use crate::protocol::valid_publish_topic;
 use crate::telemetry::logging::redact;
 use crate::transport::ByteStream;
 use crate::transport::tls::TlsIdentity;
@@ -156,15 +157,23 @@ impl<S: ByteStream> Connection<S> {
 			self.username = login.map(|l| l.username.clone());
 		}
 
-		// Drop a Will Message whose topic the client isn't authorized to publish.
-		let will_authorized = match &self.will {
-			Some(will) => self
-				.auth
-				.authorize_publish(self.username.as_deref(), &will.topic),
+		// Drop a Will Message whose topic is invalid or unauthorized. The will is
+		// published later (on abnormal disconnect) and bypasses the inbound-PUBLISH
+		// path, so it must be held to the *same* topic rules here — otherwise a
+		// client could set a will on a wildcard, a NUL-bearing topic, or the
+		// broker-reserved `$SYS/...` namespace (retained, poisoning `$SYS/#`
+		// subscribers) that a live publish is forbidden from touching.
+		let will_ok = match &self.will {
+			Some(will) => {
+				valid_publish_topic(&will.topic)
+					&& self
+						.auth
+						.authorize_publish(self.username.as_deref(), &will.topic)
+			}
 			None => true,
 		};
-		if !will_authorized {
-			debug!("will topic not authorized, dropping will");
+		if !will_ok {
+			debug!("will topic invalid or not authorized, dropping will");
 			self.will = None;
 		}
 

@@ -51,6 +51,43 @@ pub struct SubOptions<'a> {
 	pub sub_id: Option<usize>,
 }
 
+/// Tests whether a topic *filter* `req` is **subsumed** by an allow-list `rule`
+/// filter — i.e. every concrete topic that `req` could match is also matched by
+/// `rule`. Used to authorize a SUBSCRIBE against an ACL, where both sides are
+/// filters (may contain `+`/`#`).
+///
+/// This is stricter than [`filter_matches`], which treats its second argument as
+/// a *concrete* topic and so wrongly accepts a broader request: e.g.
+/// `filter_matches("home/+", "home/#")` is `true` (it reads `#` as a literal
+/// level), which would let a client granted `home/+` escalate to the whole
+/// `home/#` subtree. `filter_subsumes("home/+", "home/#")` is correctly `false`.
+pub fn filter_subsumes(rule: &str, req: &str) -> bool {
+	let mut r = rule.split('/');
+	let mut q = req.split('/');
+	loop {
+		match (r.next(), q.next()) {
+			// A `#` in the rule covers this level and everything below it.
+			(Some("#"), _) => return true,
+			// A `+` in the rule matches exactly one level; a `#` in the request
+			// spans many, so it is broader and not subsumed.
+			(Some("+"), Some("#")) => return false,
+			// A `+` in the rule covers the request's single level (a literal or `+`).
+			(Some("+"), Some(_)) => continue,
+			// The rule still needs a level but the request ended.
+			(Some("+"), None) => return false,
+			// Literal rule segment: the request must match it exactly (a `+`/`#`
+			// request at this position is broader and falls through to `false`).
+			(Some(rs), Some(qs)) if rs == qs => continue,
+			(Some(_), Some(_)) => return false,
+			// Both exhausted in lockstep: subsumed.
+			(None, None) => return true,
+			// One side has segments the other doesn't (and the rule didn't end in
+			// `#`): not subsumed.
+			(None, Some(_)) | (Some(_), None) => return false,
+		}
+	}
+}
+
 /// Tests whether a subscription `filter` (possibly containing `+`/`#`) matches a
 /// concrete `topic`. Used to find retained messages for a new subscription — the
 /// reverse direction of [`TopicTrie::matching`].
@@ -81,6 +118,15 @@ struct Node {
 	children: HashMap<Rc<str>, Node>,
 	/// Subscribers whose filter terminates at this node.
 	subscribers: Vec<Subscription>,
+}
+
+impl Node {
+	/// A node with no subscribers and no children is dead weight — its parent
+	/// prunes it so the trie shrinks back to the live subscription set rather
+	/// than growing monotonically with every distinct filter ever seen.
+	fn is_dead(&self) -> bool {
+		self.subscribers.is_empty() && self.children.is_empty()
+	}
 }
 
 /// A topic trie for MQTT subscription matching.
@@ -127,31 +173,44 @@ impl TopicTrie {
 
 	/// Removes a single subscription (used by UNSUBSCRIBE). `share_group` selects
 	/// the ordinary (`None`) or shared entry to remove. Returns whether an entry was
-	/// actually removed.
+	/// actually removed. Empty nodes left along the filter path are pruned.
 	pub fn remove(&mut self, filter: &str, client_id: &str, share_group: Option<&str>) -> bool {
-		let mut node = &mut self.root;
-		for seg in filter.split('/') {
-			match node.children.get_mut(seg) {
-				Some(child) => node = child,
-				None => return false,
-			}
-		}
-		let before = node.subscribers.len();
-		node.subscribers
-			.retain(|s| !(s.client_id == client_id && s.share_group.as_deref() == share_group));
-		node.subscribers.len() != before
+		let segments: Vec<&str> = filter.split('/').collect();
+		Self::remove_rec(&mut self.root, &segments, 0, client_id, share_group)
 	}
 
-	/// Removes every subscription belonging to a client (used on disconnect).
+	/// Descends `segments`, removes the matching subscriber at the leaf, and prunes
+	/// any node that became dead on the way back up. Returns whether a subscriber
+	/// was removed.
+	fn remove_rec(node: &mut Node, segments: &[&str], idx: usize, client_id: &str, share_group: Option<&str>) -> bool {
+		if idx == segments.len() {
+			let before = node.subscribers.len();
+			node.subscribers
+				.retain(|s| !(s.client_id == client_id && s.share_group.as_deref() == share_group));
+			return node.subscribers.len() != before;
+		}
+		let Some(child) = node.children.get_mut(segments[idx]) else {
+			return false;
+		};
+		let removed = Self::remove_rec(child, segments, idx + 1, client_id, share_group);
+		if child.is_dead() {
+			node.children.remove(segments[idx]);
+		}
+		removed
+	}
+
+	/// Removes every subscription belonging to a client (used on disconnect),
+	/// pruning any nodes that become empty.
 	pub fn remove_client(&mut self, client_id: &str) {
 		Self::remove_client_rec(&mut self.root, client_id);
 	}
 
 	fn remove_client_rec(node: &mut Node, client_id: &str) {
 		node.subscribers.retain(|s| s.client_id != client_id);
-		for child in node.children.values_mut() {
+		node.children.retain(|_, child| {
 			Self::remove_client_rec(child, client_id);
-		}
+			!child.is_dead()
+		});
 	}
 
 	/// Removes every subscription belonging to a client and returns them as
@@ -210,11 +269,58 @@ impl TopicTrie {
 				true
 			}
 		});
-		for (seg, child) in node.children.iter_mut() {
+		node.children.retain(|seg, child| {
 			segments.push(seg.to_string());
 			Self::take_client_rec(child, client_id, segments, out);
 			segments.pop();
+			!child.is_dead()
+		});
+	}
+
+	/// Reclaims interned segments no longer referenced by any trie node. Called
+	/// periodically (the trie prunes dead *nodes* inline on removal, but the
+	/// interner keeps its own `Rc` to every segment it ever handed out, so the
+	/// segment strings need a sweep to shrink back to the live set). Cheap and
+	/// safe: a segment held only by the interner has a strong count of 1.
+	pub fn gc_interner(&mut self) {
+		self.interner.retain_live();
+	}
+
+	/// Collects the distinct shared-subscription group names currently live in the
+	/// trie into `out`. Used by the periodic GC to reclaim stale round-robin
+	/// cursors for groups whose last local member has unsubscribed.
+	pub fn collect_shared_groups(&self, out: &mut std::collections::HashSet<String>) {
+		Self::collect_groups_rec(&self.root, out);
+	}
+
+	fn collect_groups_rec(node: &Node, out: &mut std::collections::HashSet<String>) {
+		for s in &node.subscribers {
+			// Only allocate the String key on first sight of a group.
+			if let Some(group) = &s.share_group
+				&& !out.contains(group.as_str())
+			{
+				out.insert(group.clone());
+			}
 		}
+		for child in node.children.values() {
+			Self::collect_groups_rec(child, out);
+		}
+	}
+
+	/// Total number of nodes in the trie (root excluded), for tests that assert
+	/// dead branches are pruned rather than accumulating.
+	#[cfg(test)]
+	fn node_count(&self) -> usize {
+		fn count(node: &Node) -> usize {
+			node.children.values().map(|c| 1 + count(c)).sum()
+		}
+		count(&self.root)
+	}
+
+	/// Distinct interned segments, for tests asserting the interner is reclaimed.
+	#[cfg(test)]
+	fn interned_count(&self) -> usize {
+		self.interner.distinct()
 	}
 
 	/// Collects every subscription whose filter matches the concrete `topic`.
@@ -347,6 +453,77 @@ mod tests {
 		trie.insert("t", "c1", opts(QoS::AtLeastOnce, false, false, None, None));
 		let got = matches(&trie, "t");
 		assert_eq!(got, vec![("c1".to_string(), false, false)]);
+	}
+
+	#[test]
+	fn filter_subsumes_rejects_wildcard_escalation() {
+		// The escalation the ACL fix closes: a rule of `home/+` must NOT subsume a
+		// request for the broader `home/#`.
+		assert!(!filter_subsumes("home/+", "home/#"));
+		assert!(!filter_subsumes("+", "#"));
+		assert!(!filter_subsumes("a/+/c", "a/#"));
+		// Legitimate subsets ARE subsumed.
+		assert!(filter_subsumes("home/#", "home/+/temp")); // # covers everything below
+		assert!(filter_subsumes("home/#", "home")); // # matches the parent level too
+		assert!(filter_subsumes("home/+", "home/kitchen")); // + covers one literal level
+		assert!(filter_subsumes("home/+", "home/+")); // identical
+		assert!(filter_subsumes("a/b/c", "a/b/c")); // literal identity
+		// Non-subsets are rejected.
+		assert!(!filter_subsumes("home/+", "home/a/b")); // deeper than one level
+		assert!(!filter_subsumes("home/+", "office/+")); // different literal
+		assert!(!filter_subsumes("a/b", "a/+")); // + is broader than literal b
+		assert!(!filter_subsumes("home/+", "home")); // + requires a level; home is shorter
+	}
+
+	#[test]
+	fn empty_nodes_are_pruned_on_removal() {
+		let mut trie = TopicTrie::default();
+		// A deep, unique filter creates a chain of nodes.
+		trie.insert(
+			"client/uuid-abc/deep/path/#",
+			"c1",
+			opts(QoS::AtMostOnce, false, false, None, None),
+		);
+		assert!(trie.node_count() > 0);
+		// Removing the only subscriber must reclaim the whole dead branch.
+		trie.remove("client/uuid-abc/deep/path/#", "c1", None);
+		assert_eq!(trie.node_count(), 0, "dead branch fully pruned on remove");
+
+		// Same via remove_client (disconnect path), with a sibling that must survive.
+		trie.insert(
+			"a/b/c",
+			"c1",
+			opts(QoS::AtMostOnce, false, false, None, None),
+		);
+		trie.insert(
+			"a/b/d",
+			"c2",
+			opts(QoS::AtMostOnce, false, false, None, None),
+		);
+		trie.remove_client("c1");
+		// a→b→d survives (c2), a→b→c is gone: nodes a,b,d = 3.
+		assert_eq!(
+			trie.node_count(),
+			3,
+			"only c1's dead leaf pruned, c2 intact"
+		);
+		let mut m = Vec::new();
+		trie.matching("a/b/d", &mut m);
+		assert_eq!(m.len(), 1);
+	}
+
+	#[test]
+	fn interner_reclaims_dead_segments_on_gc() {
+		let mut trie = TopicTrie::default();
+		trie.insert(
+			"unique-x/unique-y",
+			"c1",
+			opts(QoS::AtMostOnce, false, false, None, None),
+		);
+		assert_eq!(trie.interned_count(), 2);
+		trie.remove_client("c1"); // prunes the nodes, dropping their Rc<str> keys
+		trie.gc_interner();
+		assert_eq!(trie.interned_count(), 0, "unreferenced segments reclaimed");
 	}
 
 	#[test]

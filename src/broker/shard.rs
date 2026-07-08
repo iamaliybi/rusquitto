@@ -392,6 +392,21 @@ impl ShardState {
 		is_new
 	}
 
+	/// Periodic garbage collection of shard-local index memory that the hot paths
+	/// deliberately don't reclaim inline: interned topic segments no longer used by
+	/// any trie node, and round-robin cursors for shared groups whose last local
+	/// member has unsubscribed. Both grow only under topic/group *churn* and are
+	/// bounded to the live set by this sweep. Off the message path — called from the
+	/// per-shard maintenance timer.
+	pub fn gc_indexes(&mut self) {
+		self.trie.gc_interner();
+		if !self.shared_cursor.is_empty() {
+			let mut live = std::collections::HashSet::new();
+			self.trie.collect_shared_groups(&mut live);
+			self.shared_cursor.retain(|group, _| live.contains(group));
+		}
+	}
+
 	/// Removes a single subscription (used by UNSUBSCRIBE). `share_group` selects
 	/// the ordinary (`None`) or shared entry. Returns whether one was removed.
 	pub fn unsubscribe(&mut self, filter: &str, client_id: &str, share_group: Option<&str>) -> bool {

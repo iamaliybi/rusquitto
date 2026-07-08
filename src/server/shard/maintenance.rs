@@ -245,10 +245,16 @@ fn spawn_session_sweep(state: &Shard, tq: TaskQueueHandle, mesh_peer_id: usize) 
 					shard_state.deliver_local(will, None);
 				}
 				sweeps = sweeps.wrapping_add(1);
-				if mesh_peer_id == 0 && sweeps.is_multiple_of(MALLOC_TRIM_EVERY) {
-					// SAFETY: glibc `malloc_trim` is thread-safe and touches no
-					// Rust-visible state; it only releases free arena memory.
-					unsafe { libc::malloc_trim(0) };
+				if sweeps.is_multiple_of(MALLOC_TRIM_EVERY) {
+					// Reclaim shard-local index memory the hot paths leave behind
+					// under topic/group churn (dead interned segments, stale
+					// shared-group cursors). Per-shard, so every shard runs it.
+					state.borrow_mut().gc_indexes();
+					if mesh_peer_id == 0 {
+						// SAFETY: glibc `malloc_trim` is thread-safe and touches no
+						// Rust-visible state; it only releases free arena memory.
+						unsafe { libc::malloc_trim(0) };
+					}
 				}
 			}
 		},
