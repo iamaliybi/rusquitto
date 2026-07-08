@@ -5,6 +5,55 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): from 1.0 on, the major
 version bumps for breaking changes, the minor for features, and the patch for fixes.
 
+## [2.1.2] - 2026-07-08
+
+Security &amp; memory hardening from a comprehensive optimization/security audit. Two
+genuine authorization vulnerabilities fixed, two unbounded-growth vectors bounded.
+No wire or config compatibility change.
+
+### Security
+
+- **Will-topic validation (fixes a `$SYS`/wildcard/NUL bypass).** The Will Message
+  topic was checked against ACLs but never against `valid_publish_topic`, unlike
+  every live PUBLISH. A client could set a *retained* will on the broker-reserved
+  `$SYS/...` namespace (or a wildcard / NUL-bearing topic), then disconnect
+  abnormally, and the broker would publish and retain the forged message —
+  poisoning `$SYS/#` telemetry for every current and future subscriber. The will is
+  now validated exactly like a live publish at CONNECT and dropped if invalid.
+- **Subscribe-ACL wildcard-subsumption (fixes a privilege escalation).** SUBSCRIBE
+  authorization compared the requested *filter* with `filter_matches`, which treats
+  its argument as a *concrete topic* — so a client granted `home/+` could subscribe
+  to `home/#` and receive the entire subtree (the request's `#` was read as a
+  literal level). A new `filter_subsumes` performs a correct filter-subset test:
+  a request is allowed only if every topic it could match is also covered by an
+  allow rule. Publish ACLs (concrete topics) are unchanged.
+
+### Fixed (memory)
+
+- **Topic trie now prunes dead nodes; interned segments are reclaimed.** UNSUBSCRIBE
+  / disconnect emptied a node's subscriber list but never removed the now-empty
+  trie nodes, so the trie grew monotonically with every *distinct filter ever seen*
+  (common when filters embed per-client/correlation ids) and the segment interner
+  held each segment forever. Removal now prunes empty nodes on the way back up, and
+  a periodic per-shard sweep reclaims interned segments no longer referenced by any
+  node — bounding both to the live subscription set under churn.
+- **Stale shared-subscription round-robin cursors are reclaimed.** `shared_cursor`
+  gained a `String` key per shared group ever routed to and never released it; the
+  same periodic sweep now drops cursors for groups with no live local member.
+
+### Notes
+
+- The audit confirmed the message hot path is already well-optimized (Rc fan-out,
+  in-place PUBLISH normalization, single-shard mesh skip, interner off the publish
+  path, coalesced writes). The one remaining allocation — a per-subscriber
+  `client_id` clone in `route()` — is documented in `.agents/next-steps.md` §0 but
+  deliberately left unchanged: eliminating it needs a borrow-restructure of the core
+  delivery path that isn't worth the regression risk without a wide-fan-out
+  benchmark to prove the win.
+- Tests: +7 (120 unit + 23 integration). New coverage for filter subsumption, trie
+  node pruning, interner reclamation, shared-cursor GC, and the will-topic drop
+  end-to-end. Adversarial battery still 12/12; clippy -D clean.
+
 ## [2.1.1] - 2026-07-08
 
 Hardening: property-based fuzzing of the MQTT parser and packet handlers, wired

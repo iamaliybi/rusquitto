@@ -7,9 +7,11 @@
 //! identical segments across the whole tree share one allocation.
 //!
 //! It is shard-local (`Rc`, never crosses a core), so no synchronisation is
-//! needed. Segments are never removed individually — the working set of topic
-//! names in a broker is effectively bounded — but dropping the trie drops the
-//! interner and reclaims everything.
+//! needed. Individual segments are not removed on unsubscribe (that hot path
+//! stays allocation-free), but a periodic [`retain_live`](SegmentInterner::retain_live)
+//! sweep reclaims any segment no longer referenced by a trie node, so a broker
+//! whose topic namespace churns (e.g. per-client-id filters) does not grow the
+//! interner without bound. Dropping the trie drops the interner entirely.
 
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -29,6 +31,15 @@ impl SegmentInterner {
 		let handle: Rc<str> = Rc::from(segment);
 		self.seen.insert(handle.clone());
 		handle
+	}
+
+	/// Evicts every segment the interner is the *sole* owner of — i.e. no trie
+	/// node keys on it any more. A live segment is referenced by at least one
+	/// `HashMap<Rc<str>, Node>` key in the trie *and* the interner's own set, so
+	/// its strong count is ≥ 2; a dead one dropped by node pruning is back to 1.
+	/// O(distinct segments); call periodically, not per-unsubscribe.
+	pub fn retain_live(&mut self) {
+		self.seen.retain(|handle| Rc::strong_count(handle) > 1);
 	}
 
 	/// Number of distinct interned segments (for diagnostics/tests).

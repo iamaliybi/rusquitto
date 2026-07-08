@@ -8,6 +8,38 @@ Each item carries three badges — **priority** (value/severity), **risk**
 
 ---
 
+## 0. Optimization backlog — `route()` per-subscriber allocation (documented, not scheduled)
+
+![priority](https://img.shields.io/badge/priority-low-lightgrey)
+![risk](https://img.shields.io/badge/risk-medium-yellow)
+![status](https://img.shields.io/badge/status-documented-blue)
+
+The v2.1.2 audit's performance pass found the hot path already tight (Rc fan-out,
+in-place PUBLISH normalization, single-shard mesh skip, interner off the publish
+path, coalesced writes, boxed cold handlers — all optimal). The one remaining win:
+`broker/shard/routing.rs::route` clones each matching subscriber's `client_id`
+into the per-publish `best`/`groups` maps (`sub.client_id.clone()`), a short-string
+heap allocation **per subscriber per message** that scales with fan-out width.
+
+- [ ] The clone exists only to end the `self.trie` borrow before touching
+      `self.sessions`. Removing it needs a **disjoint-field-borrow restructure** of
+      `route` + `deliver_to` (destructure `self` into `{trie, sessions, shared_cursor,
+      shared_remote, unpark_tx, wal}`, key `best` by `&str` borrowed from the trie,
+      and make `deliver_to` a free fn over those fields). Also reuse `best` as a
+      scratch field to drop its per-publish `HashMap` allocation.
+- **Deliberately not done in v2.1.2**: this is the core delivery path (QoS downgrade,
+  No-Local, sub_id union, the deterministic shared-sub global pick, offline queue,
+  parking wake, WAL). Restructuring its borrow topology to save a short-string alloc
+  is not worth the regression risk **without a wide-fan-out benchmark proving the
+  win** — the throughput harness publishes to no-subscriber topics, so it doesn't
+  exercise this. Gate on such a benchmark + the routing unit tests + integration
+  QoS/shared-sub suite before attempting. (Higher-risk sibling: `send_publish`
+  clones the whole `Publish` per delivery — a `write_publish` helper encoding from
+  the borrowed `Rc` would cut the QoS-0 topic alloc but duplicates wire-encoding;
+  only with the same benchmark gate.)
+
+---
+
 ## 1. Mosquitto-parity program — the flagship remaining item: dispatcher mode
 
 ![priority](https://img.shields.io/badge/priority-high-red)

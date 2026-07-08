@@ -11,7 +11,7 @@ use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHashString, PasswordVerifier};
 use sha2::{Digest, Sha256};
 
-use crate::broker::topics::filter_matches;
+use crate::broker::topics::{filter_matches, filter_subsumes};
 use crate::config::AuthConfig;
 
 /// A configured user's credential: a plaintext password, a SHA-256 hash
@@ -86,12 +86,26 @@ struct UserEntry {
 	subscribe_acl: Option<Vec<String>>,
 }
 
-/// Returns whether `topic` is permitted by an optional allow-list: `None` is
-/// unrestricted, otherwise the topic must match at least one filter rule.
-fn acl_allows(acl: &Option<Vec<String>>, topic: &str) -> bool {
+/// Returns whether a *concrete publish topic* is permitted by an optional
+/// allow-list: `None` is unrestricted, otherwise the topic must match at least
+/// one filter rule. The topic is concrete (validated no-wildcard), so ordinary
+/// filter matching is correct here.
+fn acl_allows_publish(acl: &Option<Vec<String>>, topic: &str) -> bool {
 	match acl {
 		None => true,
 		Some(rules) => rules.iter().any(|rule| filter_matches(rule, topic)),
+	}
+}
+
+/// Returns whether a requested *subscription filter* is permitted by an optional
+/// allow-list. The request is itself a filter (may contain `+`/`#`), so it must
+/// be **subsumed** by an allow rule — not merely "matched". Using plain filter
+/// matching here would let a client granted `home/+` escalate to `home/#` (the
+/// whole subtree), because matching reads the request's `#` as a literal level.
+fn acl_allows_subscribe(acl: &Option<Vec<String>>, filter: &str) -> bool {
+	match acl {
+		None => true,
+		Some(rules) => rules.iter().any(|rule| filter_subsumes(rule, filter)),
 	}
 }
 
@@ -199,8 +213,8 @@ impl Authenticator {
 	/// against the `[auth]` `anonymous_publish` allow-list (absent = unrestricted).
 	pub fn authorize_publish(&self, username: Option<&str>, topic: &str) -> bool {
 		match username.and_then(|u| self.users.get(u)) {
-			Some(entry) => acl_allows(&entry.publish_acl, topic),
-			None => acl_allows(&self.anonymous_publish_acl, topic),
+			Some(entry) => acl_allows_publish(&entry.publish_acl, topic),
+			None => acl_allows_publish(&self.anonymous_publish_acl, topic),
 		}
 	}
 
@@ -209,8 +223,8 @@ impl Authenticator {
 	/// `[auth]` `anonymous_subscribe` allow-list (absent = unrestricted).
 	pub fn authorize_subscribe(&self, username: Option<&str>, filter: &str) -> bool {
 		match username.and_then(|u| self.users.get(u)) {
-			Some(entry) => acl_allows(&entry.subscribe_acl, filter),
-			None => acl_allows(&self.anonymous_subscribe_acl, filter),
+			Some(entry) => acl_allows_subscribe(&entry.subscribe_acl, filter),
+			None => acl_allows_subscribe(&self.anonymous_subscribe_acl, filter),
 		}
 	}
 }
@@ -308,6 +322,34 @@ mod tests {
 		let auth = Authenticator::from_config(&acl_cfg(None, Some(&["sensors/#"])));
 		assert!(auth.authorize_subscribe(Some("u"), "sensors/+/temp"));
 		assert!(!auth.authorize_subscribe(Some("u"), "commands/#"));
+	}
+
+	#[test]
+	fn subscribe_acl_blocks_wildcard_escalation() {
+		// A user granted the single-level `home/+` must NOT be able to widen it to
+		// the whole `home/#` subtree — the ACL-subsumption fix. (Plain filter
+		// matching would wrongly allow this.)
+		let auth = Authenticator::from_config(&acl_cfg(None, Some(&["home/+"])));
+		assert!(
+			auth.authorize_subscribe(Some("u"), "home/kitchen"),
+			"the granted level is allowed"
+		);
+		assert!(
+			!auth.authorize_subscribe(Some("u"), "home/#"),
+			"escalation to # is blocked"
+		);
+		assert!(
+			!auth.authorize_subscribe(Some("u"), "home/kitchen/camera"),
+			"deeper is blocked"
+		);
+		// The same escalation via the anonymous allow-list.
+		let anon = Authenticator::from_config(&AuthConfig {
+			allow_anonymous: true,
+			users: Vec::new(),
+			anonymous_publish: None,
+			anonymous_subscribe: Some(vec!["home/+".into()]),
+		});
+		assert!(!anon.authorize_subscribe(None, "home/#"));
 	}
 
 	#[test]

@@ -462,6 +462,67 @@ fn will_message_fires_on_abrupt_disconnect() {
 	assert_eq!(payload(&got), b"rip");
 }
 
+#[test]
+fn will_on_reserved_or_wildcard_topic_is_dropped() {
+	let port = default_broker();
+	// Watch the exact reserved topic a malicious will would try to forge (a
+	// literal $SYS/... subscription; wildcards don't match $-topics).
+	let mut watcher = Client::connect(port, "it-will-sys-watch");
+	watcher.subscribe("$SYS/broker/version", QoS::AtMostOnce);
+
+	// A client whose will targets the broker-reserved $SYS namespace, retained.
+	let sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+	sock.set_nodelay(true).ok();
+	let mut c = v5::Connect::new("it-will-sys");
+	c.clean_session = true;
+	c.keep_alive = 30;
+	c.last_will = Some(v5::LastWill::new(
+		"$SYS/broker/version",
+		b"pwned".to_vec(),
+		QoS::AtMostOnce,
+		true, // retain — would poison future subscribers too
+	));
+	let mut willer = Client { sock, buf: BytesMut::new(), pkid: 0 };
+	willer.write_packet(|b| c.write(b));
+	assert!(matches!(
+		willer.read(Duration::from_secs(2)),
+		Some(Packet::ConnAck(_))
+	));
+	drop(willer); // abrupt close — a valid will would fire here
+
+	// The forged $SYS will must have been dropped at CONNECT: nothing arrives.
+	assert!(
+		watcher.recv(Duration::from_millis(800)).is_none(),
+		"will on the reserved $SYS namespace must be dropped, not published"
+	);
+
+	// And a wildcard will topic is likewise refused (it would reach the router).
+	let sock2 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+	sock2.set_nodelay(true).ok();
+	let mut c2 = v5::Connect::new("it-will-wild");
+	c2.clean_session = true;
+	c2.keep_alive = 30;
+	c2.last_will = Some(v5::LastWill::new(
+		"it/#",
+		b"nope".to_vec(),
+		QoS::AtMostOnce,
+		false,
+	));
+	let mut willer2 = Client { sock: sock2, buf: BytesMut::new(), pkid: 0 };
+	willer2.write_packet(|b| c2.write(b));
+	assert!(matches!(
+		willer2.read(Duration::from_secs(2)),
+		Some(Packet::ConnAck(_))
+	));
+	let mut wildwatch = Client::connect(port, "it-will-wild-watch");
+	wildwatch.subscribe("it/room", QoS::AtMostOnce);
+	drop(willer2);
+	assert!(
+		wildwatch.recv(Duration::from_millis(800)).is_none(),
+		"will on a wildcard topic must be dropped"
+	);
+}
+
 // --- tests: resilience -------------------------------------------------------
 
 #[test]

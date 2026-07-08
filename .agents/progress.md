@@ -994,3 +994,56 @@ the integrity gate working as designed: measured the wall, didn't ship through i
 
 Kept: /tmp/disp/wakelat.py (parked ring-wake vs live-reactor latency probe) — the
 evidence for the finding, reusable to re-check on a future glommio.
+
+## Phase 19 — comprehensive optimization + security audit (2026-07-08, v2.1.2)
+
+User: full-codebase optimization + security audit, refactor directly, keep tests
+intact. Ran 3 parallel review agents (perf / memory / security), verified every
+finding against the real code, fixed the genuine ones, documented the rest. The
+codebase is mature (8.9/10, 137 tests) so most surfaces came back clean — the
+agents explicitly confirmed large areas already well-defended/optimized.
+
+SECURITY (2 real vulns fixed):
+1. WILL-TOPIC BYPASS (MEDIUM): the will topic was ACL-checked but never run through
+   valid_publish_topic, unlike live PUBLISH. A client could set a RETAINED will on
+   $SYS/... (or a wildcard/NUL topic), disconnect abnormally, and poison the
+   broker-reserved namespace for all $SYS/# subscribers. Fix: connect.rs will_ok now
+   requires valid_publish_topic(&will.topic) AND the ACL. Integration test
+   will_on_reserved_or_wildcard_topic_is_dropped.
+2. SUBSCRIBE-ACL SUBSUMPTION ESCALATION (MEDIUM): authorize_subscribe used
+   filter_matches(rule, requested_filter), treating the requested FILTER as a
+   concrete topic — so filter_matches("home/+","home/#")=true let a client granted
+   home/+ escalate to home/# (whole subtree). Fix: new filter_subsumes(rule, req)
+   (proper filter-subset test) used for subscribe ACLs; filter_matches kept for
+   publish (concrete topic). Verified filter_subsumes against every existing auth
+   test + new subscribe_acl_blocks_wildcard_escalation. KEY: publish path unchanged
+   (topic is concrete), only subscribe changed.
+
+MEMORY (2 unbounded-growth vectors bounded):
+3. TRIE never pruned empty nodes + interner grow-only → trie grew with every
+   distinct filter EVER subscribed (per-client-id filters are common), interner kept
+   every segment forever. Fix: remove/remove_client/take_client now prune dead nodes
+   (is_dead = no subs + no children) on the way back up (recursive, retain-based);
+   periodic per-shard sweep (gc_indexes, every 30 sweeps alongside malloc_trim)
+   reclaims interned segments via retain_live (strong_count==1 = only interner holds
+   it, i.e. dropped by node pruning). Tests: empty_nodes_are_pruned_on_removal,
+   interner_reclaims_dead_segments_on_gc.
+4. shared_cursor HashMap gained a String key per shared group ever routed, never
+   removed. Fix: gc_indexes collects live shared groups from the trie and retains
+   only those cursors. Test gc_indexes_reclaims_stale_shared_cursor.
+
+PERFORMANCE: hot path already tight (agent confirmed: Rc fan-out, in-place PUBLISH
+normalization, single-shard mesh skip, interner OFF the publish path, coalesced
+writes, boxed cold handlers all optimal). One real finding — route() clones each
+subscriber's client_id into best/groups per message (scales with fan-out). NOT
+fixed: eliminating it needs a disjoint-borrow restructure of the core delivery path
+(QoS downgrade/No-Local/sub_id union/shared-sub global pick/offline/wake/WAL) to
+save a short-string alloc, not worth the regression risk without a wide-fan-out
+benchmark (the throughput harness publishes to no-subscriber topics, doesn't
+exercise it). Documented in next-steps §0 with the exact approach. Same call on the
+higher-risk send_publish Publish-clone (would duplicate wire-encoding).
+
+Verified: 120 unit + 23 integration (+7 new), clippy -D clean, adversarial battery
+12/12 on release build. Patch release v2.1.2 (security + memory; no wire/config
+change). GOTCHA re-confirmed: don't heredoc code via wsl bash -lc — used Write/Edit
+throughout this time (no incidents).
