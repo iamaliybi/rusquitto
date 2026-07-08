@@ -912,3 +912,39 @@ exact tuning API + defaults + safety (io_memory floor/fallback, spin's Unbound
 caveat, pool-builder setter availability). Empirical baseline decomposition
 (RSS per shard count) confirmed the io_memory hypothesis before touching code.
 Config test io_memory_below_floor_is_rejected. 112 unit + 22 integration, clippy clean.
+
+## Phase 17 — the five audit deficits: honest disposition + parser fuzzing (2026-07-08, v2.1.1)
+
+User: "fix these asap" listing the 5 audit weaknesses (1 active mem 6×, 2 CPU/msg
+1.7×, 3 saturating -7%, 4 cross-shard 2×, 5 no fuzzing). Did NOT fake-fix — 4 of 5
+are not quick fixes and one is not a defect. Disposition:
+
+- 1/2/3 = ONE root cause (task-per-connection + io_uring wake floor). MEASURED that
+  tuning can't touch 2/3: spin_before_park sweep 0/20/50/100/200us left saturating
+  QoS1 FLAT at 81-82k (spin only helps single-message latency where the reactor
+  parks between msgs; under load it never parks). So 2/3 are the amortized
+  per-io_uring_enter cost, only reducible by dispatcher mode + multishot RECV
+  (Workstream A2). Not a knob problem. 1 (active mem) also = dispatcher mode. All
+  three GATED behind the A1 prototype — do NOT rush the hot-path rewrite.
+- 4 = STRUCTURAL, not a bug. Cross-shard delivery needs one mandatory cross-thread
+  reactor wake over the mesh; removing it needs cross-core shared state = breaks the
+  shared-nothing invariant the user requires. Recorded in scope.md as accepted trade.
+- 5 = FIXED NOW. proptest fuzz harness in server/connection/tests.rs::fuzz (3 props:
+  parse_packet_never_panics 3000 cases, connected_dispatch_never_panics 256,
+  preconnect_dispatch 256). Adversarial input dist: random / packetish (valid header
+  + varint len + random body) / concatenated. Runs in cargo test (CI-continuous, not
+  spot-check). Deep-validated PROPTEST_CASES=50000 (50k parser + 3k dispatch) — NO
+  findings (mqttbytes + our guards robust). proptest = dev-dep. Closes TESTING.md gap.
+
+Released v2.1.1 (patch — test-only, no runtime change). 115 unit (112+3 fuzz) + 22
+integration, clippy/fmt clean, battery 12/12.
+
+GOTCHA (self-inflicted): tried to append the fuzz module via `wsl bash -lc` heredoc
+— the double-shell mangled the Rust `Ok(Some)`/`(...)` and truncated the file +
+spuriously invoked cargo. Recovered: head -846 to truncate the corrupt block, then
+re-appended via the Write/Edit tool. RE-LEARNED the CLAUDE.md rule: never heredoc
+Rust code through the double shell; use Write/Edit.
+
+The honest headline for the user: the real fix for 1/2/3 is dispatcher mode (the
+gated flagship, A0 study done Phase 16); 4 is architectural; 5 shipped. Offered to
+take on dispatcher mode as the dedicated next effort rather than rush it.

@@ -5,6 +5,43 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): from 1.0 on, the major
 version bumps for breaking changes, the minor for features, and the patch for fixes.
 
+## [2.1.1] - 2026-07-08
+
+Hardening: property-based fuzzing of the MQTT parser and packet handlers, wired
+into `cargo test`. Closes the last testing gap named in the audits. No runtime
+behaviour change.
+
+### Added
+
+- **`proptest` fuzz harness** (`src/server/connection/tests.rs::fuzz`) — three
+  properties over an adversarial input distribution (pure random bytes, single
+  plausible-but-malformed packets, and concatenations for framing-boundary
+  fuzzing): the frame parser never panics and every parse loop terminates; a
+  fully-connected connection fed arbitrary bytes drives every handler (publish,
+  subscribe, the QoS ack flows, ping) through the real dispatch seam without
+  panicking; and a pre-CONNECT arbitrary packet is rejected cleanly. Runs in
+  `cargo test`, so the parser is continuously fuzzed in CI rather than only
+  spot-checked against the hand-curated `malformed` battery. Validated deep
+  (`PROPTEST_CASES=50000` → 50 k parser + 3 k dispatch cases) with no findings —
+  the mature `mqttbytes` codec plus the broker's own guards hold up.
+
+### Notes on the remaining audit deficits
+
+- **Active-connection memory (~6×), CPU-per-message (~1.7×), and the −7%
+  saturating throughput share one root cause** — the task-per-connection execution
+  model and glommio's io_uring per-wake floor. This release *measured* that runtime
+  tuning cannot close them: a `spin_before_park` sweep (0–200 µs) left saturating
+  QoS 1 flat at ~81k, because under load the reactor never parks between message
+  batches. The only lever is cutting the syscall/wake count per message —
+  connections on the shard's own ring plus `IORING_OP_RECV` multishot — which is
+  the dispatcher-mode program (`.agents/next-steps.md` §1, A2), gated behind a
+  prototype. It is not a tuning problem and is not chased with knobs.
+- **The cross-shard delivery tax (~2× same-core) is structural**, not a defect: a
+  publisher and subscriber on different shards incur one mandatory cross-thread
+  reactor wake over the mesh. Removing it needs cross-core shared state, which the
+  shared-nothing invariant forbids. Recorded as an accepted trade in
+  `.agents/scope.md`.
+
 ## [2.1.0] - 2026-07-07
 
 Memory &amp; latency optimization, aligned with thread-per-core: the empty-broker
