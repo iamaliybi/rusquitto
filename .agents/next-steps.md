@@ -62,12 +62,38 @@ per-connection ones).
 - [ ] **A3 — migrate QoS 2 + will/keep-alive** into dispatcher state; battery +
       full integration suite green throughout; flip the default.
 
-### Workstream B — runtime wake floor (SHIPPED in v2.1.0, follow-ups optional)
+### Workstream B — runtime wake floor (spin SHIPPED; the rest needs dispatcher mode)
 
 - [x] **`[runtime] spin_before_park_us`** knob — busy-poll before parking; measured
       RTT p50 37→27 µs (beats Mosquitto's 32). Off by default (idle-CPU trade).
-- [ ] Optional: `preempt_timer` / `ring_depth` tuning — minor; measure per-
-      `io_uring_enter` cost with `perf` (not installable on the WSL box yet) first.
+- [x] **MEASURED (2026-07-08): tuning cannot close the CPU/throughput deficits.**
+      `spin_before_park` sweep 0/20/50/100/200 µs left saturating QoS 1 flat at
+      81–82k (spin only helps single-message *latency*, where the reactor parks
+      between messages — under load it never parks, so there is nothing to spin
+      past). Conclusion: the audit's **CPU-per-message (25.5 vs 15 µs)** and
+      **saturating −7%** are the amortized per-`io_uring_enter` cost under load and
+      are **only** reducible by cutting the syscall/wake count per message — i.e.
+      connections on our own ring + `IORING_OP_RECV` multishot, which is
+      **Workstream A2**. Not a tuning problem; do not chase it with knobs.
+
+### Cross-shard delivery tax — STRUCTURAL, not a defect (documented decision)
+
+The audit's "cross-shard delivery ~2× same-core (76 vs 40 µs)" is the definitional
+cost of shared-nothing: a publisher on shard A reaching a subscriber on shard B
+requires exactly one cross-thread reactor wake over the mesh. It cannot be removed
+without cross-core shared state, which is the one invariant the project will not
+break. Marginal mitigations (the mesh drain already batches with `poll_once`) are
+in place; the per-message cross-thread wake itself is inherent. Recorded in
+[scope.md](scope.md) as an accepted trade, not tracked as open work.
+
+### Hardening — parser fuzzing (SHIPPED)
+
+- [x] **`proptest` fuzz harness** (`server/connection/tests.rs::fuzz`), in
+      `cargo test`: `parse_packet` + full connected/pre-connect dispatch over an
+      adversarial input distribution (random / plausible-malformed / concatenated).
+      Validated deep (50 k parser + 3 k dispatch cases), no findings. Closes the
+      TESTING.md gap. Deeper `cargo-fuzz` libFuzzer target over `parse_packet`
+      remains an optional follow-up.
 
 ### Workstream C — active-traffic marginal memory (ATTRIBUTED)
 

@@ -26,3 +26,9 @@ in [progress.md](progress.md).
   out of this repo's backlog. (The mesh's shared-subscription membership
   replication and deterministic pick were built to survive that step, but the step
   itself is not tracked here.)
+- **The cross-shard delivery tax is accepted, not a bug.** A publisher and
+  subscriber on different shards incur one cross-thread reactor wake over the mesh
+  (~2× same-core delivery latency, measured 76 vs 40 µs p50). This is the
+  definitional cost of shared-nothing — removing it needs cross-core shared state,
+  which the invariant above forbids. The mesh drain already batches (`poll_once`);
+  the per-message wake itself is inherent. Not tracked as open work.

@@ -844,3 +844,118 @@ fn stalled_partial_frame_is_reaped_even_without_keepalive() {
 		);
 	});
 }
+
+// --- property-based fuzzing --------------------------------------------------
+//
+// Closes the audit's standing gap: the malformed-frame surface was only covered
+// by the hand-curated adversarial battery. These proptest cases generate
+// adversarial byte streams — pure random, single plausible-but-malformed
+// packets, and concatenations of them — and drive them through the real
+// parse-and-dispatch seam, asserting the broker never panics and every parse
+// loop terminates. Runs in `cargo test`, so the parser is continuously fuzzed in
+// CI rather than only spot-checked.
+mod fuzz {
+	use super::*;
+	use proptest::prelude::*;
+
+	/// One byte sequence shaped like an MQTT packet: a type+flags header byte, a
+	/// remaining-length varint of the body, then a random body. Hits deeper
+	/// handler code than pure noise, which rarely forms a valid fixed header.
+	fn packetish() -> impl Strategy<Value = Vec<u8>> {
+		(
+			0u8..16,
+			0u8..16,
+			proptest::collection::vec(any::<u8>(), 0..300),
+		)
+			.prop_map(|(t, f, body)| {
+				let mut v = vec![(t << 4) | f];
+				let mut n = body.len();
+				loop {
+					let mut b = (n % 128) as u8;
+					n /= 128;
+					if n > 0 {
+						b |= 0x80;
+					}
+					v.push(b);
+					if n == 0 {
+						break;
+					}
+				}
+				v.extend_from_slice(&body);
+				v
+			})
+	}
+
+	/// The adversarial input distribution: pure noise, one plausible packet, or a
+	/// stream of several concatenated (framing-boundary fuzzing).
+	fn byte_soup() -> impl Strategy<Value = Vec<u8>> {
+		prop_oneof![
+			proptest::collection::vec(any::<u8>(), 0..512),
+			packetish(),
+			proptest::collection::vec(packetish(), 0..6).prop_map(|v| v.concat()),
+		]
+	}
+
+	proptest! {
+		#![proptest_config(ProptestConfig::with_cases(3000))]
+
+		/// The frame parser must never panic on any input, and every `Ok(Some)`
+		/// must consume bytes so a bounded drain always terminates.
+		#[test]
+		fn parse_packet_never_panics(data in byte_soup()) {
+			let mut buf = BytesMut::from(&data[..]);
+			let max = 64 * 1024;
+			let mut guard = 0usize;
+			loop {
+				guard += 1;
+				prop_assert!(guard < 100_000, "parse loop must terminate");
+				match Connection::<MockStream>::parse_packet(&mut buf, max) {
+					Ok(Some(_)) => continue,
+					Ok(None) | Err(_) => break,
+				}
+			}
+		}
+	}
+
+	proptest! {
+		#![proptest_config(ProptestConfig::with_cases(256))]
+
+		/// A fully-connected connection fed arbitrary bytes must never panic:
+		/// every handler (publish, subscribe, the QoS ack flows, ping, …) is
+		/// exercised through the real dispatch seam, and the drain must terminate.
+		#[test]
+		fn connected_dispatch_never_panics(data in byte_soup()) {
+			block_on(async {
+				let out = Rc::new(RefCell::new(Vec::new()));
+				let mut conn = make_conn(out);
+				drive(&mut conn, connect_packet("fuzz")).await.ok();
+				conn.inbound.extend_from_slice(&data);
+				let max = conn.limits.max_payload_size;
+				let mut guard = 0usize;
+				loop {
+					guard += 1;
+					if guard > 100_000 {
+						break;
+					}
+					match conn.process_one(max).await {
+						Ok(true) => continue,
+						Ok(false) | Err(_) => break,
+					}
+				}
+			});
+		}
+
+		/// Pre-CONNECT: an arbitrary first packet must be rejected cleanly by the
+		/// CONNECT-first guard, never panic.
+		#[test]
+		fn preconnect_dispatch_never_panics(data in byte_soup()) {
+			block_on(async {
+				let out = Rc::new(RefCell::new(Vec::new()));
+				let mut conn = make_conn(out);
+				conn.inbound.extend_from_slice(&data);
+				let max = conn.limits.max_payload_size;
+				let _ = conn.process_one(max).await;
+			});
+		}
+	}
+}

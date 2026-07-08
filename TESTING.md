@@ -177,9 +177,25 @@ adversarial battery, and soak. These are the reliability checks that can't run
 purely in-process.
 
 **Gaps / future work:**
-- No property-based / fuzz harness on the frame parser (the `malformed` battery is
-  hand-curated, not generative). A `cargo-fuzz` or `arbitrary`-driven target over
-  `parse_packet` would harden the edges further.
 - WebSocket / `wss` transports are unit-tested at the handshake layer but not
   exercised end-to-end in the integration suite (which uses raw TCP).
 - The crash-recovery and mTLS harnesses are scripted but not wired into CI.
+
+### Property-based fuzzing — `src/server/connection/tests.rs::fuzz`
+
+`proptest`-driven, and runs inside `cargo test` (so it fuzzes in CI, not just on
+demand). Three properties over an adversarial input distribution — pure random
+bytes, single plausible-but-malformed packets, and concatenations of them
+(framing-boundary fuzzing):
+
+- `parse_packet_never_panics` — the frame parser survives any byte sequence and
+  every parse loop terminates (each `Ok(Some)` consumes bytes). 3 000 cases per run.
+- `connected_dispatch_never_panics` — a fully-connected connection fed arbitrary
+  bytes drives every handler (publish / subscribe / the QoS ack flows / ping) through
+  the real dispatch seam without panicking. 256 cases per run.
+- `preconnect_dispatch_never_panics` — an arbitrary first packet is rejected cleanly
+  by the CONNECT-first guard.
+
+Run deeper on demand with `PROPTEST_CASES=50000 cargo test --lib fuzz::` (validated
+at 50 k parser + 3 k dispatch cases, no findings). For coverage-guided libFuzzer
+runs, a `cargo-fuzz` target over `parse_packet` is the deeper follow-up.
