@@ -40,6 +40,16 @@ websocket_port = 8884     # wss listener port (used only when enabled and websoc
 # cores = 8               # CPU cores to run on (one shard/executor per core). Default: all online; over-count is clamped.
 placement = "max-spread"  # max-spread (latency) | max-pack (locality) | unbound (no pinning)
 mesh_capacity = 1024      # per-link inter-shard mesh buffer (> 0)
+io_memory_kib = 512       # io_uring registered-buffer pool PER SHARD, KiB (>= 64). glommio pre-allocates and PINS
+                          #   this at startup, so it is resident for the shard's life — the dominant term in the
+                          #   empty-broker footprint (glommio's own default is 10 MiB/core). The network fast path
+                          #   never draws from it; only DMA file I/O (persistence snapshots) does, falling back to the
+                          #   heap when exhausted. 512 keeps a shard near a megabyte; raise it only for
+                          #   persistence-heavy deployments doing large, frequent snapshots.
+spin_before_park_us = 0   # microseconds to busy-poll io_uring completions before parking the reactor (0 = park at
+                          #   once). A small value (e.g. 50) removes the park/unpark round-trip from single-message
+                          #   latency — measured p50 37 -> 27 us — trading idle CPU for it. Latency-critical, steadily
+                          #   -busy shards only. Effective only under max-spread / max-pack (ignored under unbound).
 
 [logging]
 level = "info,rusquitto=debug"      # EnvFilter syntax; RUST_LOG overrides at startup

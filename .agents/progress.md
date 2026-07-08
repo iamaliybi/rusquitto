@@ -850,3 +850,65 @@ MEASUREMENT KIT (kept): examples/wake_probe.rs (runtime floor);
 CPU-per-message via /proc/<pid>/stat utime+stime around N ping-pongs — the
 decisive signal was CPU/msg ≈ wall/msg (broker never idle ⇒ per-wake work, not
 waiting), and the echo probe splitting runtime floor from MQTT-layer cost.
+
+## Phase 16 — memory + latency optimization: io_memory, spin_before_park, A0 study (2026-07-07, v2.1.0)
+
+User: "maximum research on minimizing memory + peak optimization, keep shared-
+nothing/thread-per-core, complete next-steps, deploy release." Did deep research
+(glommio executor-tuning source dive) and landed the two SAFE, high-leverage wins
+from the parity program; documented the flagship (dispatcher mode) design study;
+deferred the dispatcher REWRITE to the next cycle per my own "prove on a prototype"
+gate. Shipped as v2.1.0.
+
+WIN 1 — io_memory (Workstream D, the headline). ROOT CAUSE of the empty-broker
+baseline gap FOUND: glommio's `LocalExecutorBuilder`/`PoolBuilder` default
+`io_memory = 10 << 20` = 10 MiB PER EXECUTOR (src/executor/mod.rs:74), pre-
+registered with io_uring (IORING_REGISTER_BUFFERS) at startup which PINS/faults it
+resident (sys/uring.rs:1306+). Confirmed empirically: empty RSS scaled 17.5/28.6/
+40.0/51.7 MiB for 1/2/3/4 shards = ~11 MiB/shard. The network fast path uses
+yolo_recv/send (plain syscalls) NOT the registered pool — only DMA file I/O
+(persistence snapshots) draws from it, and it FALLS BACK TO THE HEAP when exhausted
+(sys/uring.rs:143), so shrinking is safe (floor 64 KiB, sys/uring.rs:1304).
+Added `[runtime] io_memory_kib` (default 512). lib.rs: `.io_memory(kib*1024)` on the
+pool builder before on_all_shards. RESULT: 1-shard 17.5→8.1 MiB (Mosquitto's 7.6
+parity!), 4-shard 51.7→13.1 (~1.6 MiB/shard). ZERO throughput/latency/parked-floor/
+battery regression (verified: saturating QoS1 79.4k unchanged, 3-shard 359k, parked
+0.68, battery 12/12). BONUS: the 10MiB×N pinned pool was almost certainly the WSL
+multi-shard io_uring ENOMEM gotcha (RLIMIT_MEMLOCK); 512KiB×N fits easily — 4 shards
+now boot clean on the WSL box.
+
+WIN 2 — spin_before_park (Workstream B). glommio `spin_before_park(Duration)` on the
+pool builder (executor/mod.rs:819) busy-polls completions before parking the reactor,
+removing the io_uring park/unpark round-trip from single-message latency. CAVEAT
+(from source): silently disabled under Unbound placement (executor/mod.rs:1157) —
+only works under MaxSpread/MaxPack (our default). Added `[runtime] spin_before_park_us`
+(default 0 = off; spinning burns idle CPU so opt-in). A/B at 50us: RTT p50 37.3→27.1us
+(-27%), mean 41.4→30.1 — BEATS Mosquitto's 31.9us p50. The latency lever for
+latency-critical steadily-busy shards.
+
+Workstream C (active marginal +1.3 KiB): ATTRIBUTED to the two per-connection BytesMut
+buffers (read + coalesced-write) growing to read_chunk under traffic, retained below
+BUFFER_RETAIN_MAX. Shrinking harder trades vs throughput (re-growth). Correct fix =
+dispatcher mode's shared per-shard scratch buffer. NOT pursued standalone. NOTE:
+per-conn cost unchanged (idle 6.24, active 7.56 KiB/conn) but TOTAL 500-conn active
+footprint dropped 21.4→11.8 MiB (-45%) purely from the baseline win.
+
+A0 DESIGN STUDY (Workstream A flagship) — COMPLETE, decision recorded in next-steps:
+ESCALATE-PER-CONNECTION wins over escalate-per-operation. A connection lives as a
+ring state struct (like a parked conn), dispatcher handles simple ops inline
+(PING, QoS0/1 publish w/ socket room, PUBACK/PUBREC) with NO per-conn task/source;
+escalates to today's Connection stack (verbatim) for blocking ops (window-full,
+throttle, partial frame, SUBSCRIBE+retained, CONNECT, TLS/WS), returns to ring after
+= park/unpark generalized from idle-only to every-idle-moment. Reuses v2.0.0 parking
+machinery wholesale. Sized: kills 2.3KiB future + 1.7KiB task/source → live conn
+~1.0-1.3 KiB (Mosquitto territory), removes task-wake from hot path (closes the -7%
+saturating gap + active-buffer marginal). A1 (prototype behind a flag + gate BEFORE
+default) / A2 (multishot RECV) / A3 (QoS2 + flip default) are the next release cycle.
+Deliberately NOT shipping the rewrite this cycle — my own gate says prove on a
+prototype first, and a clean memory-win release shouldn't carry a hot-path rewrite.
+
+Research method (kept): parallel Explore agent dove the glommio 0.9 source for the
+exact tuning API + defaults + safety (io_memory floor/fallback, spin's Unbound
+caveat, pool-builder setter availability). Empirical baseline decomposition
+(RSS per shard count) confirmed the io_memory hypothesis before touching code.
+Config test io_memory_below_floor_is_rejected. 112 unit + 22 integration, clippy clean.

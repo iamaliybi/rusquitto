@@ -117,17 +117,35 @@ pub fn run(config: Config) -> std::io::Result<()> {
 	// shard count so each shard has a slot for its per-shard load gauge.
 	let metrics = Arc::new(telemetry::metrics::Metrics::with_shards(shards));
 
-	LocalExecutorPoolBuilder::new(placement)
-		.on_all_shards(move || {
-			let mesh = mesh.clone();
-			let config = Arc::clone(&config);
-			let shutdown = Arc::clone(&shutdown);
-			let metrics = Arc::clone(&metrics);
-			let tls_config = tls_config.clone();
-			async move { server::shard::run_shard(mesh, config, shutdown, metrics, tls_config).await }
-		})
-		.expect("failed to spawn local executor")
-		.join_all();
+	// Runtime tuning. `io_memory` is glommio's pre-registered, pinned io_uring
+	// buffer pool per shard; its 10 MiB default dominates the empty-broker
+	// footprint while the network fast path never touches it, so we shrink it to
+	// the configured size (default 512 KiB) — this alone reclaims ~9 MiB of
+	// resident memory per core, and keeps the pinned memlock small enough that
+	// multi-shard starts on hosts with a tight `RLIMIT_MEMLOCK`. `spin_before_park`
+	// (off by default) busy-polls completions briefly before parking the reactor,
+	// trading idle CPU for lower single-message latency; glommio ignores it under
+	// `unbound` placement, which is expected.
+	let io_memory = config
+		.runtime
+		.io_memory_kib
+		.saturating_mul(1024)
+		.max(64 * 1024);
+	let spin_before_park = config.runtime.spin_before_park_us;
+	let mut pool = LocalExecutorPoolBuilder::new(placement).io_memory(io_memory);
+	if spin_before_park > 0 {
+		pool = pool.spin_before_park(std::time::Duration::from_micros(spin_before_park));
+	}
+	pool.on_all_shards(move || {
+		let mesh = mesh.clone();
+		let config = Arc::clone(&config);
+		let shutdown = Arc::clone(&shutdown);
+		let metrics = Arc::clone(&metrics);
+		let tls_config = tls_config.clone();
+		async move { server::shard::run_shard(mesh, config, shutdown, metrics, tls_config).await }
+	})
+	.expect("failed to spawn local executor")
+	.join_all();
 
 	tracing::info!("broker shut down");
 	Ok(())

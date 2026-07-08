@@ -5,6 +5,47 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): from 1.0 on, the major
 version bumps for breaking changes, the minor for features, and the patch for fixes.
 
+## [2.1.0] - 2026-07-07
+
+Memory &amp; latency optimization, aligned with thread-per-core: the empty-broker
+footprint is **more than halved** and single-message latency can now **beat
+Mosquitto's** — both from tuning the glommio runtime, with zero throughput
+regression and no architectural change. Two new `[runtime]` knobs.
+
+### Added
+
+- **`[runtime] io_memory_kib`** (default **512**, was glommio's implicit 10 MiB
+  *per core*). glommio pre-allocates and **pins** an io_uring registered-buffer
+  pool per executor at startup — it is resident for the shard's whole life and was
+  the dominant term in the empty-broker footprint. The network fast path
+  (`recv`/`send`) never draws from it; only DMA file I/O (persistence snapshots)
+  does, and that falls back to the heap when the pool is exhausted, so shrinking it
+  is safe (glommio's 64 KiB floor is enforced). Measured, same box:
+  - Empty-broker RSS, **1 shard: 17.6 → 8.1 MiB** (Mosquitto's 7.6 parity);
+    **4 shards: 51.7 → 13.1 MiB** (~1.6 MiB/shard, was ~11).
+  - **Zero regression**: saturating QoS 1 unchanged (79.4k/core, 359k on 3 shards),
+    parked-idle floor unchanged (0.68 KiB/conn), adversarial battery still 12/12.
+  - Bonus: the small pinned pool keeps multi-shard within a tight `RLIMIT_MEMLOCK`,
+    so multi-shard now starts on memlock-constrained hosts (e.g. non-interactive
+    WSL) that the 10 MiB×N default could push into io_uring `ENOMEM`.
+- **`[runtime] spin_before_park_us`** (default **0** = off). Busy-polls io_uring
+  completions for this many microseconds before parking the reactor, removing the
+  park/unpark round-trip from single-message latency. Measured at 50 µs:
+  **PUBLISH→PUBACK RTT p50 37 → 27 µs** — below Mosquitto's 31.9 µs. Opt-in because
+  spinning trades idle CPU for the latency; suited to latency-critical, steadily-busy
+  shards. Effective only under `max-spread`/`max-pack` placement (glommio disables
+  spinning under `unbound`).
+
+### Notes
+
+- **Per-connection cost is unchanged** (idle 6.24, active 7.56 KiB/conn) — this
+  release lowers the fixed baseline and unlocks cheap multi-shard, not the
+  per-connection constant. Total footprint still improves markedly: a 500-connection
+  active broker dropped 21.4 → 11.8 MiB (−45%) from the baseline win alone. Closing
+  the per-connection constant is the dispatcher-mode program (`.agents/next-steps.md`
+  §1), whose A0 design study landed this cycle; the rewrite itself is gated to the
+  next release behind a prototype.
+
 ## [2.0.0] - 2026-07-07
 
 The parked-connection idle path: idle connections now cost **0.68 KiB** of live
