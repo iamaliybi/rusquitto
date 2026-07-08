@@ -32,3 +32,14 @@ in [progress.md](progress.md).
   definitional cost of shared-nothing — removing it needs cross-core shared state,
   which the invariant above forbids. The mesh drain already batches (`poll_once`);
   the per-message wake itself is inherent. Not tracked as open work.
+- **Active-connection memory (~6× Mosquitto) is bounded by glommio 0.9, not a
+  quick fix.** Prototyped and measured (progress.md Phase 18): serving *active*
+  connections off a per-shard raw io_uring ring — the "dispatcher mode" that would
+  drop the per-connection task + source — imposes ms-scale per-message latency
+  (measured p50 3.1 ms via the ring vs 0.3 ms on glommio's live reactor), because
+  glommio delivers low-latency readiness only for its own per-connection `Source`
+  (the very memory we'd remove) and cannot efficiently await a foreign ring.
+  Cheap-memory and low-latency are the same mechanism on this runtime. Parking wins
+  for *idle* connections (latency-tolerant); active connections have no such point.
+  Accepted as an architectural bound, with future options (different runtime,
+  spin-mode, `FuturesUnordered` partial) noted in next-steps but not scheduled.

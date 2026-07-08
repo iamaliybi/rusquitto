@@ -948,3 +948,49 @@ Rust code through the double shell; use Write/Edit.
 The honest headline for the user: the real fix for 1/2/3 is dispatcher mode (the
 gated flagship, A0 study done Phase 16); 4 is architectural; 5 shipped. Offered to
 take on dispatcher mode as the dedicated next effort rather than rush it.
+
+## Phase 18 — dispatcher mode prototyped, found non-viable on glommio 0.9 (2026-07-08)
+
+User: "do and finish it" (dispatcher mode, the flagship that would close audit items
+1/2/3 = active-conn memory 6×, CPU/msg 1.7×, saturating -7%). Committed to building it
+behind a flag with an integrity gate (ship only if battery green + no guarantee
+weakened). PROTOTYPE STOPPED AT THE GATE — the A0 design assumption is wrong for
+ACTIVE connections, and I proved it with a measurement rather than shipping a broken
+high-latency path.
+
+THE FINDING (real glommio 0.9 limit): dispatcher mode = serve active connections off a
+per-shard raw io_uring ring (no per-conn glommio task/source) = the parking model
+generalized from idle to active. But the parking ring reaps CQEs on an adaptive 1-25ms
+TIMER TICK — fine for idle parked conns (latency-tolerant), CATASTROPHIC for active.
+MEASURED (/tmp/disp/wakelat.py): a parked conn woken via the ring = p50 3.1ms / p90
+9.8ms per wake, vs 0.3ms on glommio's live reactor (and 27-37us for real active RTT).
+~10x worse, 3 orders of magnitude over active latency.
+
+ROOT CAUSE: on glommio the efficient low-latency I/O wait and the per-connection memory
+are THE SAME THING. glommio gives us-latency readiness ONLY for its own per-conn Source
+(the ~1.7KiB we wanted to remove). A foreign io_uring can only be polled on a timer tick
+(ms) or by spinning a core (glommio can't await a foreign eventfd — yolo_recv is recv(2),
+ENOTSOCK, established Phase 14). Parking works ONLY because idle conns tolerate ms wakes.
+There is no cheap-memory + low-latency point for ACTIVE conns on glommio 0.9.
+
+CONSEQUENCE: active-conn memory (audit item 1) is ARCHITECTURALLY BOUNDED on glommio
+0.9 — same class as the cross-shard tax (Phase 17). Items 2/3 (CPU/msg, saturating)
+share the root (the task/wake model IS the efficient-wait mechanism) and are likewise
+bounded — Phase 17 already measured that tuning (spin sweep) can't touch them. So
+audit items 1/2/3 are all now reclassified: not quick fixes, bounded by the runtime.
+
+OPTIONS documented in next-steps (none a clean win, none scheduled): (a) different
+runtime with multiplexed reactor access (huge); (b) spin-mode dispatcher (core-burn,
+only OK on a dedicated already-saturated core, wrong default); (c) FuturesUnordered
+shared-task multiplex (removes N task futures, KEEPS N glommio sources → partial win
+~7.3→~4-5KiB, not parity, real complexity). Best risk-adjusted if item 1 is ever
+prioritized, but still not Mosquitto's 1.2KiB.
+
+ACTIONS: reverted the [dispatcher] config scaffold (won't ship a non-functional flag);
+tree back to v2.1.1 baseline + these doc updates. NO release (no shippable code change
+— the deliverable is the proven finding). Recorded in next-steps Workstream A, scope.md
+(active-conn memory bounded, alongside cross-shard tax), and the audit ledger. This is
+the integrity gate working as designed: measured the wall, didn't ship through it.
+
+Kept: /tmp/disp/wakelat.py (parked ring-wake vs live-reactor latency probe) — the
+evidence for the finding, reusable to re-check on a future glommio.

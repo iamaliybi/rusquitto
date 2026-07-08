@@ -33,34 +33,47 @@ protocol engine itself is already Mosquitto-lean (~0.7 KiB state); the cost is t
 ~2.3 KiB async-task future + ~1.7 KiB glommio task &amp; io_uring source per live
 connection. Closing all three at once is Workstream A.
 
-### Workstream A — dispatcher mode (loop-per-shard data plane)
+### Workstream A — dispatcher mode: PROTOTYPED, found NON-VIABLE on glommio 0.9
 
-**A0 — design study: COMPLETE (progress.md Phase 16).** Decision: **escalate-per-
-connection**, reusing the v2.0.0 parking machinery wholesale. A connection lives
-as a state struct on the shard's readiness ring (like a parked conn today), but
-the shard dispatcher handles its *simple* ops inline on readiness — PINGREQ,
-QoS 0/1 PUBLISH with socket-buffer room, PUBACK/PUBREC bookkeeping — with **no
-per-connection task and no per-connection reactor source**. A connection escalates
-to a spawned task (today's `Connection` stack, verbatim) only for blocking ops:
-window-full backpressure, throttle sleep, partial-frame reassembly, SUBSCRIBE with
-retained replay, CONNECT/auth, and all of TLS/WS. On completion it returns to the
-ring — the park→unpark transition generalized from idle-only to every-idle-moment.
-Sized from `alloc_probe`: eliminates the ~2.3 KiB future + ~1.7 KiB task/source →
-**live conn ≈ 1.0–1.3 KiB, Mosquitto territory**, and removes task-spawn/wake from
-the hot path (the −7% saturating gap and the active-buffer marginal go with it,
-since inline handling delivers into a shared per-shard scratch buffer, not
-per-connection ones).
+**A0 — design study (progress.md Phase 16)** proposed serving active connections as
+state structs on the shard's readiness ring (parking generalized from idle to every
+moment), sized to bring a live connection to ~1.0–1.3 KiB by dropping the ~2.3 KiB
+task future + ~1.7 KiB glommio source.
 
-- [ ] **A1 — prototype + gate.** Build the inline dispatch path for the simple ops
-      behind a `[dispatcher] enabled` flag; prove the live/active memory floor and
-      the saturating-QoS-1 CPU on the real benchmark battery **before** making it
-      the default. This is the "prove on a prototype" gate my own notes demanded.
-- [ ] **A2 — multishot ingress.** With connections on our ring, replace re-armed
-      oneshot polls with `IORING_OP_RECV` multishot (data in the CQE, no re-arm, no
-      separate recv syscall) and batch replies per reap — where io_uring can *beat*
-      epoll's syscall count per message, not just match it.
-- [ ] **A3 — migrate QoS 2 + will/keep-alive** into dispatcher state; battery +
-      full integration suite green throughout; flip the default.
+**A1 — prototype: STOPPED at the viability gate (progress.md Phase 18, 2026-07-08).**
+The A0 assumption is **wrong for active connections**, proven by measurement. The
+raw per-shard ring reaps completions on an adaptive **1–25 ms timer tick** (fine for
+*idle* parked connections — latency-tolerant by definition). Serving *active*
+connections through it was measured at **p50 3.1 ms / p90 9.8 ms per wake vs 0.3 ms
+on glommio's live reactor** (`/tmp/disp/wakelat.py`) — ~10× worse, and three orders
+of magnitude above the 27–37 µs active connections get today.
+
+Root cause — a real glommio 0.9 limit: **the efficient, low-latency I/O wait and the
+per-connection memory are the same thing.** glommio delivers µs-latency readiness
+only for *its own* per-connection `Source` (the ~1.7 KiB we wanted to remove); a
+foreign io_uring can only be polled on a timer tick (ms latency) or by burning a core
+spinning (established earlier: glommio cannot `await` a foreign eventfd —
+`yolo_recv` is `recv(2)`, `ENOTSOCK`). Parking sidesteps this *only* because idle
+connections tolerate ms wakes. There is no cheap-memory + low-latency point for
+*active* connections on this runtime.
+
+**Conclusion: active-connection memory (audit item 1) is architecturally bounded on
+glommio 0.9**, in the same class as the cross-shard tax — not a quick fix. Reclassified
+in the audit ledger. Options, none a clean win, none scheduled:
+
+- **Different runtime / reactor access** — a runtime that lets one task await
+  readiness on many fds (epoll-style) would remove the per-connection task future
+  while keeping efficient waits. Largest change; out of scope for now.
+- **Spin-mode dispatcher** — a core-burning poll loop is acceptable *only* on a
+  dedicated core already saturated with active work; wrong default for mostly-idle
+  fleets (where parking already wins). Niche opt-in at best.
+- **Shared-task `FuturesUnordered` multiplex** — one task awaiting all connections'
+  reads removes the N task futures but keeps N glommio sources: a *partial* memory
+  win (~7.3 → ~4–5 KiB, not to Mosquitto's 1.2) at real complexity/fairness cost.
+  Best risk-adjusted option if the memory item is ever prioritized; still not parity.
+
+The audit's **CPU-per-message and −7% saturating** (items 2/3) share this root and
+are likewise bounded — no knob or safe rewrite closes them on glommio 0.9.
 
 ### Workstream B — runtime wake floor (spin SHIPPED; the rest needs dispatcher mode)
 
