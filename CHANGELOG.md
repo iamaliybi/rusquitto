@@ -5,6 +5,31 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): from 1.0 on, the major
 version bumps for breaking changes, the minor for features, and the patch for fixes.
 
+## [2.2.1] - 2026-07-09
+
+Internal hot-path cleanup. No wire, config, or behavioural change.
+
+### Changed
+
+- **`route()` fan-out no longer clones a `client_id` per matched subscriber.** The
+  per-publish `best`/`groups` maps now key on the subscriber's borrowed `&str`
+  (taken from the topic trie) instead of an owned `String`, made possible by a
+  disjoint-field-borrow of `ShardState` (the trie stays borrowed across the whole
+  fan-out while delivery reaches `sessions`/`wal`/`unpark_tx` through a free
+  `deliver_to`). This removes one heap allocation per matched subscriber per
+  message — at a 1000-subscriber fan-out, ~15M allocations/second.
+
+  **Honest note on impact:** this is an allocation reduction and a borrow-structure
+  simplification, **not a measured throughput win.** On a CPU-saturated
+  1000-subscriber fan-out the publish rate is unchanged within run-to-run noise
+  (~64 µs/publish before and after), because the per-delivery cost is dominated by
+  the mailbox `try_send` and `Delivery` construction, not the short-string
+  allocation. Shipped for the cleaner structure and the reduced allocator traffic
+  (which can still matter under memory pressure or a different allocator), with no
+  performance claim attached. Full suite green (120 unit + 23 integration, including
+  shared-subscription exactly-once, cross-shard, No Local, and Subscription
+  Identifier echo).
+
 ## [2.2.0] - 2026-07-08
 
 Consolidation release. No functional change over 2.1.2 — this marks the 2.x

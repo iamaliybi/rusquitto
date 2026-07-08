@@ -1047,3 +1047,36 @@ Verified: 120 unit + 23 integration (+7 new), clippy -D clean, adversarial batte
 12/12 on release build. Patch release v2.1.2 (security + memory; no wire/config
 change). GOTCHA re-confirmed: don't heredoc code via wsl bash -lc — used Write/Edit
 throughout this time (no incidents).
+
+## Phase 20 — route() per-subscriber allocation shipped (2026-07-09, v2.2.1)
+
+The Phase-19 backlog item, closed out. `route()`'s per-publish `best`/`groups` maps
+cloned each matching subscriber's `client_id` into an owned `String` key (one
+short-string heap alloc per subscriber per message, scaling with fan-out width). The
+disjoint-field-borrow restructure lands it: `route` destructures `self` into
+`{trie, sessions, shared_cursor, shared_remote, wal, unpark_tx}`, the maps key on
+`sub.client_id.as_str()` (borrowed from the trie, which stays borrowed across the
+whole fan-out), and `deliver_to` moved from a `&mut self` method to a free fn over
+`(sessions, wal, unpark_tx)` — so delivery no longer needs `&mut self` while the trie
+borrow is live. The shared-group round-robin still owns one key per *group* publish
+(`group.to_string()` for the `shared_cursor` entry — not per subscriber), negligible.
+
+BENCHMARK-FIRST (the documented gate): built `/tmp/fanout/bench.py` (1000 subscribers
+on one topic, publisher hammering QoS 0, shard CPU-saturated ~100%) and measured
+before/after. RESULT — **no measurable throughput change**: baseline 64.48 µs/publish
+vs refactored 64.9 / 64.5 / 62.6 (mean ≈ 64.0), identical within ±3.5 % run-to-run
+noise, at the *widest and most allocation-favorable* fan-out possible (~15.5 M
+`client_id` allocs/sec eliminated). The 64.9 ns/delivery cost is dominated by the
+mailbox `try_send` + `Delivery` construction + `Rc` clone, not the short-string alloc
+(glibc tcache absorbs it below the harness noise floor).
+
+DECISION HISTORY (honest): first pass measured no win and I **reverted** it per the
+"ship only on a proven win" gate, recording the negative result. The user then
+explicitly asked to finish and release it — so it was re-applied and **shipped in
+v2.2.1 as an allocation reduction + borrow-structure cleanup, with NO performance
+claim** (CHANGELOG says so plainly). The change is correct and fully covered — 120
+unit + 23 integration green (shared-sub exact-once, cross-shard, No Local, sub_id
+echo), clippy/fmt clean — so it ships on its own merits, not on a benchmark it never
+passed. LESSON: an allocation that scales with fan-out can still be immaterial to
+throughput when the per-op cost is channel/queue-bound; measure at the widest case,
+and separate "correct + clean" (ship-worthy) from "faster" (must be proven).

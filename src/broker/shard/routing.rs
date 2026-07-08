@@ -6,7 +6,9 @@ use std::rc::Rc;
 
 use mqttbytes::{QoS, v5::Publish};
 
-use super::ShardState;
+use glommio::channels::local_channel::LocalSender;
+
+use super::{Session, ShardState, WalPending};
 use crate::broker::delivery::{Delivery, MAILBOX_LIMIT, OFFLINE_QUEUE_LIMIT, UnparkCmd};
 use crate::broker::topics::filter_matches;
 use crate::protocol::min_qos;
@@ -117,25 +119,36 @@ impl ShardState {
 	/// and Retain As Published options. Uses `try_send` so a slow or full consumer
 	/// never blocks the publisher.
 	fn route(&mut self, publish: Rc<Publish>, publisher: Option<&str>, was_retained: bool) {
+		// Disjoint field borrows. The subscription matches borrow the trie immutably
+		// for the whole fan-out, which lets `best`/`groups` key on the subscribers'
+		// borrowed `&str` client ids instead of cloning an owned `String` per matched
+		// subscriber — but only because delivery reaches `sessions`/`wal`/`unpark_tx`
+		// through the free `deliver_to` rather than back through `self` (a `&mut self`
+		// call would collide with the live trie borrow). On a wide fan-out this drops
+		// one heap allocation per matched subscriber from the hot path.
+		let Self {
+			trie, sessions, shared_cursor, shared_remote, wal, unpark_tx, ..
+		} = self;
+
 		let mut matches = Vec::new();
-		self.trie.matching(&publish.topic, &mut matches);
+		trie.matching(&publish.topic, &mut matches);
 
 		// Collapse overlapping subscriptions to one Match per client, keeping the
 		// options of the highest-QoS match. Ordinary subscribers go in `best` (each
 		// gets a copy); shared subscribers are bucketed by group name in `groups`
-		// (one member of each is picked below). Owned keys so the trie borrow ends
-		// before we touch `sessions`.
-		let mut best: HashMap<String, Match> = HashMap::new();
-		let mut groups: HashMap<String, HashMap<String, Match>> = HashMap::new();
+		// (one member of each is picked below). Keys borrow the trie, so the trie
+		// stays borrowed until the fan-out below completes.
+		let mut best: HashMap<&str, Match> = HashMap::new();
+		let mut groups: HashMap<&str, HashMap<&str, Match>> = HashMap::new();
 		for sub in matches {
 			let bucket = match &sub.share_group {
 				None => &mut best,
 				// No Local never applies here: it is a protocol error on a shared
 				// subscription (MQTT 5 §3.8.3.1), rejected at SUBSCRIBE — which also
 				// keeps every shard's view of the group's candidates identical.
-				Some(group) => groups.entry(group.clone()).or_default(),
+				Some(group) => groups.entry(group.as_str()).or_default(),
 			};
-			let entry = bucket.entry(sub.client_id.clone()).or_insert(Match {
+			let entry = bucket.entry(sub.client_id.as_str()).or_insert(Match {
 				qos: sub.qos,
 				nolocal: sub.nolocal,
 				retain_as_published: sub.retain_as_published,
@@ -158,12 +171,14 @@ impl ShardState {
 		// Ordinary subscribers: one copy each.
 		for (client_id, m) in best {
 			// No Local: never echo a message back to the client that published it.
-			if m.nolocal && publisher == Some(client_id.as_str()) {
+			if m.nolocal && publisher == Some(client_id) {
 				continue;
 			}
 			let qos = min_qos(publish.qos, m.qos);
 			let retain = was_retained && m.retain_as_published;
-			self.deliver_to(&client_id, &publish, qos, retain, m.sub_ids);
+			deliver_to(
+				sessions, wal, unpark_tx, client_id, &publish, qos, retain, m.sub_ids,
+			);
 		}
 
 		// Shared groups: exactly one member per group receives each message.
@@ -177,33 +192,33 @@ impl ShardState {
 		// is purely local, the original round-robin is kept (better fairness,
 		// and suspended members may still queue QoS > 0 messages).
 		for (group, members) in groups {
-			let mut ids: Vec<String> = members.keys().cloned().collect();
+			let mut ids: Vec<&str> = members.keys().copied().collect();
 			if ids.is_empty() {
 				continue;
 			}
-			ids.sort();
+			ids.sort_unstable();
 			// A parked member counts as online: it is still a connected client (a
 			// delivery queues and wakes it), and — critically — it never announced a
 			// shared-group Leave, so *remote* shards still count it in the global
 			// pick. Excluding it locally would desync the deterministic choice
 			// (double- or zero-delivery).
-			let online: Vec<String> = ids
+			let online: Vec<&str> = ids
 				.iter()
+				.copied()
 				.filter(|id| {
-					self.sessions
+					sessions
 						.get(*id)
 						.is_some_and(|s| s.mailbox.is_some() || s.parked)
 				})
-				.cloned()
 				.collect();
 
-			let picked = match self.shared_remote.get(&group).filter(|r| !r.is_empty()) {
+			let picked: Option<&str> = match shared_remote.get(group).filter(|r| !r.is_empty()) {
 				Some(remote) => {
 					// Global pick over the merged, sorted view of connected members
 					// everywhere. Deterministic: same list + same hash on every shard.
 					let mut all: Vec<&str> = online
 						.iter()
-						.map(String::as_str)
+						.copied()
 						.chain(remote.iter().map(String::as_str))
 						.collect();
 					all.sort_unstable();
@@ -211,91 +226,121 @@ impl ShardState {
 					let choice = all[shared_pick_index(&publish.topic, &publish.payload, all.len())];
 					// Deliver only if the chosen member is ours; otherwise the shard
 					// that owns it makes the same choice and delivers there.
-					online.iter().find(|id| id.as_str() == choice).cloned()
+					online.iter().copied().find(|id| *id == choice)
 				}
 				None => {
 					// Purely local group: round-robin, preferring connected members
 					// (a suspended member still queues QoS > 0 when it is all we have).
 					let pool = if online.is_empty() {
-						ids
+						&ids
 					} else {
-						online
+						&online
 					};
-					let cursor = self.shared_cursor.entry(group).or_insert(0);
-					let picked = pool[*cursor % pool.len()].clone();
+					// One owned key per shared-group publish (not per subscriber) to
+					// index the persistent per-group cursor — negligible next to the
+					// per-subscriber clone this refactor removed.
+					let cursor = shared_cursor.entry(group.to_string()).or_insert(0);
+					let picked = pool[*cursor % pool.len()];
 					*cursor = cursor.wrapping_add(1);
 					Some(picked)
 				}
 			};
 
 			if let Some(client_id) = picked {
-				let m = &members[&client_id];
+				let m = &members[client_id];
 				let qos = min_qos(publish.qos, m.qos);
 				let retain = was_retained && m.retain_as_published;
-				self.deliver_to(&client_id, &publish, qos, retain, m.sub_ids.clone());
+				deliver_to(
+					sessions,
+					wal,
+					unpark_tx,
+					client_id,
+					&publish,
+					qos,
+					retain,
+					m.sub_ids.clone(),
+				);
 			}
 		}
 	}
+}
 
-	/// Delivers one message to a single client's session: straight to its live
-	/// mailbox if connected; queued (and the parking task woken) if *parked*;
-	/// otherwise buffered in its offline queue (QoS > 0 only; QoS 0 is dropped for
-	/// a suspended session). `sub_ids` are the Subscription Identifiers to echo on
-	/// the delivered PUBLISH.
-	///
-	/// (See `route` for how shared-group deliveries pick their one recipient.)
-	fn deliver_to(&mut self, client_id: &str, publish: &Rc<Publish>, qos: QoS, retain: bool, sub_ids: Vec<usize>) {
-		let Some(session) = self.sessions.get_mut(client_id) else {
-			return;
-		};
-		let mut queued_offline = false;
-		let mut wake = false;
-		match &session.mailbox {
-			Some(mailbox) => {
-				// The mailbox channel is unbounded so an idle connection allocates
-				// nothing; this length guard enforces the same drop-on-full bound a
-				// bounded channel would (a consumer that stops reading its socket
-				// stops draining, and unbounded growth would be a DoS).
-				if mailbox.len() < MAILBOX_LIMIT {
-					let _ = mailbox.try_send(Delivery { publish: publish.clone(), qos, retain, sub_ids });
-				}
+/// Delivers one message to a single client's session, taking the shard's session
+/// map (and WAL / unpark handles) directly rather than through `&mut self`, so
+/// [`ShardState::route`] can call it while the topic trie is still borrowed —
+/// which is what lets its per-subscriber map keys stay borrowed `&str` (no owned
+/// `String` cloned per matched subscriber).
+///
+/// Straight to the client's live mailbox if connected; queued (and the parking
+/// task woken) if *parked*; otherwise buffered in its offline queue (QoS > 0
+/// only; QoS 0 is dropped for a suspended session). `sub_ids` are the
+/// Subscription Identifiers to echo on the delivered PUBLISH. (See `route` for
+/// how shared-group deliveries pick their one recipient.)
+#[allow(clippy::too_many_arguments)]
+fn deliver_to(
+	sessions: &mut HashMap<String, Session>,
+	wal: &mut Option<WalPending>,
+	unpark_tx: &Option<LocalSender<UnparkCmd>>,
+	client_id: &str,
+	publish: &Rc<Publish>,
+	qos: QoS,
+	retain: bool,
+	sub_ids: Vec<usize>,
+) {
+	let Some(session) = sessions.get_mut(client_id) else {
+		return;
+	};
+	let mut queued_offline = false;
+	let mut wake = false;
+	match &session.mailbox {
+		Some(mailbox) => {
+			// The mailbox channel is unbounded so an idle connection allocates
+			// nothing; this length guard enforces the same drop-on-full bound a
+			// bounded channel would (a consumer that stops reading its socket
+			// stops draining, and unbounded growth would be a DoS).
+			if mailbox.len() < MAILBOX_LIMIT {
+				let _ = mailbox.try_send(Delivery { publish: publish.clone(), qos, retain, sub_ids });
 			}
-			None if session.parked => {
-				// Parked: the client is *connected*, just task-less — so QoS 0 is
-				// queued too (a suspended session would drop it), bounded like the
-				// offline queue. One deduplicated Wake resurrects the connection,
-				// which drains everything queued here. No WAL write: a parked
-				// session is a live connection, not durable state.
-				if session.offline_queue.len() >= OFFLINE_QUEUE_LIMIT {
-					session.offline_queue.pop_front();
-				}
-				session
-					.offline_queue
-					.push_back(Delivery { publish: publish.clone(), qos, retain, sub_ids });
-				if !session.wake_pending {
-					session.wake_pending = true;
-					wake = true;
-				}
+		}
+		None if session.parked => {
+			// Parked: the client is *connected*, just task-less — so QoS 0 is
+			// queued too (a suspended session would drop it), bounded like the
+			// offline queue. One deduplicated Wake resurrects the connection,
+			// which drains everything queued here. No WAL write: a parked
+			// session is a live connection, not durable state.
+			if session.offline_queue.len() >= OFFLINE_QUEUE_LIMIT {
+				session.offline_queue.pop_front();
 			}
-			None if qos != QoS::AtMostOnce => {
-				if session.offline_queue.len() >= OFFLINE_QUEUE_LIMIT {
-					session.offline_queue.pop_front();
-				}
-				session
-					.offline_queue
-					.push_back(Delivery { publish: publish.clone(), qos, retain, sub_ids });
-				queued_offline = true;
+			session
+				.offline_queue
+				.push_back(Delivery { publish: publish.clone(), qos, retain, sub_ids });
+			if !session.wake_pending {
+				session.wake_pending = true;
+				wake = true;
 			}
-			None => {}
 		}
-		// The suspended session's durable offline queue grew: re-log it in the WAL.
-		if queued_offline {
-			self.wal_dirty(client_id);
+		None if qos != QoS::AtMostOnce => {
+			if session.offline_queue.len() >= OFFLINE_QUEUE_LIMIT {
+				session.offline_queue.pop_front();
+			}
+			session
+				.offline_queue
+				.push_back(Delivery { publish: publish.clone(), qos, retain, sub_ids });
+			queued_offline = true;
 		}
-		if wake && let Some(tx) = &self.unpark_tx {
-			// Unbounded local channel: only errors at shard teardown, where the
-			// parked fd is reclaimed by the shutdown drain instead.
-			let _ = tx.try_send(UnparkCmd::Wake { client_id: client_id.to_string() });
+		None => {}
+	}
+	// The suspended session's durable offline queue grew: re-log it in the WAL
+	// (inline `ShardState::wal_dirty`, which we cannot call without `self` here).
+	if queued_offline && let Some(w) = wal.as_mut() {
+		w.removed.remove(client_id);
+		if !w.dirty.contains(client_id) {
+			w.dirty.insert(client_id.to_string());
 		}
+	}
+	if wake && let Some(tx) = unpark_tx {
+		// Unbounded local channel: only errors at shard teardown, where the
+		// parked fd is reclaimed by the shutdown drain instead.
+		let _ = tx.try_send(UnparkCmd::Wake { client_id: client_id.to_string() });
 	}
 }
