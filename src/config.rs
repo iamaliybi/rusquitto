@@ -156,6 +156,26 @@ pub struct RuntimeConfig {
 	pub placement: Placement,
 	/// Per-link capacity of the inter-shard channel mesh.
 	pub mesh_capacity: usize,
+	/// io_uring registered-buffer pool per shard, in KiB. glommio pre-allocates
+	/// this and **pins it** (`IORING_REGISTER_BUFFERS`) at startup, so it lands in
+	/// resident memory for the shard's whole life — the dominant term in the
+	/// empty-broker footprint (glommio's own default is 10 MiB *per core*). The
+	/// network fast path (`recv`/`send`) does not draw from this pool; only DMA
+	/// file I/O — i.e. persistence snapshots — does, and it falls back to the
+	/// heap when the pool is exhausted, so a small pool costs at most slightly
+	/// slower snapshots. `512` (the default) keeps a shard's baseline near a
+	/// megabyte; raise it only for persistence-heavy deployments doing large,
+	/// frequent snapshots. Clamped to glommio's 64 KiB floor.
+	pub io_memory_kib: usize,
+	/// Microseconds to busy-spin polling io_uring completions before parking the
+	/// reactor. `0` (the default) parks immediately — the right trade for most
+	/// deployments. A small non-zero value (e.g. `50`) removes the io_uring
+	/// park/unpark round-trip from the single-message latency path, trading idle
+	/// CPU for lower request/response latency; worthwhile only for latency-
+	/// critical, steadily-busy shards. Has effect only under a CPU-pinning
+	/// `placement` (`max-spread` / `max-pack`); glommio disables spinning under
+	/// `unbound`.
+	pub spin_before_park_us: u64,
 }
 
 /// CPU placement strategy, mapped onto glommio's `PoolPlacement`.
@@ -471,6 +491,8 @@ impl Default for RuntimeConfig {
 			cores: None,
 			placement: Placement::MaxSpread,
 			mesh_capacity: 1024,
+			io_memory_kib: 512,
+			spin_before_park_us: 0,
 		}
 	}
 }
@@ -611,6 +633,9 @@ impl Config {
 		}
 		if self.runtime.mesh_capacity == 0 {
 			return invalid("runtime.mesh_capacity must be non-zero");
+		}
+		if self.runtime.io_memory_kib < 64 {
+			return invalid("runtime.io_memory_kib must be at least 64 (glommio's io_uring buffer floor)");
 		}
 		if self.limits.max_qos > 2 {
 			return invalid("limits.max_qos must be 0, 1, or 2");
@@ -843,6 +868,19 @@ mod tests {
 
 		c.tls.websocket = false;
 		assert_eq!(c.tls.wss_port(), None, "wss requires tls.websocket");
+	}
+
+	#[test]
+	fn io_memory_below_floor_is_rejected() {
+		let mut c = Config::default();
+		assert_eq!(
+			c.runtime.io_memory_kib, 512,
+			"small io_memory default keeps the baseline lean"
+		);
+		c.runtime.io_memory_kib = 32;
+		assert!(c.validate().is_err(), "below glommio's 64 KiB floor");
+		c.runtime.io_memory_kib = 64;
+		assert!(c.validate().is_ok(), "at the floor is fine");
 	}
 
 	#[test]
