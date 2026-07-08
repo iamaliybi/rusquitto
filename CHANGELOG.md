@@ -5,6 +5,27 @@ All notable changes to rusquitto are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): from 1.0 on, the major
 version bumps for breaking changes, the minor for features, and the patch for fixes.
 
+## [2.2.0] - 2026-07-08
+
+Consolidation release. No functional change over 2.1.2 — this marks the 2.x
+hardening line (connection parking, the `io_memory`/`spin_before_park` runtime
+tuning, property-based parser fuzzing, and the security &amp; memory audit) as a
+stable minor, and finishes the repository housekeeping.
+
+### Changed
+
+- Removed the superseded top-level `docs/` guides (`ARCHITECTURE.md`,
+  `MQTT_IMPLEMENTATION.md`, `MQTT_PACKETS.md`); the maintained architecture and
+  design notes live in `.agents/` and `README.md`.
+- `.agents/next-steps.md` cleared to the single open, benchmark-gated optimization
+  item; the task-per-connection memory/CPU deficits (live-connection heap,
+  active-connection memory, saturating QoS 1 per core) are recorded in
+  `.agents/scope.md` as **accepted architectural bounds of the glommio 0.9 runtime**
+  — prototyped and proven non-viable to remove (serving active connections off a raw
+  readiness ring costs ms-scale wake latency, because on this runtime the efficient
+  low-latency I/O wait and the per-connection memory are the same mechanism). Parking
+  reclaims the idle case to 0.68 KiB/conn, where the density win lives.
+
 ## [2.1.2] - 2026-07-08
 
 Security &amp; memory hardening from a comprehensive optimization/security audit. Two
